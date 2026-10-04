@@ -1,0 +1,20 @@
+0 verbose cli A:\nodejs\node.exe A:\nodejs\node_modules\npm\bin\npm-cli.js
+1 info using npm@11.19.1
+2 info using node@v26.10.0
+3 silly config load:file:A:\nodejs\node_modules\npm\npmrc
+4 silly config load:file:A:\android\AgeCivModTool\.npmrc
+5 silly config load:file:C:\Users\saysky\.npmrc
+6 silly config load:file:A:\android\AgeCivModTool\node_global\etc\npmrc
+7 verbose title npm list @tauri-apps/api @tauri-apps/plugin-clipboard-manager @tauri-apps/plugin-upload @tauri-apps/plugin-log @tauri-apps/plugin-stronghold @tauri-apps/plugin-sql @tauri-apps/plugin-http @tauri-apps/plugin-os @tauri-apps/plugin-authenticator @tauri-apps/plugin-nfc @tauri-apps/plugin-store @tauri-apps/plugin-websocket @tauri-apps/plugin-window-state @tauri-apps/plugin-localhost @tauri-apps/plugin-process @tauri-apps/plugin-single-instance @tauri-apps/plugin-geolocation @tauri-apps/plugin-barcode-scanner @tauri-apps/plugin-global-shortcut @tauri-apps/plugin-updater @tauri-apps/plugin-haptics @tauri-apps/plugin-cli @tauri-apps/plugin-dialog @tauri-apps/plugin-notification @tauri-apps/plugin-opener @tauri-apps/plugin-positioner @tauri-apps/plugin-shell @tauri-apps/plugin-biometric @tauri-apps/plugin-fs @tauri-apps/plugin-deep-link @tauri-apps/plugin-autostart @tauri-apps/plugin-persisted-scope
+8 verbose argv "list" "@tauri-apps/api" "@tauri-apps/plugin-clipboard-manager" "@tauri-apps/plugin-upload" "@tauri-apps/plugin-log" "@tauri-apps/plugin-stronghold" "@tauri-apps/plugin-sql" "@tauri-apps/plugin-http" "@tauri-apps/plugin-os" "@tauri-apps/plugin-authenticator" "@tauri-apps/plugin-nfc" "@tauri-apps/plugin-store" "@tauri-apps/plugin-websocket" "@tauri-apps/plugin-window-state" "@tauri-apps/plugin-localhost" "@tauri-apps/plugin-process" "@tauri-apps/plugin-single-instance" "@tauri-apps/plugin-geolocation" "@tauri-apps/plugin-barcode-scanner" "@tauri-apps/plugin-global-shortcut" "@tauri-apps/plugin-updater" "@tauri-apps/plugin-haptics" "@tauri-apps/plugin-cli" "@tauri-apps/plugin-dialog" "@tauri-apps/plugin-notification" "@tauri-apps/plugin-opener" "@tauri-apps/plugin-positioner" "@tauri-apps/plugin-shell" "@tauri-apps/plugin-biometric" "@tauri-apps/plugin-fs" "@tauri-apps/plugin-deep-link" "@tauri-apps/plugin-autostart" "@tauri-apps/plugin-persisted-scope" "--json" "--depth" "0"
+9 verbose logfile logs-max:10 dir:A:\android\AgeCivModTool\node_cache\_logs\2026-10-04T04_20_12_592Z-
+10 verbose logfile A:\android\AgeCivModTool\node_cache\_logs\2026-10-04T04_20_12_592Z-debug-0.log
+11 silly logfile start cleaning logs, removing 1 files
+12 silly packumentCache heap:4395630592 maxSize:1098907648 maxEntrySize:549453824
+13 silly logfile done cleaning log files
+14 verbose cwd A:\android\AgeCivModTool
+15 verbose os Windows_NT 10.0.26300
+16 verbose node v26.10.0
+17 verbose npm  v11.19.1
+18 verbose exit 1
+19 verbose code 1

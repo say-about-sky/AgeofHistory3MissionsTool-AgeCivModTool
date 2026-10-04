@@ -1,0 +1,272 @@
+package com.saysky.agecivmodtool
+
+import android.app.Activity
+import android.content.Intent
+import android.net.Uri
+import android.os.Build
+import android.os.Environment
+import android.provider.DocumentsContract
+import android.provider.Settings
+import androidx.activity.result.ActivityResult
+import androidx.documentfile.provider.DocumentFile
+import app.tauri.annotation.ActivityCallback
+import app.tauri.annotation.Command
+import app.tauri.annotation.InvokeArg
+import app.tauri.annotation.TauriPlugin
+import app.tauri.plugin.Invoke
+import app.tauri.plugin.JSArray
+import app.tauri.plugin.JSObject
+import app.tauri.plugin.Plugin
+
+@InvokeArg
+class ListDirArgs {
+    lateinit var folderId: String
+    var path: String? = null
+}
+
+@InvokeArg
+class ReadFilesInDirArgs {
+    lateinit var folderId: String
+    lateinit var dirPath: String
+    var names: Array<String> = emptyArray()
+}
+
+@TauriPlugin
+class AllFilesAccessPlugin(private val activity: Activity) : Plugin(activity) {
+    private fun hasAllFilesAccess(): Boolean {
+        return Build.VERSION.SDK_INT < Build.VERSION_CODES.R || Environment.isExternalStorageManager()
+    }
+
+    private fun accessStatus(): JSObject {
+        return JSObject().apply { put("granted", hasAllFilesAccess()) }
+    }
+
+    @Command
+    fun hasAllFilesAccess(invoke: Invoke) {
+        invoke.resolve(accessStatus())
+    }
+
+    @Command
+    fun requestAllFilesAccess(invoke: Invoke) {
+        if (hasAllFilesAccess()) {
+            invoke.resolve(accessStatus())
+            return
+        }
+
+        val appSettingsIntent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
+            data = Uri.parse("package:${activity.packageName}")
+        }
+        try {
+            startActivityForResult(invoke, appSettingsIntent, "onSettingsResult")
+        } catch (_: Exception) {
+            try {
+                startActivityForResult(
+                    invoke,
+                    Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION),
+                    "onSettingsResult",
+                )
+            } catch (error: Exception) {
+                invoke.reject(error.message ?: "无法打开所有文件访问设置")
+            }
+        }
+    }
+
+    @ActivityCallback
+    fun onSettingsResult(invoke: Invoke, result: ActivityResult) {
+        invoke.resolve(accessStatus())
+    }
+
+    /** 读取工作区目录：单次子项游标查询列出一层目录，避免逐文件属性查询导致的卡顿。 */
+    @Command
+    fun listDir(invoke: Invoke) {
+        val args = invoke.parseArgs(ListDirArgs::class.java)
+        Thread {
+            try {
+                val entries = listDirEntries(args.folderId, args.path ?: "")
+    /** 批量读取目录内图标：单次列目录、按文件名匹配后直读，返回 name + dataUrl（缺失项跳过）。 */
+    @Command
+    fun readFilesInDir(invoke: Invoke) {
+        val args = invoke.parseArgs(ReadFilesInDirArgs::class.java)
+        Thread {
+            try {
+                val files = readFilesInDirEntries(args.folderId, args.dirPath, args.names)
+                invoke.resolve(JSObject().apply { put("files", files) })
+            } catch (error: Throwable) {
+                invoke.reject(error.message ?: "读取图标失败")
+            }
+        }.start()
+    }
+
+                invoke.resolve(JSObject().apply { put("entries", entries) })
+            } catch (error: Throwable) {
+                invoke.reject(error.message ?: "读取目录失败")
+            }
+        }.start()
+    }
+
+    private class FastListUnsupportedException(message: String) : Exception(message)
+
+    private class ChildEntry(val uri: Uri, val name: String, val isDir: Boolean)
+
+    private fun folderTreeUri(folderId: String): Uri {
+        val prefs = activity.getSharedPreferences("scoped_storage", Activity.MODE_PRIVATE)
+        val uriValue = prefs.getString("folder:$folderId:uri", null)
+            ?: throw IllegalStateException("工作区授权已失效，请重新选择目录")
+        rel results = JSArray()
+        for (child in listChildrenFast(treeUri, relativePath)) {
+            results.put(entryObject(child.name, joinPath(relativePath, child.name), child.isDir))
+        }
+        return results
+    }
+
+    /** 快速解析目录路径为 document URI（每层 1 次子项查询）。 */
+    private fun resolveDirUriFast(treeUri: Uri, relativePath: String): Uri {
+        var dirUri = DocumentsContract.buildDocumentUriUsingTree(
+            treeUri,
+            DocumentsContract.getTreeDocumentId(treeUri),
+        )
+        for (segment in pathSegments(relativePath)) {
+            val child = queryChildren(treeUri, dirUri).firstOrNull { it.name == segment }
+                ?: throw IllegalStateException("目录不存在：$relativePath")
+            if (!child.isDir) {
+                throw IllegalStateException("路径不是目录：$relativePath")
+            }
+            dirUri = child.uri
+        }
+        return dirUri
+    }
+
+    private fun listChildrenFast(treeUri: Uri, relativePath: String): List<ChildEntry> =
+        queryChildren(treeUri, resolveDirUriFast(treeUri, relativePath))
+
+    private fun listChildrenSlow(treeUri: Uri, relativePath: String): List<ChildEntry> {
+        var current = DocumentFile.fromTreeUri(activity, treeUri)
+            ?: throw IllegalStateException("工作区授权已失效，请重新选择目录")
+        for (segment in pathSegments(relativePath)) {
+            current = current.findFile(segment)
+                ?: throw IllegalStateException("目录不存在：$relativePath")
+        }
+        val out = ArrayList<ChildEntry>()
+        for (file in current.listFiles()) {
+            val name = file.name ?: continue
+            out.add(ChildEntry(file.uri, name, file.isDirectory))
+        }
+        return out
+    }
+
+    /** 批量读取目录内图标：单次列目录、按 "{name}.png" 大小写不敏感匹配、直读文件，返回 data URL。 */
+    private fun readFilesInDirEntries(
+        folderId: String,
+        dirPath: String,
+        names: Array<String>,
+    ): JSArray {
+        val treeUri = folderTreeUri(folderId)
+        val children = try {
+            listChildrenFast(treeUri, dirPath)
+        } catch (_: FastListUnsupportedException) {
+            listChildrenSlow(treeUri, dirPath)
+        }
+        val filesByName = HashMap<String, Uri>()
+        for (child in children) {
+            if (!child.isDir) {
+                val key = child.name.lowercase()
+                if (!filesByName.containsKey(key)) {
+                    filesByName[key] = child.uri
+                }
+            }
+        }
+
+        val files = JSArray()
+        for (name in names) {
+            val uri = filesByName["${name.lowercase()}.png"] ?: continue
+            val bytes = activity.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                ?: continue
+            val encoded = android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
+            files.put(JSObject().apply {
+                put("name", name)
+                put("dataUrl", "data:image/png;base64,$encoded")
+            })
+        }
+        return file
+        for (segment in pathSegments(relativePath)) {
+            val child = queryChildren(treeUri, dirUri).firstOrNull { it.name == segment }
+                ?: throw IllegalStateException("目录不存在：$relativePath")
+            if (!child.isDir) {
+                throw IllegalStateException("路径不是目录：$relativePath")
+            }
+            dirUri = child.uri
+        }
+
+        val results = JSArray()
+        for (child in queryChildren(treeUri, dirUri)) {
+            results.put(entryObject(child.name, joinPath(relativePath, child.name), child.isDir))
+        }
+        return results
+    }
+
+    /** 兜底路径：个别不支持子项游标的目录服务，退回 DocumentFile 逐项读取（较慢但能工作）。 */
+    private fun listDirEntriesSlow(treeUri: Uri, relativePath: String): JSArray {
+        var current = DocumentFile.fromTreeUri(activity, treeUri)
+            ?: throw IllegalStateException("工作区授权已失效，请重新选择目录")
+        for (segment in pathSegments(relativePath)) {
+            current = current.findFile(segment)
+                ?: throw IllegalStateException("目录不存在：$relativePath")
+        }
+
+        val results = JSArray()
+        for (file in current.listFiles()) {
+            val name = file.name ?: continue
+            results.put(entryObject(name, joinPath(relativePath, name), file.isDirectory))
+        }
+        return results
+    }
+
+    private fun queryChildren(treeUri: Uri, dirUri: Uri): List<ChildEntry> {
+        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(
+            dirUri,
+            DocumentsContract.getDocumentId(dirUri),
+        )
+        val projection = arrayOf(
+            DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+            DocumentsContract.Document.COLUMN_MIME_TYPE,
+        )
+        val cursor = activity.contentResolver.query(childrenUri, projection, null, null, null)
+            ?: throw FastListUnsupportedException("无法读取目录列表")
+        cursor.use { c ->
+            val idIndex = c.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+            val nameIndex = c.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+            val mimeIndex = c.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
+            if (idIndex < 0 || nameIndex < 0 || mimeIndex < 0) {
+                throw FastListUnsupportedException("目录服务不支持列投影")
+            }
+            val out = ArrayList<ChildEntry>()
+            while (c.moveToNext()) {
+                val documentId = c.getString(idIndex) ?: continue
+                val name = c.getString(nameIndex) ?: ""
+                val isDir = c.getString(mimeIndex) == DocumentsContract.Document.MIME_TYPE_DIR
+                out.add(
+                    ChildEntry(
+                        DocumentsContract.buildDocumentUriUsingTree(treeUri, documentId),
+                        name,
+                        isDir,
+                    ),
+                )
+            }
+            return out
+        }
+    }
+
+    private fun pathSegments(relativePath: String): List<String> =
+        relativePath.split('/').filter { it.isNotEmpty() }
+
+    private fun joinPath(base: String, name: String): String =
+        if (base.isEmpty()) name else "$base/$name"
+
+    private fun entryObject(name: String, relativePath: String, isDir: Boolean): JSObject =
+        JSObject().apply {
+            put("name", name)
+            put("path", relativePath)
+            put("isDir", isDir)
+        }
+}

@@ -1,0 +1,1952 @@
+use dioxus::prelude::*;
+use serde::{Deserialize, Serialize};
+use wasm_bindgen::prelude::*;
+use wasm_bindgen_futures::JsFuture;
+
+use super::{
+	FocusIcon, FocusTarget, MindMapCanvas, MissionRecord, WorkDirectory,
+	event::{delete_event_text, rename_event_text, save_event_text, EventPanel},
+	files::{ExplorerClipboard, ExplorerCommand, Files, WorkspaceFile},
+	frame::Frame,
+};
+use crate::app::tauri_bridge::{invoke, open_directory_dialog};
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MissionFileArgs {
+	work_directory: String,
+	file_name: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SaveMissionsFileArgs {
+	work_directory: String,
+	file_name: String,
+	missions: Vec<MissionRecord>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MissionIconsArgs {
+	work_directory: String,
+	names: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkDirectoryArgs {
+	work_directory: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateWorkDirectoryArgs {
+	parent_directory: String,
+	directory_name: String,
+}
+
+#[derive(Serialize)]
+struct FolderDialogOptions {
+	directory: bool,
+	multiple: bool,
+	title: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ScopedFolder {
+	id: String,
+	name: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ScopedEntry {
+	name: String,
+	path: String,
+	is_dir: bool,
+}
+
+#[derive(Deserialize)]
+struct ScopedTextFile {
+	contents: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ScopedFolderPath {
+	folder_id: String,
+	path: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ScopedReadFilesArgs {
+	folder_id: String,
+	dir_path: String,
+	names: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ScopedFilePath {
+	folder_id: String,
+	path: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ScopedWriteTextFile {
+	folder_id: String,
+	path: String,
+	contents: String,
+	recursive: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ScopedMkdir {
+	folder_id: String,
+	path: String,
+	recursive: bool,
+}
+
+async fn is_android() -> Result<bool, String> {
+	let value = JsFuture::from(invoke("is_android", js_sys::Object::new().into()))
+		.await
+		.map_err(|error| format!("检测运行平台失败：{error:?}"))?;
+	value
+		.as_bool()
+		.ok_or_else(|| "运行平台检测结果无效".to_string())
+}
+
+async fn query_all_files_access() -> Result<bool, String> {
+	let value = JsFuture::from(invoke("has_all_files_access", js_sys::Object::new().into()))
+		.await
+		.map_err(|error| format!("读取全盘文件授权状态失败：{error:?}"))?;
+	value
+		.as_bool()
+		.ok_or_else(|| "全盘文件授权状态无效".to_string())
+}
+
+async fn open_all_files_access_settings() -> Result<bool, String> {
+	let value = JsFuture::from(invoke("request_all_files_access", js_sys::Object::new().into()))
+		.await
+		.map_err(|error| format!("打开全盘文件授权设置失败：{error:?}"))?;
+	value
+		.as_bool()
+		.ok_or_else(|| "全盘文件授权结果无效".to_string())
+}
+
+async fn scoped_request<T: Serialize>(command: &str, request: &T) -> Result<JsValue, String> {
+	let request = serde_wasm_bindgen::to_value(request).map_err(|error| error.to_string())?;
+	let args = js_sys::Object::new();
+	js_sys::Reflect::set(&args, &JsValue::from_str("req"), &request)
+		.map_err(|error| format!("准备存储请求失败：{error:?}"))?;
+	JsFuture::from(invoke(
+		&format!("plugin:scoped-storage|{command}"),
+		args.into(),
+	))
+	.await
+	.map_err(|error| format!("访问 Android 工作区失败：{error:?}"))
+}
+
+
+/// 读取 Android 工作区目录（走 App 自带快速插件：单次子项游标查询列出一层目录）。
+async fn scoped_read_dir(
+	folder_id: &str,
+	path: Option<String>,
+) -> Result<Vec<ScopedEntry>, String> {
+	let args = serde_wasm_bindgen::to_value(&ScopedFolderPath {
+		folder_id: folder_id.to_string(),
+		path,
+	})
+	.map_err(|error| error.to_string())?;
+	let value = JsFuture::from(invoke("list_scoped_dir", args))
+		.await
+		.map_err(|error| format!("读取 Android 目录失败：{error:?}"))?;
+	serde_wasm_bindgen::from_value(value).map_err(|error| format!("读取目录列表失败：{error}"))
+}
+
+/// 批量读取 Android 工作区图标（快速路径：单次列目录 + 直读文件，返回 data URL；缺失项自动跳过）。
+async fn scoped_read_files_in_dir(
+	folder_id: &str,
+	dir_path: &str,
+	names: &[String],
+) -> Result<Vec<FocusIcon>, String> {
+	let args = serde_wasm_bindgen::to_value(&ScopedReadFilesArgs {
+		folder_id: folder_id.to_string(),
+		dir_path: dir_path.to_string(),
+		names: names.to_vec(),
+	})
+	.map_err(|error| error.to_string())?;
+	let value = JsFuture::from(invoke("read_scoped_files_in_dir", args))
+		.await
+		.map_err(|error| format!("读取 Android 工作区图标失败：{error:?}"))?;
+	serde_wasm_bindgen::from_value(value).map_err(|error| format!("图标数据格式错误：{error}"))
+}
+
+async fn scoped_read_text_file(folder_id: &str, path: String) -> Result<String, String> {
+	let value = scoped_request(
+		"read_text_file",
+		&ScopedFilePath {
+			folder_id: folder_id.to_string(),
+			path,
+		},
+	)
+	.await?;
+	let file: ScopedTextFile = serde_wasm_bindgen::from_value(value)
+		.map_err(|error| format!("读取工作区文本失败：{error}"))?;
+	Ok(file.contents)
+}
+
+async fn scoped_write_text_file(
+	folder_id: &str,
+	path: String,
+	contents: String,
+) -> Result<(), String> {
+	scoped_request(
+		"write_text_file",
+		&ScopedWriteTextFile {
+			folder_id: folder_id.to_string(),
+			path,
+			contents,
+			recursive: true,
+		},
+	)
+	.await?;
+	Ok(())
+}
+
+async fn scoped_mkdir(folder_id: &str, path: String) -> Result<(), String> {
+	scoped_request(
+		"mkdir",
+		&ScopedMkdir {
+			folder_id: folder_id.to_string(),
+			path,
+			recursive: true,
+		},
+	)
+	.await?;
+	Ok(())
+}
+
+fn join_scoped_path(parent: &str, child: &str) -> String {
+	if parent.is_empty() {
+		child.to_string()
+	} else {
+		format!("{parent}/{child}")
+	}
+}
+
+fn join_rel_path(parent: &str, name: &str) -> String {
+	if parent.is_empty() {
+		name.to_string()
+	} else {
+		format!("{parent}/{name}")
+	}
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceTransferArgs {
+	work_directory: String,
+	source: String,
+	target: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspacePathArgs {
+	work_directory: String,
+	target: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ScopedTransfer {
+	from_folder_id: String,
+	from_path: String,
+	to_folder_id: String,
+	to_path: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ScopedRemoveFile {
+	folder_id: String,
+	path: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ScopedRemoveDir {
+	folder_id: String,
+	path: String,
+	recursive: bool,
+}
+
+async fn copy_item(directory: &WorkDirectory, source: &str, target: &str) -> Result<(), String> {
+	if let Some(folder_id) = &directory.folder_id {
+		scoped_request(
+			"copy",
+			&ScopedTransfer {
+				from_folder_id: folder_id.clone(),
+				from_path: join_scoped_path(&directory.root_path, source),
+				to_folder_id: folder_id.clone(),
+				to_path: join_scoped_path(&directory.root_path, target),
+			},
+		)
+		.await
+		.map(|_| ())
+	} else {
+		let args = serde_wasm_bindgen::to_value(&WorkspaceTransferArgs {
+			work_directory: directory.root_path.clone(),
+			source: source.to_string(),
+			target: target.to_string(),
+		})
+		.map_err(|error| error.to_string())?;
+		JsFuture::from(invoke("copy_workspace_item", args))
+			.await
+			.map_err(|error| format!("复制文件失败：{error:?}"))?;
+		Ok(())
+	}
+}
+
+async fn move_item(directory: &WorkDirectory, source: &str, target: &str) -> Result<(), String> {
+	if let Some(folder_id) = &directory.folder_id {
+		scoped_request(
+			"move",
+			&ScopedTransfer {
+				from_folder_id: folder_id.clone(),
+				from_path: join_scoped_path(&directory.root_path, source),
+				to_folder_id: folder_id.clone(),
+				to_path: join_scoped_path(&directory.root_path, target),
+			},
+		)
+		.await
+		.map(|_| ())
+	} else {
+		let args = serde_wasm_bindgen::to_value(&WorkspaceTransferArgs {
+			work_directory: directory.root_path.clone(),
+			source: source.to_string(),
+			target: target.to_string(),
+		})
+		.map_err(|error| error.to_string())?;
+		JsFuture::from(invoke("move_workspace_item", args))
+			.await
+			.map_err(|error| format!("移动文件失败：{error:?}"))?;
+		Ok(())
+	}
+}
+
+async fn delete_item(
+	directory: &WorkDirectory,
+	target: &str,
+	is_directory: bool,
+) -> Result<(), String> {
+	if let Some(folder_id) = &directory.folder_id {
+		let path = join_scoped_path(&directory.root_path, target);
+		if is_directory {
+			scoped_request(
+				"remove_dir",
+				&ScopedRemoveDir {
+					folder_id: folder_id.clone(),
+					path,
+					recursive: true,
+				},
+			)
+			.await
+			.map(|_| ())
+		} else {
+			scoped_request(
+				"remove_file",
+				&ScopedRemoveFile {
+					folder_id: folder_id.clone(),
+					path,
+				},
+			)
+			.await
+			.map(|_| ())
+		}
+	} else {
+		let args = serde_wasm_bindgen::to_value(&WorkspacePathArgs {
+			work_directory: directory.root_path.clone(),
+			target: target.to_string(),
+		})
+		.map_err(|error| error.to_string())?;
+		JsFuture::from(invoke("delete_workspace_item", args))
+			.await
+			.map_err(|error| format!("删除文件失败：{error:?}"))?;
+		Ok(())
+	}
+}
+
+async fn reveal_item(directory: &WorkDirectory, target: &str) -> Result<(), String> {
+	if directory.folder_id.is_some() {
+		return Err("Android 暂不支持打开文件位置".to_string());
+	}
+	let args = serde_wasm_bindgen::to_value(&WorkspacePathArgs {
+		work_directory: directory.root_path.clone(),
+		target: target.to_string(),
+	})
+	.map_err(|error| error.to_string())?;
+	JsFuture::from(invoke("reveal_workspace_item", args))
+		.await
+		.map_err(|error| format!("打开文件位置失败：{error:?}"))?;
+	Ok(())
+}
+
+/// 重新扫描工作区文件列表（复制/移动/删除后刷新用）。
+async fn reload_file_list(directory: &WorkDirectory) -> Result<Vec<WorkspaceFile>, String> {
+	if let Some(folder_id) = &directory.folder_id {
+		let mut entries = Vec::new();
+		let mut pending = vec![directory.root_path.clone()];
+		while let Some(dir) = pending.pop() {
+			let path = if dir.is_empty() { None } else { Some(dir.clone()) };
+			for entry in scoped_read_dir(folder_id, path).await? {
+				let relative_path = entry
+					.path
+					.strip_prefix(&directory.root_path)
+					.unwrap_or(&entry.path)
+					.trim_start_matches('/')
+					.to_string();
+				entries.push(WorkspaceFile {
+					name: entry.name,
+					relative_path,
+					is_directory: entry.is_dir,
+				});
+				if entry.is_dir {
+					pending.push(entry.path);
+				}
+			}
+		}
+		Ok(entries)
+	} else {
+		let args = serde_wasm_bindgen::to_value(&WorkDirectoryArgs {
+			work_directory: directory.root_path.clone(),
+		})
+		.map_err(|error| error.to_string())?;
+		let value = JsFuture::from(invoke("list_workspace_files", args))
+			.await
+			.map_err(|error| format!("读取工作区文件失败：{error:?}"))?;
+		serde_wasm_bindgen::from_value(value).map_err(|error| format!("工作区文件格式错误：{error}"))
+	}
+}
+
+async fn pick_folder(title: &str) -> Result<Option<WorkDirectory>, String> {
+	if is_android().await? {
+		let value = JsFuture::from(invoke(
+			"plugin:scoped-storage|pick_folder",
+			js_sys::Object::new().into(),
+		))
+		.await
+		.map_err(|error| format!("打开 Android 文件管理器失败：{error:?}"))?;
+		let folder: ScopedFolder = serde_wasm_bindgen::from_value(value)
+			.map_err(|error| format!("读取所选目录失败：{error}"))?;
+		let name = folder.name.unwrap_or_else(|| "工作区".to_string());
+		return Ok(Some(WorkDirectory {
+			display_path: name,
+			folder_id: Some(folder.id),
+			root_path: String::new(),
+		}));
+	}
+
+	let options = serde_wasm_bindgen::to_value(&FolderDialogOptions {
+		directory: true,
+		multiple: false,
+		title: title.to_string(),
+	})
+	.map_err(|error| error.to_string())?;
+	let value = JsFuture::from(open_directory_dialog(options))
+		.await
+		.map_err(|error| format!("打开文件管理器失败：{error:?}"))?;
+	Ok(value.as_string().map(|path| WorkDirectory {
+		display_path: path.clone(),
+		folder_id: None,
+		root_path: path,
+	}))
+}
+
+async fn load_workspace_files(
+	work_directory: &WorkDirectory,
+) -> Result<Vec<WorkspaceFile>, String> {
+	if let Some(folder_id) = &work_directory.folder_id {
+		let mut entries = Vec::new();
+		let mut pending = vec![work_directory.root_path.clone()];
+		while let Some(directory) = pending.pop() {
+			let path = if directory.is_empty() {
+				None
+			} else {
+				Some(directory.clone())
+			};
+			for entry in scoped_read_dir(folder_id, path).await? {
+				let relative_path = entry
+					.path
+					.strip_prefix(&work_directory.root_path)
+					.unwrap_or(&entry.path)
+					.trim_start_matches('/')
+					.to_string();
+				entries.push(WorkspaceFile {
+					name: entry.name,
+					relative_path,
+					is_directory: entry.is_dir,
+				});
+				if entry.is_dir {
+					pending.push(entry.path);
+				}
+			}
+		}
+		return Ok(entries);
+	}
+
+	let args = serde_wasm_bindgen::to_value(&WorkDirectoryArgs {
+		work_directory: work_directory.root_path.clone(),
+	})
+	.map_err(|error| error.to_string())?;
+	let files_value = JsFuture::from(invoke("list_workspace_files", args))
+		.await
+		.map_err(|error| format!("读取工作区文件失败：{error:?}"))?;
+	serde_wasm_bindgen::from_value(files_value)
+		.map_err(|error| format!("工作区文件格式错误：{error}"))
+}
+
+/// 读取单个国策树配置（missions 目录下的 .json 文件）。
+async fn load_tree_records(
+	work_directory: &WorkDirectory,
+	json_path: &str,
+) -> Result<Vec<MissionRecord>, String> {
+	if let Some(folder_id) = &work_directory.folder_id {
+		let path = join_scoped_path(&work_directory.root_path, json_path);
+		let contents = scoped_read_text_file(folder_id, path).await?;
+		let args = serde_wasm_bindgen::to_value(&ParseMissionsArgs { contents })
+			.map_err(|error| error.to_string())?;
+		let value = JsFuture::from(invoke("parse_missions", args))
+			.await
+			.map_err(|error| format!("读取国策配置失败：{error:?}"))?;
+		serde_wasm_bindgen::from_value(value)
+			.map_err(|error| format!("国策配置格式错误：{error}"))
+	} else {
+		let file_name = json_path
+			.strip_prefix("missions/")
+			.unwrap_or(json_path)
+			.to_string();
+		let args = serde_wasm_bindgen::to_value(&MissionFileArgs {
+			work_directory: work_directory.root_path.clone(),
+			file_name,
+		})
+		.map_err(|error| error.to_string())?;
+		let value = JsFuture::from(invoke("load_missions_file", args))
+			.await
+			.map_err(|error| format!("读取国策配置失败：{error:?}"))?;
+		serde_wasm_bindgen::from_value(value)
+			.map_err(|error| format!("国策配置格式错误：{error}"))
+	}
+}
+
+/// 仅加载该树实际引用到的图标（缺失的图标静默跳过）。
+async fn load_tree_icons(
+	work_directory: &WorkDirectory,
+	missions: &[MissionRecord],
+	mut progress: Signal<Option<LoadProgress>>,
+) -> Rtotal_icons = names.len();
+		let mut icons = Vec::with_capacity(total_icons);
+		let mut completed = 0_usize;
+		for chunk in names.chunks(ICON_READ_CHUNK_SIZE) {
+			icons
+				.extend(scoped_read_files_in_dir(folder_id, &icon_directory, chunk
+		for chunk in requested.chunks(ICON_READ_CHUNK_SIZE) {
+			let requests: Vec<ScopedFilePath> = chunk
+				.iter()
+				.map(|(_, path)| ScopedFilePath {
+					folder_id: folder_id.clone(),
+					path: path.clone(),
+				})
+				.collect();
+			let data = scoped_read_file_batch(&requests).await?;
+			let batch: Vec<IconPayload> = chunk
+				.iter()
+				.zip(data)
+				.map(|((name, _), data)| IconPayload {
+					name: name.clone(),
+					data,
+				})
+				.collect();
+			icons.extend(encode_icon_batch(&batch).await?);
+			completed += chunk.len();
+			progress.set(Some(LoadProgress {
+				stage: format!("正在载入国策图标（{completed}/{total_icons}）..."),
+				completed,
+				total: total_icons,
+			}));
+		}
+		Ok(icons)
+	} else {
+		let args = serde_wasm_bindgen::to_value(&MissionIconsArgs {
+			work_directory: work_directory.root_path.clone(),
+			names,
+		})
+		.map_err(|error| error.to_string())?;
+		let value = JsFuture::from(invoke("load_mission_icons", args))
+			.await
+			.map_err(|error| format!("读取国策图标失败：{error:?}"))?;
+		serde_wasm_bindgen::from_value(value)
+			.map_err(|error| format!("国策图标格式错误：{error}"))
+	}
+}
+
+/// 手动加载单个图标（资源管理器双击 .png 时调用）；文件缺失时返回 None。
+async fn load_single_icon(
+	work_directory: &WorkDirectory,
+	name: &str,
+	relative_path: &str,
+) -> Result<Option<FocusIcon>, String> {
+	if let Some(folder_id) = &work_directory.folder_id {
+		let path = join_scoped_path(&work_directory.root_path, relative_path);
+		let requests = vec![ScopedFilePath {
+			folder_id: folder_id.clone(),
+			path,
+		}];
+		let data = scoped_read_file_batch(&requests).await?;
+		let Some(data) = data.into_iter().next() else {
+			return Ok(None);
+		};
+		let batch = vec![IconPayload {
+			name: name.to_string(),
+			data,
+		}];
+		Ok(encode_icon_batch(&batch).await?.into_iter().next())
+	} else {
+		let args = serde_wasm_bindgen::to_value(&MissionIconsArgs {
+			work_directory: work_directory.root_path.clone(),
+			names: vec![name.to_string()],
+		})
+		.map_err(|error| error.to_string())?;
+		let value = JsFuture::from(invoke("load_mission_icons", args))
+			.await
+			.map_err(|error| format!("读取国策图标失败：{error:?}"))?;
+		let icons: Vec<FocusIcon> = serde_wasm_bindgen::from_value(value)
+			.map_err(|error| format!("国策图标格式错误：{error}"))?;
+		Ok(icons.into_iter().next())
+	}
+}
+
+/// 保存(dir_part, file_name) = relative_path
+			.rsplit_once('/')
+			.map_or(("", relative_path), |(dir, file)| (dir, file));
+		let dir_path = join_scoped_path(&work_directory.root_path, dir_part);
+		let stem = file_name
+			.rsplit_once('.')
+			.map_or(file_name, |(stem, _)| stem);
+		let found = scoped_read_files_in_dir(folder_id, &dir_path, &[stem.to_string()]).await?;
+		Ok(found.into_iter().next().map(|icon| FocusIcon {
+			name: name.to_string(),
+			data_url: icon.data_url,
+		}
+			.ok_or_else(|| "国策配置序列化结果无效".to_string())?;
+		scoped_write_text_file(
+			folder_id,
+			join_scoped_path(&work_directory.root_path, json_path),
+			contents,
+		)
+		.await
+	} else {
+		let args = serde_wasm_bindgen::to_value(&SaveMissionsFileArgs {
+			work_directory: work_directory.root_path.clone(),
+			file_name: json_path
+				.strip_prefix("missions/")
+				.unwrap_or(json_path)
+				.to_string(),
+			missions: records,
+		})
+		.map_err(|error| error.to_string())?;
+		JsFuture::from(invoke("save_missions_file", args))
+			.await
+			.map_err(|error| format!("保存国策配置失败：{error:?}"))?;
+		Ok(())
+	}
+}
+
+#[derive(Serialize)]
+struct ParseMissionsArgs {
+	contents: String,
+}
+
+#[derive(Serialize)]
+struct IconPayload {
+	name: String,
+	data: Vec<u8>,
+}
+
+#[derive(Serialize)]
+struct EncodeIconsArgs<'a> {
+	icons: &'a [IconPayload],
+}
+
+#[derive(Clone)]
+struct LoadProgress {
+	stage: String,
+	completed: usize,
+	total: usize,
+}
+
+/// 单批并发读取的图标数量，平衡 IPC 并发度与内存占用。
+const ICON_READ_CHUNK_SIZE: usize = 8;
+
+/// 一个已打开的国策树标签页：持有该树的配置与引用图标，关闭标签页即释放。
+#[derive(Clone, PartialEq)]
+struct TreeTab {
+	id: String,
+	title: String,
+	json_path: String,
+	missions: Vec<MissionRecord>,
+	icons: Vec<FocusIcon>,
+	dirty: bool,
+	save_ack: u64,
+}
+
+/// 单个国策树画布：以 key 挂载保持编辑状态，非激活时隐藏而非卸载。
+#[component]
+fn TreeCae_event_file: EventHandler<String>,
+	on_rename_event_file: EventHandler<(String, String)>,
+	on_nodes_change: EventHandler<(Vec<String>, Vec<String>)>,
+	on_dirty_change: EventHandler<(String, bool)>,
+) -> Element {
+	let save_tab_id = tab.id.clone();
+	let dirty_tab_id = tab.id.clone();
+	let canvas_tab_id = tab.id.clone();
+	let is_active = active_tab_id.read().as_deref() == Some(tab.id.as_str());
+	rsx! {
+        div {
+            class: "tab-canvas",
+            style: if is_active { "display: flex;" } else { "display: none;" },
+            MindMapCanvas {
+                initial_icons: tab.icons.clone(),
+                missions: tab.missions.clone(),
+                active_tab_id,
+                tab_id: canvas_tab_id,
+                on_save: move |records| on_save.call((save_tab_id.clone(), records)),
+                save_request,
+                save_status,
+                on_edit_event,
+                on_create_event_file,
+                on_delete_event_file,
+                on_rename_event_file,
+                focus_request,
+                is_android,
+                on_nodes_change,
+                on_dirty_change: move |dirty| on_dirty_change.call((dirty_tab_id.clone(), dirty)),
+                pending_icon,
+                save_ack: tab.save_ack,
+            }
+        }
+    }
+}
+
+/// 可拖拽调整宽度的侧边面板。
+#[derive(Clone, Copy, PartialEq)]
+enum ResizeSide {
+	Explorer,
+	Events,
+}
+
+/// 一次拖拽调整宽度的进行状态。
+#[derive(Clone, Copy)]
+struct PanelResize {
+	side: ResizeSide,
+	start_x: f64,
+	start_width: f64,
+}
+
+/// 左右侧边面板的宽度限制（像素）。
+const EXPLORER_MIN_WIDTH: f64 = 170.0;
+const EXPLORER_MAX_WIDTH: f64 = 640.0;
+const EVENTS_MIN_WIDTH: f64 = 260.0;
+const EVENTS_MAX_WIDTH: f64 = 760.0;
+
+#[derive(Serialize)]
+struct SerializeMissionsArgs {
+	missions: Vec<MissionRecord>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DirectoryNameArgs {
+	directory_name: String,
+}
+
+#[component]
+pub fn Work() -> Element {
+	let work_directory = use_signal(|| None::<WorkDirectory>);
+	let workspace_files = use_signal(Vec::<WorkspaceFile>::new);
+	let mut open_tabs = use_signal(Vec::<TreeTab>::new);
+	let mut active_tab_id = use_signal(|| None::<String>);
+	// 资源管理器手动加载的图标：双击 .png 时推送给对应标签页画布并入其图标列表。
+	let pending_icon = use_signal(|| None::<(String, FocusIcon)>);
+	let mut event_release_request = use_signal(|| 0_u64);
+	let mut tab_close_prompt = use_signal(|| None::<String>);
+	let loading = use_signal(|| false);
+	let load_progress = use_signal(|| None::<LoadProgress>);
+	let mut files_open = use_signal(|| true);
+	let mut events_open = use_signal(|| false);
+	let open_event_request = use_signal(|| None::<String>);
+	let rename_event_request = use_signal(|| None::<(String, String)>);
+	let mut selected_file = use_signal(|| None::<String>);
+	let explorer_clipboard = use_signal(|| None::<ExplorerClipboard>);
+	let mut mind_node_names = use_signal(Vec::<String>::new);
+	let mut mind_node_images = use_signal(Vec::<String>::new);
+	let mut delete_prompt = use_signal(|| None::<(String, String)>);
+	let mind_focus_request = use_signal(|| None::<(FocusTarget, u64)>);
+	let focus_seq = use_signal(|| 0_u64);
+	let mut explorer_width = use_signal(|| 246.0);
+	let mut events_width = use_signal(|| 340.0);
+	let mut resizing = use_signal(|| None::<PanelResize>);
+	let load_error = use_signal(String::new);
+	let save_status = use_signal(String::new);
+	let mut save_request = use_signal(|| 0_u64);
+	let mut directory_name = use_signal(|| "GameCivs".to_string());
+	let android_platform = use_signal(|| false);
+	let all_files_access_granted = use_signal(|| None::<bool>);
+	let permission_error = use_signal(String::new);
+
+	use_effect(move || {
+		let mut android_platform = android_platform;
+		let mut all_files_access_granted = all_files_access_granted;
+		spawn(async move {
+			if matches!(is_android().await, Ok(true)) {
+				android_platform.set(true);
+				all_files_access_granted.set(query_all_files_access().await.ok());
+			}
+		});
+	});
+
+	let on_manage_all_files = move |_| {
+		let mut all_files_access_granted = all_files_access_granted;
+		let mut permission_error = permission_error;
+		spawn(async move {
+			permission_error.set(String::new());
+			match open_all_files_access_settings().await {
+				Ok(granted) => all_files_access_granted.set(Some(granted)),
+				Err(error) => permission_error.set(error),
+			}
+		});
+	};
+
+	let on_choose_directory = EventHandler::new(move |_: ()| {
+		let mut work_directory = work_directory;
+		let mut workspace_files = workspace_files;
+		let mut open_tabs = open_tabs;
+		let mut active_tab_id = active_tab_id;
+		let mut loading = loading;
+		let mut load_progress = load_progress;
+		let mut load_error = load_error;
+		let mut selected_file = selected_file;
+		let mut event_release_request = event_release_request;
+		let mut mind_node_names = mind_node_names;
+		let mut mind_node_images = mind_node_images;
+		spawn(async move {
+			loading.set(true);
+			load_error.set(String::new());
+			load_progress.set(Some(LoadProgress {
+				stage: "正在扫描工作区文件...".to_string(),
+				completed: 0,
+				total: 0,
+			}));
+			match pick_folder("选择 GameCivs 工作目录").await {
+				Ok(Some(selected_directory)) => {
+					match load_workspace_files(&selected_directory).await {
+						Ok(loaded_files) => {
+							open_tabs.set(Vec::new());
+							active_tab_id.set(None);
+							selected_file.set(None);
+							event_release_request.with_mut(|request| {
+								*request = request.wrapping_add(1);
+							});
+							mind_node_names.set(Vec::new());
+							mind_node_images.set(Vec::new());
+							workspace_files.set(loaded_files);
+							work_directory.set(Some(selected_directory));
+						}
+						Err(error) => load_error.set(error),
+					}
+				}
+				Ok(None) => {}
+				Err(error) => load_error.set(error),
+			}
+			loading.set(false);
+			load_progress.set(None);
+		});
+	});
+
+	let on_create_directory = move |_| {
+		let mut work_directory = work_directory;
+		let mut workspace_files = workspace_files;
+		let mut open_tabs = open_tabs;
+		let mut active_tab_id = active_tab_id;
+		let mut selected_file = selected_file;
+		let mut event_release_request = event_release_request;
+		let mut mind_node_names = mind_node_names;
+		let mut mind_node_images = mind_node_images;
+		let mut loading = loading;
+		let mut load_progress = load_progress;
+		let mut load_error = load_error;
+		let directory_name = directory_name.read().trim().to_string();
+		spawn(async move {
+			loading.set(true);
+			load_error.set(String::new());
+			load_progress.set(Some(LoadProgress {
+				stage: "正在创建并载入工作区...".to_string(),
+				completed: 0,
+				total: 0,
+			}));
+			let result = async {
+				let Some(parent_directory) =
+					pick_folder("选择新工作目录的存放位置").await?
+				else {
+					return Ok(None);
+				};
+				let created_directory = if let Some(folder_id) = parent_directory.folder_id {
+					let validation = serde_wasm_bindgen::to_value(&DirectoryNameArgs {
+						directory_name: directory_name.clone(),
+					})
+					.map_err(|error| error.to_string())?;
+					JsFuture::from(invoke("validate_work_directory_name_command", validation))
+						.await
+						.map_err(|error| format!("工作区名称无效：{error:?}"))?;
+					let root_path = join_scoped_path(&parent_directory.root_path, &directory_name);
+					scoped_mkdir(&folder_id, root_path.clone()).await?;
+					scoped_mkdir(
+						&folder_id,
+						join_scoped_path(&root_path, "missions/missionsImages/H"),
+					)
+					.await?;
+					scoped_mkdir(
+						&folder_id,
+						join_scoped_path(&root_path, "missions/missionsEvents"),
+					)
+					.await?;
+					let args = serde_wasm_bindgen::to_value(&SerializeMissionsArgs {
+						missions: Vec::new(),
+					})
+					.map_err(|error| error.to_string())?;
+					let value = JsFuture::from(invoke("serialize_missions", args))
+						.await
+						.map_err(|error| format!("初始化任务配置失败：{error:?}"))?;
+					let contents = value
+						.as_string()
+						.ok_or_else(|| "任务配置序列化结果无效".to_string())?;
+					scoped_write_text_file(
+						&folder_id,
+						join_scoped_path(&root_path, "missions/Missions.json"),
+						contents,
+					)
+					.await?;
+					WorkDirectory {
+						display_path: format!(
+							"{}/{}",
+							parent_directory.display_path, directory_name
+						),
+						folder_id: Some(folder_id),
+						root_path,
+					}
+				} else {
+					let args = serde_wasm_bindgen::to_value(&CreateWorkDirectoryArgs {
+						parent_directory: parent_directory.root_path,
+						directory_name,
+					})
+					.map_err(|error| error.to_string())?;
+					let value = JsFuture::from(invoke("create_work_directory", args))
+						.await
+						.map_err(|error| format!("创建工作目录失败：{error:?}"))?;
+					let path = value
+						.as_string()
+						.ok_or_else(|| "创建目录命令未返回路径".to_string())?;
+					WorkDirectory {
+						display_path: path.clone(),
+						folder_id: None,
+						root_path: path,
+					}
+				};
+				Ok(Some(created_directory))
+			}
+			.await;
+
+			match result {
+				Ok(Some(created_directory)) => {
+					match load_workspace_files(&created_directory).await {
+						Ok(loaded_files) => {
+							open_tabs.set(Vec::new());
+							active_tab_id.set(None);
+							selected_file.set(None);
+							event_release_request.with_mut(|request| {
+								*request = request.wrapping_add(1);
+							});
+							mind_node_names.set(Vec::new());
+							mind_node_images.set(Vec::new());
+							workspace_files.set(loaded_files);
+							work_directory.set(Some(created_directory));
+							// 自动打开初始空国策树。
+							load_progress.set(Some(LoadProgress {
+								stage: "正在打开初始国策树...".to_string(),
+								completed: 0,
+								total: 0,
+							}));
+							let starter_directory = work_directory.read().clone();
+							if let Some(starter_directory) = starter_directory {
+								match load_tree_records(
+									&starter_directory,
+									"missions/Missions.json",
+								)
+								.await
+								{
+									Ok(records) => {
+										open_tabs.with_mut(|tabs| {
+											tabs.push(TreeTab {
+												id: "missions/Missions.json".to_string(),
+												title: "Missions".to_string(),
+												json_path: "missions/Missions.json"
+													.to_string(),
+												missions: records,
+												icons: Vec::new(),
+												dirty: false,
+												save_ack: 0,
+											});
+										});
+										active_tab_id
+											.set(Some("missions/Missions.json".to_string()));
+									}
+									Err(error) => load_error.set(error),
+								}
+							}
+						}
+						Err(error) => load_error.set(error),
+					}
+				}
+				Ok(None) => {}
+				Err(error) => load_error.set(error),
+			}
+			loading.set(false);
+			load_progress.set(None);
+		});
+	};
+
+	// 释放不再被任何标签页引用的事件脚本内存。
+	let release_event_if_unused = EventHandler::new(move |_: ()| {
+		let Some(path) = selected_file.read().clone() else {
+			return;
+		};
+		let name = path
+			.strip_prefix("missions/missionsEvents/")
+			.or_else(|| path.strip_prefix("missionsEvents/"))
+			.unwrap_or(&path);
+		let referenced = open_tabs.read().iter().any(|tab| {
+			tab.missions
+				.iter()
+				.any(|mission| mission.mission_event == name)
+		});
+		if !referenced {
+			event_release_request.with_mut(|request| *request = request.wrapping_add(1));
+			selected_file.set(None);
+		}
+	});
+
+	// 关闭标签页：从列表移除（对应画布卸载，图标与国策数据随之释放）。
+	let on_close_tab = EventHandler::new(move |tab_id: String| {
+		dioxus_logger::tracing::info!("CLOSE-TAB: {tab_id}");
+		// 先快照全部信号值（读守卫随语句结束释放），再统一写入，避免重入借用。
+		let tabs_snapshot: Vec<TreeTab> = open_tabs.read().clone();
+		let current_active = active_tab_id.read().clone();
+		let was_active = current_active.as_deref() == Some(tab_id.as_str());
+		let remaining: Vec<TreeTab> = tabs_snapshot
+			.iter()
+			.filter(|tab| tab.id != tab_id)
+			.cloned()
+			.collect();
+		let next_active = if was_active {
+			let removed_index = tabs_snapshot
+				.iter()
+				.position(|tab| tab.id == tab_id)
+				.unwrap_or(0);
+			remaining
+				.get(removed_index.min(remaining.len().saturating_sub(1)))
+				.map(|tab| tab.id.clone())
+		} else {
+			current_active
+		};
+		open_tabs.set(remaining);
+		active_tab_id.set(next_active);
+		if open_tabs.read().is_empty() {
+			mind_node_names.set(Vec::new());
+			mind_node_images.set(Vec::new());
+		}
+		release_event_if_unused.call(());
+	});
+
+	// 点 X 关闭：未保存修改先弹出确认，否则直接关闭。
+	let on_close_tab_requested = EventHandler::new(move |tab_id: String| {
+		dioxus_logger::tracing::info!("CLOSE-REQUESTED: {tab_id}");
+		let dirty = open_tabs
+			.read()
+			.iter()
+			.find(|tab| tab.id == tab_id)
+			.map(|tab| tab.dirty)
+			.unwrap_or(false);
+		if dirty {
+			tab_close_prompt.set(Some(tab_id));
+		} else {
+			on_close_tab.call(tab_id);
+		}
+	});
+
+	// 双击 .json 打开（或激活）国策树标签页。
+	let on_open_tree = EventHandler::new(move |json_path: String| {
+		let mut load_error = load_error;
+		let Some(directory) = work_directory.read().clone() else {
+			load_error.set("打开国策树失败：请先打开工作区".to_string());
+			return;
+		};
+		if let Some(tab) = open_tabs
+			.read()
+			.iter()
+			.find(|tab| tab.json_path == json_path)
+		{
+			active_tab_id.set(Some(tab.id.clone()));
+			return;
+		}
+		if *loading.read() {
+			return;
+		}
+		let mut loading = loading;
+		let mut load_progress = load_progress;
+		let mut open_tabs = open_tabs;
+		let mut active_tab_id = active_tab_id;
+		spawn(async move {
+			loading.set(true);
+			load_error.set(String::new());
+			load_progress.set(Some(LoadProgress {
+				stage: "正在读取国策配置...".to_string(),
+				completed: 0,
+				total: 0,
+			}));
+			let result = async {
+				let records = load_tree_records(&directory, &json_path).await?;
+				load_progress.set(Some(LoadProgress {
+					stage: "正在扫描国策图标...".to_string(),
+					completed: 0,
+					total: 0,
+				}));
+				let icons = load_tree_icons(&directory, &records, load_progress).await?;
+				Ok::<_, String>((records, icons))
+			}
+			.await;
+			match result {
+				Ok((records, icons)) => {
+					let title = json_path
+						.strip_prefix("missions/")
+						.unwrap_or(&json_path)
+						.trim_end_matches(".json")
+						.to_string();
+					open_tabs.with_mut(|tabs| {
+						tabs.push(TreeTab {
+							id: json_path.clone(),
+							title,
+							json_path: json_path.clone(),
+							missions: records,
+							icons,
+							dirty: false,
+							save_ack: 0,
+						});
+					});
+					active_tab_id.set(Some(json_path));
+				}
+				Err(error) => load_error.set(format!("打开国策树失败：{error}")),
+			}
+			loading.set(false);
+			load_progress.set(None);
+		});
+	});
+
+	// 文件列表变化后剪掉已不存在的国策树标签页。
+	let prune_tabs = EventHandler::new(move |files: Vec<WorkspaceFile>| {
+		let removed: Vec<String> = open_tabs
+			.read()
+			.iter()
+			.filter(|tab| !files.iter().any(|file| file.relative_path == tab.json_path))
+			.map(|tab| tab.id.clone())
+			.collect();
+		if removed.is_empty() {
+			return;
+		}
+		let remaining: Vec<TreeTab> = open_tabs
+			.read()
+			.iter()
+			.filter(|tab| !removed.contains(&tab.id))
+			.cloned()
+			.collect();
+		let active_removed = active_tab_id
+			.read()
+			.as_ref()
+			.map(|id| removed.contains(id))
+			.unwrap_or(false);
+		let next_active = if active_removed {
+			remaining.first().map(|tab| tab.id.clone())
+		} else {
+			active_tab_id.read().clone()
+		};
+		open_tabs.set(remaining);
+		active_tab_id.set(next_active);
+		if open_tabs.read().is_empty() {
+			mind_node_names.set(Vec::new());
+			mind_node_images.set(Vec::new());
+		}
+		release_event_if_unused.call(());
+	});
+
+	// 保存单个国策树（仅激活标签页响应 Ctrl+S / 保存按钮）。
+	let on_save_tab = EventHandler::new(move |(tab_id, records): (String, Vec<MissionRecord>)| {
+		let Some(directory) = work_directory.read().clone() else {
+			return;
+		};
+		let Some(json_path) = open_tabs
+			.read()
+			.iter()
+			.find(|tab| tab.id == tab_id)
+			.map(|tab| tab.json_path.clone())
+		else {
+			return;
+		};
+		let mut save_status = save_status;
+		let mut open_tabs = open_tabs;
+		spawn(async move {
+			save_status.set("正在保存...".to_string());
+			match save_tree_file(&directory, &json_path, records).await {
+				Ok(()) => {
+					open_tabs.with_mut(|tabs| {
+						if let Some(tab) = tabs.iter_mut().find(|tab| tab.json_path == json_path) {
+							tab.save_ack = tab.save_ack.wrapping_add(1);
+						}
+					});
+					save_status.set("保存完成".to_string());
+				}
+				Err(error) => save_status.set(format!("保存失败：{error}")),
+			}
+		});
+	});
+
+	// 画布脏状态回传，关闭标签页前提示未保存修改。
+	let on_dirty_change = EventHandler::new(move |(tab_id, dirty): (String, bool)| {
+		open_tabs.with_mut(|tabs| {
+			if let Some(tab) = tabs.iter_mut().find(|tab| tab.id == tab_id) {
+				tab.dirty = dirty;
+			}
+		});
+	});
+
+	// 点击标签页切换激活国策树。
+	let on_select_tab = EventHandler::new(move |tab_id: String| {
+		active_tab_id.set(Some(tab_id));
+	});
+
+	let on_edit_event = move |file_name: String| {
+		let mut events_open = events_open;
+		let mut open_event_request = open_event_request;
+		events_open.set(true);
+		open_event_request.set(Some(file_name));
+	};
+
+	let on_create_event_file = move |(file_name, contents): (String, String)| {
+		let Some(directory) = work_directory.read().clone() else {
+			let mut load_error = load_error;
+			load_error.set("创建事件脚本失败：请先打开工作区".to_string());
+			return;
+		};
+		spawn(async move {
+			let mut load_error = load_error;
+			let mut workspace_files = workspace_files;
+			match save_event_text(&directory, &file_name, &contents).await {
+				Ok(()) => {
+					let relative_path = format!("missions/missionsEvents/{file_name}");
+					workspace_files.with_mut(|files| {
+						if !files.iter().any(|file| file.relative_path == relative_path) {
+							files.push(WorkspaceFile {
+								name: file_name.clone(),
+								relative_path,
+								is_directory: false,
+							});
+						}
+					});
+				}
+				Err(error) => load_error.set(format!("创建事件脚本失败：{error}")),
+			}
+		});
+	};
+
+	let on_delete_event_file = move |file_name: String| {
+		let Some(directory) = work_directory.read().clone() else {
+			return;
+		};
+		spawn(async move {
+			let mut load_error = load_error;
+			let mut workspace_files = workspace_files;
+			match delete_event_text(&directory, &file_name).await {
+				Ok(()) => {
+					workspace_files.with_mut(|files| {
+						files.retain(|file| {
+							!(file.name == file_name
+								&& file.relative_path.starts_with("missions/missionsEvents/"))
+						});
+					});
+				}
+				Err(error) => load_error.set(format!("删除事件脚本失败：{error}")),
+			}
+		});
+	};
+
+	let on_rename_event_file = move |(old_name, new_name): (String, String)| {
+		if old_name == new_name {
+			return;
+		}
+		let Some(directory) = work_directory.read().clone() else {
+			return;
+		};
+		spawn(async move {
+			let mut load_error = load_error;
+			let mut workspace_files = workspace_files;
+			let mut rename_event_request = rename_event_request;
+			match rename_event_text(&directory, &old_name, &new_name).await {
+				Ok(()) => {
+					workspace_files.with_mut(|files| {
+						let old_relative_path = format!("missions/missionsEvents/{old_name}");
+						for file in files.iter_mut() {
+							if file.relative_path == old_relative_path {
+								file.name = new_name.clone();
+								file.relative_path = format!("missions/missionsEvents/{new_name}");
+							}
+						}
+					});
+					rename_event_request.set(Some((old_name, new_name)));
+				}
+				Err(error) => load_error.set(format!("重命名事件脚本失败：{error}")),
+			}
+		});
+	};
+
+	// 事件面板选中文件变化 → 资源管理器定位并高亮。
+	let on_file_selected = move |path: Option<String>| {
+		let mut selected_file = selected_file;
+		selected_file.set(path);
+	};
+
+	// 思维导图节点变化 → 记录当前使用的标题与图标（删除前占用检查用）。
+	let on_nodes_change = move |(names, images): (Vec<String>, Vec<String>)| {
+		let mut mind_node_names = mind_node_names;
+		let mut mind_node_images = mind_node_images;
+		if *mind_node_names.read() != names {
+			mind_node_names.set(names);
+		}
+		if *mind_node_images.read() != images {
+			mind_node_images.set(images);
+		}
+	};
+
+	// 资源管理器双击：json → 打开国策树标签页；txt → 打开事件面板并聚焦卡片；
+	// png → 手动载入当前国策树图标库（供创建卡片菜单选用）并聚焦使用该图标的卡片。
+	let on_open_file = move |relative_path: String| {
+		if let Some(name) = relative_path.strip_prefix("missions/") {
+			if name.to_ascii_lowercase().ends_with(".json") && !name.contains('/') {
+				on_open_tree.call(relative_path.clone());
+				return;
+			}
+		}
+		if let Some(file_name) = relative_path
+			.strip_prefix("missions/missionsEvents/")
+			.or_else(|| relative_path.strip_prefix("missionsEvents/"))
+			.map(|name| name.to_string())
+			.filter(|name| name.to_ascii_lowercase().ends_with(".txt"))
+		{
+			let mut events_open = events_open;
+			let mut open_event_request = open_event_request;
+			events_open.set(true);
+			open_event_request.set(Some(file_name.clone()));
+
+			let title = file_name.strip_suffix(".txt").unwrap_or(&file_name).to_string();
+			let mut focus_seq = focus_seq;
+			let seq = focus_seq.read().wrapping_add(1);
+			focus_seq.set(seq);
+			let mut mind_focus_request = mind_focus_request;
+			mind_focus_request.set(Some((FocusTarget::Title(title), seq)));
+			return;
+		}
+		if let Some(file_name) = relative_path
+			.strip_prefix("missions/missionsImages/")
+			.or_else(|| relative_path.strip_prefix("missionsImages/"))
+			.map(|name| name.to_string())
+			.filter(|name| name.to_ascii_lowercase().ends_with(".png"))
+		{
+			// 图标在 H/ 子目录下，取末段文件名与卡片 image_name 匹配。
+			let file_name = file_name.rsplit('/').next().unwrap_or(&file_name).to_string();
+			let mut focus_seq = focus_seq;
+			let seq = focus_seq.read().wrapping_add(1);
+			focus_seq.set(seq);
+			let mut mind_focus_request = mind_focus_request;
+			mind_focus_request.set(Some((FocusTarget::Image(file_name.clone()), seq)));
+
+			// 手动加载图标：双击 .png 时把该图标载入当前激活国策树，供创建卡片菜单选用。
+			// 图标选择器不再自动加载完整图标库，避免图标过多时页面卡死。
+			let file_exists = workspace_files
+				.read()
+				.iter()
+				.any(|file| file.relative_path == relative_path);
+			if !file_exists {
+				return;
+			}
+			let Some(tab_id) = active_tab_id.read().clone() else {
+				return;
+			};
+			let Some(directory) = work_directory.read().clone() else {
+				return;
+			};
+			let icon_name = file_name
+				.rsplit_once('.')
+				.map_or_else(|| file_name.clone(), |(stem, _)| stem.to_string());
+			let mut pending_icon = pending_icon;
+			let mut load_error = load_error;
+			spawn(async move {
+				match load_single_icon(&directory, &icon_name, &relative_path).await {
+					Ok(Some(icon)) => pending_icon.set(Some((tab_id, icon))),
+					Ok(None) => {}
+					Err(error) => load_error.set(format!("载入图标失败：{error}")),
+				}
+			});
+		}
+	};
+
+	// 资源管理器右键命令：剪切/复制/粘贴/删除/打开文件位置。
+	let on_explorer_command = move |(command, argument): (ExplorerCommand, String)| {
+		match command {
+			ExplorerCommand::Cut | ExplorerCommand::Copy => {
+				let Some(entry) = workspace_files
+					.read()
+					.iter()
+					.find(|file| file.relative_path == argument)
+					.cloned()
+				else {
+					return;
+				};
+				let mut explorer_clipboard = explorer_clipboard;
+				explorer_clipboard.set(Some(ExplorerClipboard {
+					source_path: entry.relative_path,
+					source_name: entry.name,
+					is_directory: entry.is_directory,
+					is_cut: command == ExplorerCommand::Cut,
+				}));
+			}
+			ExplorerCommand::Paste => {
+				let Some(directory) = work_directory.read().clone() else {
+					return;
+				};
+				let Some(clipboard) = explorer_clipboard.read().clone() else {
+					return;
+				};
+				let target_dir = argument;
+				let source_path = clipboard.source_path.clone();
+				let source_name = clipboard.source_name.clone();
+				let is_cut = clipboard.is_cut;
+				spawn(async move {
+					let mut load_error = load_error;
+					let mut workspace_files = workspace_files;
+					let mut explorer_clipboard = explorer_clipboard;
+					let mut selected_file = selected_file;
+					// 目标名冲突时生成“xx 副本.txt”形式的唯一名。
+					let (stem, ext) = source_name
+						.rsplit_once('.')
+						.map(|(s, e)| (s.to_string(), format!(".{e}")))
+						.unwrap_or((source_name.clone(), String::new()));
+					let exists = |name: &str| {
+						workspace_files
+							.read()
+							.iter()
+							.any(|file| file.relative_path == join_rel_path(&target_dir, name))
+					};
+					let mut target_name = source_name.clone();
+					let mut counter = 1;
+					while exists(&target_name) {
+						counter += 1;
+						target_name = if counter == 2 {
+							format!("{stem} 副本{ext}")
+						} else {
+							format!("{stem} 副本 {counter}{ext}")
+						};
+					}
+					let target_path = join_rel_path(&target_dir, &target_name);
+					let result = if is_cut {
+						if source_path == target_path {
+							Ok(())
+						} else {
+							move_item(&directory, &source_path, &target_path).await
+						}
+					} else {
+						copy_item(&directory, &source_path, &target_path).await
+					};
+					match result {
+						Ok(()) => {
+							if is_cut {
+								explorer_clipboard.set(None);
+								if selected_file.read().clone() == Some(source_path.clone()) {
+									selected_file.set(Some(target_path.clone()));
+								}
+							}
+							if let Ok(files) = reload_file_list(&directory).await {
+								workspace_files.set(files.clone());
+								prune_tabs.call(files);
+							}
+						}
+						Err(error) => load_error.set(format!("粘贴失败：{error}")),
+					}
+				});
+			}
+			ExplorerCommand::Delete => {
+				let name = argument.rsplit('/').next().unwrap_or(&argument).to_string();
+				let stem = name.strip_suffix(".txt").unwrap_or(&name).to_string();
+				let is_events = argument.starts_with("missions/missionsEvents/")
+					|| argument.starts_with("missionsEvents/");
+				let is_image = argument.starts_with("missions/missionsImages/")
+					|| argument.starts_with("missionsImages/");
+
+				// 占用检查：画布中正在使用的脚本/图标删除前给出警告。
+				let mut warning = String::new();
+				let is_open_tree = argument.to_ascii_lowercase().ends_with(".json")
+					&& open_tabs.read().iter().any(|tab| tab.json_path == argument);
+				if argument == "missions/Missions.json" {
+					warning =
+						"Missions.json 是国策树画布配置文件，删除后画布将无法加载。".to_string();
+				} else if is_open_tree {
+					warning = "该文件已作为国策树在标签页中打开，删除后对应标签页将关闭。".to_string();
+				} else if is_events && mind_node_names.read().contains(&stem) {
+					warning = format!(
+						"该脚本正被国策卡片「{stem}」使用，删除后对应国策将没有事件脚本。"
+					);
+				} else if is_image && mind_node_images.read().contains(&name) {
+					warning = format!("该图标正被国策卡片使用，删除后卡片图标将无法显示。");
+				}
+				let message = if warning.is_empty() {
+					format!("确定删除 {name} 吗？此操作不可恢复。")
+				} else {
+					format!("{warning}\n\n确定仍然删除 {name} 吗？此操作不可恢复。")
+				};
+				let mut delete_prompt = delete_prompt;
+				delete_prompt.set(Some((argument, message)));
+			}
+			ExplorerCommand::Reveal => {
+				let Some(directory) = work_directory.read().clone() else {
+					return;
+				};
+				spawn(async move {
+					let mut load_error = load_error;
+					if let Err(error) = reveal_item(&directory, &argument).await {
+						load_error.set(format!("打开文件位置失败：{error}"));
+					}
+				});
+			}
+		}
+	};
+
+	let has_workspace = work_directory.read().is_some();
+	let current_directory = work_directory.read().clone();
+	let workspace_name = current_directory
+		.as_ref()
+		.map(|directory| {
+			let path = &directory.display_path;
+			path.trim_end_matches(|character| character == '\\' || character == '/')
+				.rsplit(|character| character == '\\' || character == '/')
+				.next()
+				.unwrap_or_default()
+		})
+		.filter(|name| !name.is_empty())
+		.unwrap_or("AgeCivModTool")
+		.to_string();
+	let progress_snapshot = load_progress.read().clone();
+	let (loading_stage, loading_percent, loading_counter) = match progress_snapshot {
+		Some(progress) if progress.total > 0 => {
+			let percent = (progress.completed as f64 / progress.total as f64 * 100.0)
+				.clamp(0.0, 100.0);
+			(
+				progress.stage,
+				Some(percent),
+				Some(format!("{} / {}", progress.completed, progress.total)),
+			)
+		}
+		Some(progress) => (progress.stage, None, None),
+		None => ("正在准备...".to_string(), None, None),
+	};
+	let tab_close_prompt_data = tab_close_prompt.read().clone().map(|tab_id| {
+		let title = open_tabs
+			.read()
+			.iter()
+			.find(|tab| tab.id == tab_id)
+			.map(|tab| tab.title.clone())
+			.unwrap_or_default();
+		(tab_id, title)
+	});
+	let canvas_tabs: Vec<(String, TreeTab)> = open_tabs
+		.read()
+		.iter()
+		.cloned()
+		.map(|tab| (tab.id.clone(), tab))
+		.collect();
+	rsx! {
+        div {
+            class: if resizing.read().is_some() { "editor-shell resizing" } else { "editor-shell" },
+            tabindex: "0",
+            autofocus: true,
+            onpointermove: move |evt: Event<PointerData>| {
+                let Some(state) = *resizing.read() else {
+                    return;
+                };
+                let delta = evt.client_coordinates().x - state.start_x;
+                match state.side {
+                    ResizeSide::Explorer => {
+                        explorer_width
+                            .set(
+                                (state.start_width + delta)
+                                    .clamp(EXPLORER_MIN_WIDTH, EXPLORER_MAX_WIDTH),
+                            );
+                    }
+                    ResizeSide::Events => {
+                        events_width
+                            .set(
+                                (state.start_width - delta)
+                                    .clamp(EVENTS_MIN_WIDTH, EVENTS_MAX_WIDTH),
+                            );
+                    }
+                }
+            },
+            onpointerup: move |_| resizing.set(None),
+            onpointercancel: move |_| resizing.set(None),
+            onkeydown: move |evt: Event<KeyboardData>| {
+                let data = evt.data();
+                let key = data.key().to_string();
+                let modifiers = data.modifiers();
+                if modifiers.contains(Modifiers::CONTROL) || modifiers.contains(Modifiers::META)
+                {
+                    match key.to_ascii_lowercase().as_str() {
+                        "s" => {
+                            evt.prevent_default();
+                            save_request.with_mut(|request| *request = request.wrapping_add(1));
+                        }
+                        "o" => {
+                            evt.prevent_default();
+                            if !*loading.read() {
+                                on_choose_directory.call(());
+                            }
+                        }
+                        "n" => {
+                            evt.prevent_default();
+                            if !*loading.read() {
+                                on_create_directory(());
+                            }
+                        }
+                        "w" => {
+                            evt.prevent_default();
+                            let active_tab = active_tab_id.read().clone();
+                            if let Some(tab_id) = active_tab {
+                                on_close_tab_requested.call(tab_id);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            },
+            Frame {
+                on_open: move |_| on_choose_directory.call(()),
+                on_new: move |_| on_create_directory(()),
+                on_manage_all_files,
+                on_save: move |_| save_request.with_mut(|request| *request = request.wrapping_add(1)),
+                on_toggle_files: move |_| {
+                    let next = !*files_open.read();
+                    files_open.set(next);
+                },
+                on_toggle_events: move |_| {
+                    let next = !*events_open.read();
+                    events_open.set(next);
+                },
+                has_workspace,
+                workspace_name,
+                is_loading: *loading.read(),
+                is_android: *android_platform.read(),
+                all_files_access_granted: *all_files_access_granted.read(),
+                tabs: open_tabs
+                                                                                    .read()
+                                                                                    .iter()
+                                                                                    .map(|tab| (tab.id.clone(), tab.title.clone()))
+                                                                                    .collect(),
+                active_tab_id: active_tab_id.read().clone(),
+                on_select_tab,
+                on_close_tab: on_close_tab_requested,
+            }
+            div { class: "editor-body",
+                if *files_open.read() {
+                    div { class: "drawer explorer-drawer",
+                        Files {
+                            entries: workspace_files.read().clone(),
+                            work_directory: current_directory.as_ref().map(|directory| directory.display_path.clone()),
+                            width: *explorer_width.read(),
+                            selected_path: selected_file,
+                            clipboard: explorer_clipboard,
+                            on_open_file,
+                            on_command: on_explorer_command,
+                        }
+                        div {
+                            class: "resize-handle",
+                            role: "separator",
+                            aria_orientation: "vertical",
+                            aria_hidden: "true",
+                            id: "resize-explorer",
+                            onpointerdown: move |evt: Event<PointerData>| {
+                                resizing
+                                    .set(
+                                        Some(PanelResize {
+                                            side: ResizeSide::Explorer,
+                                            start_x: evt.client_coordinates().x,
+                                            start_width: *explorer_width.read(),
+                                        }),
+                                    );
+                                let pointer_id = evt.data().pointer_id();
+                                spawn(async move {
+                                    let _ = dioxus::document::eval(
+                                            &format!(
+                                                "document.getElementById('resize-explorer')?.setPointerCapture({pointer_id})",
+                                            ),
+                                        )
+                                        .await;
+                                });
+                            },
+                        }
+                    }
+                }
+                main { class: "editor-main",
+                    if *loading.read() {
+                        div { class: "loading-panel", role: "status",
+                            div { class: "loading-stage", "{loading_stage}" }
+                            if let Some(percent) = loading_percent {
+                                div {
+                                    class: "loading-progress",
+                                    role: "progressbar",
+                                    aria_valuemin: "0",
+                                    aria_valuemax: "100",
+                                    aria_valuenow: "{percent:.0}",
+                                    div {
+                                        class: "loading-progress-fill",
+                                        style: "width: {percent}%;",
+                                    }
+                                }
+                            } else {
+                                div { class: "loading-progress indeterminate",
+                                    div { class: "loading-progress-fill" }
+                                }
+                            }
+                            if let Some(counter) = loading_counter {
+                                div { class: "loading-progress-text", "{counter}" }
+                            }
+                        }
+                    } else if !open_tabs.read().is_empty() {
+                        div { class: "canvas-stage",
+                            for (tab_id , tab) in canvas_tabs {
+                                TreeCanvas {
+                                    key: "{tab_id}",
+                                    tab,
+                                    active_tab_id,
+                                    save_request,
+                                    save_status: save_status.read().clone(),
+                                    focus_request: mind_focus_request,
+                                    pending_icon,
+                                    is_android: *android_platform.read(),
+                                    on_save: on_save_tab,
+                                    on_edit_event,
+                                    on_create_event_file,
+                                    on_delete_event_file,
+                                    on_rename_event_file,
+                                    on_nodes_change,
+                                    on_dirty_change,
+                                }
+                            }
+                        }
+                    } else {
+                        div { class: "welcome-panel",
+                            div { class: "welcome-mark", "A" }
+                            h1 { "国策树工作区" }
+                            p {
+                                if work_directory.read().is_some() {
+                                    "在资源管理器中双击 missions 下的 .json 文件打开国策树。"
+                                } else {
+                                    "从文件菜单打开现有工作区，或创建一个新的工作区。"
+                                }
+                            }
+                            label { class: "workspace-name",
+                                span { "新工作区名称" }
+                                input {
+                                    value: "{directory_name}",
+                                    oninput: move |event: FormEvent| directory_name.set(event.value()),
+                                }
+                            }
+                            if !load_error.read().is_empty() {
+                                p { class: "workspace-error", role: "alert", "{load_error.read()}" }
+                            }
+                        }
+                    }
+                }
+                if *events_open.read() {
+                    div { class: "drawer events-drawer",
+                        div {
+                            class: "resize-handle",
+                            role: "separator",
+                            aria_orientation: "vertical",
+                            aria_hidden: "true",
+                            id: "resize-events",
+                            onpointerdown: move |evt: Event<PointerData>| {
+                                resizing
+                                    .set(
+                                        Some(PanelResize {
+                                            side: ResizeSide::Events,
+                                            start_x: evt.client_coordinates().x,
+                                            start_width: *events_width.read(),
+                                        }),
+                                    );
+                                let pointer_id = evt.data().pointer_id();
+                                spawn(async move {
+                                    let _ = dioxus::document::eval(
+                                            &format!(
+                                                "document.getElementById('resize-events')?.setPointerCapture({pointer_id})",
+                                            ),
+                                        )
+                                        .await;
+                                });
+                            },
+                        }
+                        EventPanel {
+                            work_directory: current_directory.clone(),
+                            save_request,
+                            open_request: open_event_request,
+                            rename_request: rename_event_request,
+                            release_request: event_release_request,
+                            on_selection_change: on_file_selected,
+                            width: *events_width.read(),
+                        }
+                    }
+                }
+            }
+            footer { class: "editor-statusbar",
+                span {
+                    if has_workspace {
+                        "工作区已载入"
+                    } else {
+                        "未打开工作区"
+                    }
+                }
+                if let Some(tab_id) = active_tab_id.read().clone() {
+                    if let Some(tab) = open_tabs.read().iter().find(|tab| tab.id == tab_id) {
+                        span { class: "status-path", "国策树：{tab.title}" }
+                    }
+                }
+                if let Some(directory) = current_directory {
+                    span {
+                        class: "status-path",
+                        title: "{directory.display_path}",
+                        "{directory.display_path}"
+                    }
+                }
+                if !permission_error.read().is_empty() {
+                    span {
+                        class: "status-error",
+                        role: "alert",
+                        title: "{permission_error.read()}",
+                        "{permission_error.read()}"
+                    }
+                }
+            }
+            if let Some((path, message)) = delete_prompt.read().clone() {
+                div {
+                    class: "menu-dismiss",
+                    style: "z-index: 55;",
+                    aria_hidden: "true",
+                    onclick: move |_| delete_prompt.set(None),
+                }
+                div { class: "confirm-dialog", role: "alertdialog",
+                    p { class: "confirm-message", "{message}" }
+                    div { class: "confirm-actions",
+                        button {
+                            class: "event-save",
+                            r#type: "button",
+                            onclick: move |_| {
+                                let directory = work_directory.read().clone();
+                                let is_directory = workspace_files
+                                    .read()
+                                    .iter()
+                                    .find(|file| file.relative_path == path)
+                                    .map(|file| file.is_directory)
+                                    .unwrap_or(false);
+                                delete_prompt.set(None);
+                                if let Some(directory) = directory {
+                                    let path = path.clone();
+                                    spawn(async move {
+                                        let mut load_error = load_error;
+                                        let mut workspace_files = workspace_files;
+                                        match delete_item(&directory, &path, is_directory).await {
+                                            Ok(()) => {
+                                                if let Ok(files) = reload_file_list(&directory).await
+                                                {
+                                                    workspace_files.set(files.clone());
+                                                    prune_tabs.call(files);
+                                                }
+                                            }
+                                            Err(error) => load_error.set(format!("删除失败：{error}")),
+                                        }
+                                    }
+                                    );
+                                }
+                            },
+                            "确认删除"
+                        }
+                        button {
+                            class: "event-revert",
+                            r#type: "button",
+                            onclick: move |_| delete_prompt.set(None),
+                            "取消"
+                        }
+                    }
+                }
+            }
+            if let Some((tab_id, tab_title)) = tab_close_prompt_data {
+                div {
+                    class: "menu-dismiss",
+                    style: "z-index: 55;",
+                    aria_hidden: "true",
+                    onclick: move |_| tab_close_prompt.set(None),
+                }
+                div { class: "confirm-dialog", role: "alertdialog",
+                    p { class: "confirm-message",
+                        "国策树「{tab_title}」有未保存的修改，关闭标签页将丢失这些修改。"
+                    }
+                    div { class: "confirm-actions",
+                        button {
+                            class: "event-save",
+                            r#type: "button",
+                            onclick: move |_| {
+                                tab_close_prompt.set(None);
+                                on_close_tab.call(tab_id.clone());
+                            },
+                            "关闭标签页"
+                        }
+                        button {
+                            class: "event-revert",
+                            r#type: "button",
+                            onclick: move |_| tab_close_prompt.set(None),
+                            "取消"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
