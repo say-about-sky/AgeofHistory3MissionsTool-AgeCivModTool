@@ -1,6 +1,6 @@
 # AgeCivModTool
 
-This template should help get you started developing with Tauri and Dioxus.
+文明时代3 决议国策编辑器
 
 ## Recommended IDE Setup
 
