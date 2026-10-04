@@ -1,0 +1,162 @@
+use dioxus::prelude::*;
+
+#[component]
+pub fn Frame(
+	on_open: EventHandler<()>,
+	on_new: EventHandler<()>,
+    on_save: EventHandler<()>,
+	on_toggle_files: EventHandler<()>,
+	on_toggle_events: EventHandler<()>,
+        on_manage_all_files: EventHandler<()>,
+	has_workspace: bool,
+    workspace_name: String,
+	is_loading: bool,
+        is_android: bool,
+        all_files_access_granted: Option<bool>,
+	tabs: Vec<(String, String)>,
+	active_tab_id: Option<String>,
+	on_select_tab: EventHandler<String>,
+	on_close_tab: EventHandler<String>,
+) -> Element {
+	let mut file_menu_open = use_signal(|| false);
+	// 预克隆标签数据，供 rsx 循环体中的多个闭包各自持有。
+	// 注意：select_id 与 close_id 都必须填 id，不能填 title，否则关闭匹配不到标签。
+	let tab_items: Vec<(String, String, String, String)> = tabs
+		.iter()
+		.map(|(id, title)| (id.clone(), title.clone(), id.clone(), id.clone()))
+		.collect();
+
+	rsx! {
+        header { class: "editor-header",
+            if *file_menu_open.read() {
+                div {
+                    class: "menu-dismiss",
+                    aria_hidden: "true",
+                    onclick: move |_| file_menu_open.set(false),
+                }
+            }
+            div { class: "editor-titlebar",
+                div { class: "app-mark", "🗃️" }
+                span { class: "app-title", "{workspace_name}" }
+            }
+            nav { class: "menu-bar", "aria-label": "主菜单",
+                div { class: "menu-wrap",
+                    button {
+                        class: "menu-trigger",
+                        r#type: "button",
+                        aria_expanded: "{file_menu_open}",
+                        onclick: move |_| file_menu_open.toggle(),
+                        "文件"
+                    }
+                    if *file_menu_open.read() {
+                        div { class: "menu-popover",
+                            button {
+                                class: "menu-item",
+                                r#type: "button",
+                                disabled: is_loading,
+                                onclick: move |_| {
+                                    file_menu_open.set(false);
+                                    on_new.call(());
+                                },
+                                span { class: "menu-symbol", "+" }
+                                span { "新建工作区..." }
+                                span { class: "menu-shortcut", "Ctrl+N" }
+                            }
+                            button {
+                                class: "menu-item",
+                                r#type: "button",
+                                disabled: is_loading,
+                                onclick: move |_| {
+                                    file_menu_open.set(false);
+                                    on_open.call(());
+                                },
+                                span { class: "menu-symbol", "↗" }
+                                span { "打开工作区..." }
+                                span { class: "menu-shortcut", "Ctrl+O" }
+                            }
+                            if is_android {
+                                button {
+                                    class: "menu-item",
+                                    r#type: "button",
+                                    onclick: move |_| {
+                                        file_menu_open.set(false);
+                                        on_manage_all_files.call(());
+                                    },
+                                    span { class: "menu-symbol", "⇧" }
+                                    span { "全盘文件访问权限..." }
+                                    span { class: "menu-shortcut",
+                                        if all_files_access_granted == Some(true) {
+                                            "已授权"
+                                        } else {
+                                            "未授权"
+                                        }
+                                    }
+                                }
+                            }
+                            button {
+                                class: "menu-item",
+                                r#type: "button",
+                                disabled: !has_workspace || is_loading,
+                                onclick: move |_| {
+                                    file_menu_open.set(false);
+                                    on_save.call(());
+                                },
+                                span { class: "menu-symbol", "↓" }
+                                span { "保存工作区" }
+                                span { class: "menu-shortcut", "Ctrl+S" }
+                            }
+                        }
+                    }
+                }
+                button {
+                    class: "menu-trigger",
+                    r#type: "button",
+                    onclick: move |_| on_toggle_files.call(()),
+                    span { class: "toolbar-icon", "▤" }
+                    "资源管理器"
+                }
+                if !tabs.is_empty() {
+                    div {
+                        class: "tab-strip",
+                        role: "tablist",
+                        aria_label: "国策树标签页",
+                        for (id , title , select_id , close_id) in tab_items {
+                            div {
+                                class: if active_tab_id.as_ref() == Some(&id) { "editor-tab active" } else { "editor-tab" },
+                                role: "tab",
+                                aria_selected: "{active_tab_id.as_ref() == Some(&id)}",
+                                title: "{title}",
+                                span {
+                                    class: "tab-select",
+                                    title: "{title}",
+                                    onclick: move |_| on_select_tab.call(select_id.clone()),
+                                    span { class: "tab-label", "{title}" }
+                                }
+                                button {
+                                    class: "tab-close",
+                                    r#type: "button",
+                                    aria_label: "关闭 {title}",
+                                    onclick: move |_| {
+                                        dioxus_logger::tracing::info!("TAB-CLOSE clicked: {close_id}");
+                                        on_close_tab.call(close_id.clone());
+                                    },
+                                    "✕"
+                                }
+                            }
+                        }
+                    }
+                }
+                if is_loading {
+                    span { class: "header-status", role: "status", "正在载入..." }
+                }
+                button {
+                    class: "menu-trigger events-toggle",
+                    r#type: "button",
+                    onclick: move |_| on_toggle_events.call(()),
+                    span { class: "toolbar-icon", "✎" }
+                    "国策事件"
+                }
+            }
+        }
+    }
+}

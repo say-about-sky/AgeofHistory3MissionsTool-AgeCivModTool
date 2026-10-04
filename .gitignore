@@ -1,0 +1,13 @@
+/dist/
+/target/
+/Cargo.lock
+
+# 本机构建/调试产物与敏感文件（不上传）
+/tmp/
+/output/
+/node_cache/
+/missions.db
+*.bks
+*.apk
+*.corrupt-backup
+.npmrc
