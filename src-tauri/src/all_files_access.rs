@@ -1,10 +1,15 @@
+//! Android「所有文件访问」插件封装。
+//!
+//! 通过 App 内置的 `AllFilesAccessPlugin` 调用系统 API：申请权限、快速列目录、
+//! 按目录批量读写文件（绕过逐文件 ContentProvider 查询）。
+
 use serde::{Deserialize, Serialize};
 use tauri::{
     plugin::{Builder, PluginHandle, TauriPlugin},
     AppHandle, Manager, Runtime,
 };
 
-use crate::ScannedEntry;
+use crate::models::ScannedEntry;
 
 struct AndroidAccess<R: Runtime>(PluginHandle<R>);
 

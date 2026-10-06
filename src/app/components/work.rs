@@ -613,14 +613,21 @@ async fn load_tree_records(
 ) -> Result<Vec<MissionRecord>, String> {
 	if let Some(folder_id) = &work_directory.folder_id {
 		let path = join_scoped_path(&work_directory.root_path, json_path);
-		let contents = scoped_read_text_file(folder_id, path).await?;
+		let contents = scoped_read_text_file(folder_id, path.clone()).await?;
 		let args = serde_wasm_bindgen::to_value(&ParseMissionsArgs { contents })
 			.map_err(|error| error.to_string())?;
 		let value = JsFuture::from(invoke("parse_missions", args))
 			.await
 			.map_err(|error| format!("读取国策配置失败：{error:?}"))?;
-		serde_wasm_bindgen::from_value(value)
-			.map_err(|error| format!("国策配置格式错误：{error}"))
+		let parsed: ParsedMissionsFile = serde_wasm_bindgen::from_value(value)
+			.map_err(|error| format!("国策配置格式错误：{error}"))?;
+		// 宽松语法的文件在打开时被自动纠正：把规范化内容写回原文件。
+		if let Some(corrected) = parsed.corrected_contents {
+			scoped_write_text_file(folder_id, path, corrected)
+				.await
+				.map_err(|error| format!("自动纠正语法后保存失败：{error}"))?;
+		}
+		Ok(parsed.missions)
 	} else {
 		let file_name = json_path
 			.strip_prefix("missions/")
@@ -764,6 +771,15 @@ async fn save_tree_file(
 #[derive(Serialize)]
 struct ParseMissionsArgs {
 	contents: String,
+}
+
+/// `parse_missions` 的返回：解析出的国策记录；文件语法被自动纠正时附带规范化后的内容。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ParsedMissionsFile {
+	missions: Vec<MissionRecord>,
+	#[serde(default)]
+	corrected_contents: Option<String>,
 }
 
 #[derive(Clone)]
@@ -1774,10 +1790,10 @@ pub fn Work() -> Element {
                 is_android: *android_platform.read(),
                 all_files_access_granted: *all_files_access_granted.read(),
                 tabs: open_tabs
-                                                                                                                                                    .read()
-                                                                                                                                                    .iter()
-                                                                                                                                                    .map(|tab| (tab.id.clone(), tab.title.clone()))
-                                                                                                                                                    .collect(),
+                                                                                                                                                                    .read()
+                                                                                                                                                                    .iter()
+                                                                                                                                                                    .map(|tab| (tab.id.clone(), tab.title.clone()))
+                                                                                                                                                                    .collect(),
                 active_tab_id: active_tab_id.read().clone(),
                 on_select_tab,
                 on_close_tab: on_close_tab_requested,
