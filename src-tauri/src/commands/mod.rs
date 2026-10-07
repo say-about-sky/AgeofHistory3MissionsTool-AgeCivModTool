@@ -7,6 +7,7 @@ pub mod apk;
 pub mod events;
 pub mod icons;
 pub mod missions;
+pub mod missions_db;
 pub mod platform;
 pub mod scoped_storage;
 pub mod work_directory;

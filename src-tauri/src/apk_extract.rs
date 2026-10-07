@@ -60,11 +60,60 @@ pub struct ExtractOutcome {
 pub type ExtractProgress<'a> = &'a (dyn Fn(u64, u64) + Sync);
 
 /// 扫描阶段收集的条目元数据（仅中央目录固定字段）。
-struct ScanEntry {
-    name: String,
-    method: u16,
-    comp_size: u64,
-    lfh_offset: u64,
+pub(crate) struct ScanEntry {
+    pub(crate) name: String,
+    pub(crate) method: u16,
+    pub(crate) comp_size: u64,
+    pub(crate) lfh_offset: u64,
+}
+
+/// 扫描 APK 中央目录，返回全部条目元数据（「从 APK 中导入」后的补全数据兜底等
+/// 只需读取少量条目的场景使用；与大解压共用同一套宽容扫描）。
+pub(crate) fn list_apk_entries(file: &File) -> Result<Vec<ScanEntry>, String> {
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("读取 APK 信息失败：{error}"))?;
+    if !metadata.is_file() {
+        return Err(
+            "该 APK 无法随机读取（可能来自云存储等虚拟目录），请先把 APK 保存到设备本地后再解压"
+                .to_string(),
+        );
+    }
+    let file_len = metadata.len();
+
+    let eocd_pos = find_eocd(file, file_len)?;
+    let (cd_offset, entry_count) = read_eocd_metadata(file, eocd_pos)?;
+    let cd_start = locate_cd_start(file, cd_offset, eocd_pos)?;
+
+    let mut scan_entries: Vec<ScanEntry> = Vec::new();
+    // 中央目录一次性读入内存解析：游戏 APK 常有一万以上条目，逐条目做
+    // 「4 字节签名 + 46 字节头 + 文件名」多次小读在 Android FUSE 上非常昂贵。
+    let cd_len = eocd_pos.saturating_sub(cd_start);
+    if cd_len <= CD_IN_MEMORY_LIMIT {
+        let mut data = vec![0u8; cd_len as usize];
+        if cd_len > 0 {
+            read_exact_at(file, cd_start, &mut data)?;
+        }
+        parse_central_directory(&data, &mut scan_entries);
+    } else {
+        // 极端巨大的中央目录：回退为逐条目定位读取，避免一次性占用过多内存。
+        let mut pos = cd_start;
+        while pos + CDFH_FIXED_SIZE <= eocd_pos {
+            if read_u32_at(file, pos)? != CDFH_SIG {
+                break; // 中央目录结束（条目数可能不准，以签名缺失为准）。
+            }
+            let (method, comp_size, name, lfh_offset, next_pos) = read_cdfh(file, pos)?;
+            pos = next_pos;
+            scan_entries.push(ScanEntry {
+                name,
+                method,
+                comp_size,
+                lfh_offset,
+            });
+        }
+    }
+    let _ = entry_count; // 仅作参考，实际以中央目录签名为准。
+    Ok(scan_entries)
 }
 
 /// 记录前若干条失败原因（最多 5 条），用于最终错误汇总。
@@ -138,50 +187,8 @@ pub fn extract_selected_from_file(
     prefixes: &[&str],
     on_progress: ExtractProgress<'_>,
 ) -> Result<ExtractOutcome, String> {
-    let metadata = file
-        .metadata()
-        .map_err(|error| format!("读取 APK 信息失败：{error}"))?;
-    if !metadata.is_file() {
-        return Err(
-            "该 APK 无法随机读取（可能来自云存储等虚拟目录），请先把 APK 保存到设备本地后再解压"
-                .to_string(),
-        );
-    }
-    let file_len = metadata.len();
-
     // ---- 1. 扫描中央目录（只读元数据）----
-    let eocd_pos = find_eocd(file, file_len)?;
-    let (cd_offset, entry_count) = read_eocd_metadata(file, eocd_pos)?;
-    let cd_start = locate_cd_start(file, cd_offset, eocd_pos)?;
-
-    let mut scan_entries: Vec<ScanEntry> = Vec::new();
-    // 中央目录一次性读入内存解析：游戏 APK 常有一万以上条目，逐条目做
-    // 「4 字节签名 + 46 字节头 + 文件名」多次小读在 Android FUSE 上非常昂贵。
-    let cd_len = eocd_pos.saturating_sub(cd_start);
-    if cd_len <= CD_IN_MEMORY_LIMIT {
-        let mut data = vec![0u8; cd_len as usize];
-        if cd_len > 0 {
-            read_exact_at(file, cd_start, &mut data)?;
-        }
-        parse_central_directory(&data, &mut scan_entries);
-    } else {
-        // 极端巨大的中央目录：回退为逐条目定位读取，避免一次性占用过多内存。
-        let mut pos = cd_start;
-        while pos + CDFH_FIXED_SIZE <= eocd_pos {
-            if read_u32_at(file, pos)? != CDFH_SIG {
-                break; // 中央目录结束（条目数可能不准，以签名缺失为准）。
-            }
-            let (method, comp_size, name, lfh_offset, next_pos) = read_cdfh(file, pos)?;
-            pos = next_pos;
-            scan_entries.push(ScanEntry {
-                name,
-                method,
-                comp_size,
-                lfh_offset,
-            });
-        }
-    }
-    let _ = entry_count; // 仅作参考，实际以中央目录签名为准。
+    let scan_entries = list_apk_entries(file)?;
 
     // ---- 2. 规划：规范文件名、预建目录、筛出待解压文件 ----
     let mut files: Vec<(ScanEntry, PathBuf)> = Vec::with_capacity(scan_entries.len());
@@ -540,14 +547,13 @@ thread_local! {
     static PREFETCH_BUFFER: RefCell<Vec<u8>> = RefCell::new(vec![0u8; ENTRY_PREFETCH]);
 }
 
-/// 解压单个文件条目（一次预读覆盖本地头与小条目数据；大条目再链式补读）。
-fn extract_entry(file: &File, entry: &ScanEntry, output_path: &Path) -> Result<(), String> {
-    // 0 字节的 stored 条目：直接建空文件，省去一次本地头读取。
-    if entry.comp_size == 0 && entry.method == 0 {
-        create_file(output_path)?;
-        return Ok(());
-    }
-
+/// 条目数据读取核心：一次预读本地头（小条目数据一并读入），把解压后的数据流
+/// 交给 `consumer`（支持 stored / deflate）。供解压写盘与按需内存读取共用。
+fn with_entry_data(
+    file: &File,
+    entry: &ScanEntry,
+    consumer: impl FnOnce(&mut dyn Read) -> Result<(), String>,
+) -> Result<(), String> {
     PREFETCH_BUFFER.with(|cell| {
         let mut buffer = cell.borrow_mut();
         // 一次读取同时覆盖：本地头（30B）+ 名称/扩展字段；小条目的数据也在此次读取内。
@@ -564,51 +570,72 @@ fn extract_entry(file: &File, entry: &ScanEntry, output_path: &Path) -> Result<(
         let lfh_extra_len = u16::from_le_bytes([buffer[28], buffer[29]]) as usize;
         let data_off = 30 + lfh_name_len + lfh_extra_len;
 
-        let mut output = create_file(output_path)?;
-        if data_off as u64 + entry.comp_size <= read as u64 {
-            // 整个文件数据都在预读缓冲内：零额外系统调用。
-            let data = &buffer[data_off..data_off + entry.comp_size as usize];
-            match entry.method {
-                0 => output
-                    .write_all(data)
-                    .map_err(|error| format!("复制数据失败：{error}"))?,
-                8 => {
-                    let mut source = std::io::Cursor::new(data);
-                    let mut decoder = flate2::read::DeflateDecoder::new(&mut source);
-                    copy_stream(&mut decoder, &mut output)
-                        .map_err(|error| format!("解压数据失败：{error}"))?;
-                }
-                other => return Err(format!("不支持的压缩方式 {other}")),
-            }
+        // 数据跨越预读边界（大条目）时：缓冲内部分与剩余句柄数据链式读取；
+        // 名称/扩展字段异常大而超出预读缓冲时，缓冲部分视为空（全部走句柄）。
+        let fits = data_off as u64 + entry.comp_size <= read as u64;
+        let buffered = ((read as u64).saturating_sub(data_off as u64))
+            .min(entry.comp_size) as usize;
+        let data: &[u8] = if data_off <= read && buffered > 0 {
+            &buffer[data_off..data_off + buffered]
         } else {
-            // 数据跨越预读边界（大条目）：缓冲内部分与剩余句柄数据链式读取。
-            // 名称/扩展字段异常大而超出预读缓冲时，缓冲部分视为空（全部走句柄）。
-            let buffered = ((read as u64).saturating_sub(data_off as u64))
-                .min(entry.comp_size) as usize;
-            let data: &[u8] = if data_off <= read {
-                &buffer[data_off..data_off + buffered]
-            } else {
-                &[]
-            };
+            &[]
+        };
+        let mut source: Box<dyn Read + '_> = if fits {
+            Box::new(std::io::Cursor::new(data))
+        } else {
             let data_start = entry.lfh_offset + data_off as u64;
             let rest = PosReader::new(file, data_start + buffered as u64)
                 .take(entry.comp_size - buffered as u64);
-            let mut source = std::io::Cursor::new(data).chain(rest);
-            match entry.method {
-                0 => {
-                    copy_stream(&mut source, &mut output)
-                        .map_err(|error| format!("复制数据失败：{error}"))?;
-                }
-                8 => {
-                    let mut decoder = flate2::read::DeflateDecoder::new(source);
-                    copy_stream(&mut decoder, &mut output)
-                        .map_err(|error| format!("解压数据失败：{error}"))?;
-                }
-                other => return Err(format!("不支持的压缩方式 {other}")),
+            Box::new(std::io::Cursor::new(data).chain(rest))
+        };
+        match entry.method {
+            0 => consumer(&mut source),
+            8 => {
+                let mut decoder = flate2::read::DeflateDecoder::new(source);
+                consumer(&mut decoder)
             }
+            other => Err(format!("不支持的压缩方式 {other}")),
         }
+    })
+}
+
+/// 解压单个文件条目（一次预读覆盖本地头与小条目数据；大条目再链式补读）。
+fn extract_entry(file: &File, entry: &ScanEntry, output_path: &Path) -> Result<(), String> {
+    // 0 字节的 stored 条目：直接建空文件，省去一次本地头读取。
+    if entry.comp_size == 0 && entry.method == 0 {
+        create_file(output_path)?;
+        return Ok(());
+    }
+    let context = if entry.method == 8 { "解压数据失败" } else { "复制数据失败" };
+    with_entry_data(file, entry, |reader| {
+        let mut output = create_file(output_path)?;
+        copy_stream(reader, &mut output).map_err(|error| format!("{context}：{error}"))?;
         Ok(())
     })
+}
+
+/// 读取单个条目到内存（「从 APK 中导入」后的工作区补全等按需取数场景使用）。
+/// `limit` 为允许的最大解压尺寸（防止意外读取超大条目）。
+pub(crate) fn read_apk_entry_bytes(
+    file: &File,
+    entry: &ScanEntry,
+    limit: u64,
+) -> Result<Vec<u8>, String> {
+    if entry.comp_size > limit {
+        return Err(format!(
+            "条目过大（{} 字节），已跳过：{}",
+            entry.comp_size, entry.name
+        ));
+    }
+    let mut data: Vec<u8> = Vec::with_capacity(entry.comp_size.min(limit) as usize);
+    with_entry_data(file, entry, |reader| {
+        let mut limited = reader.take(limit + 1);
+        limited
+            .read_to_end(&mut data)
+            .map_err(|error| format!("读取条目失败：{error}"))?;
+        Ok(())
+    })?;
+    Ok(data)
 }
 
 /// 建文件（覆盖语义；unix 走 openat + 父目录句柄缓存）。
@@ -680,7 +707,7 @@ fn create_file_impl(output_path: &Path) -> io::Result<File> {
 ///
 /// 替代「每条目新建 BufReader/BufWriter（各 128KB）」与 `io::copy`（默认 8KB 小块）：
 /// 上万条目时反复申请/释放大块内存会触发 mmap 抖动，小分块则在 FUSE 上产生大量小读写。
-fn copy_stream(reader: &mut impl Read, writer: &mut File) -> io::Result<u64> {
+fn copy_stream(reader: &mut dyn Read, writer: &mut File) -> io::Result<u64> {
     thread_local! {
         static COPY_BUFFER: RefCell<Vec<u8>> = RefCell::new(vec![0u8; 256 * 1024]);
     }
@@ -853,6 +880,43 @@ mod tests {
             "hello-apk"
         );
         assert_eq!(fs::read_to_string(dest.join("root.txt")).unwrap(), "stored");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lists_and_reads_entries_in_memory() {
+        let dir = temp_dir("read-entry");
+        let apk = dir.join("test.apk");
+        {
+            let mut zip = zip::ZipWriter::new(File::create(&apk).unwrap());
+            zip.start_file(
+                "assets/game/Civilizations.txt",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+            zip.write_all(b"atr;").unwrap();
+            zip.start_file(
+                "assets/game/data.json",
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored),
+            )
+            .unwrap();
+            zip.write_all(b"{\"a\":1}").unwrap();
+            zip.finish().unwrap();
+        }
+        let file = File::open(&apk).unwrap();
+        let entries = list_apk_entries(&file).unwrap();
+        assert_eq!(entries.len(), 2);
+        let civ = entries
+            .iter()
+            .find(|entry| entry.name == "assets/game/Civilizations.txt")
+            .unwrap();
+        assert_eq!(
+            read_apk_entry_bytes(&file, civ, 1024 * 1024).unwrap(),
+            b"atr;"
+        );
+        // 尺寸上限保护：超过 limit 的条目拒绝读取。
+        assert!(read_apk_entry_bytes(&file, civ, 2).is_err());
         let _ = fs::remove_dir_all(&dir);
     }
 

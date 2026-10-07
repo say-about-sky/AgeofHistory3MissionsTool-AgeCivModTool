@@ -76,6 +76,8 @@ pub async fn pick_android_file<R: tauri::Runtime>(
             // 用户取消：正常返回空结果。
             return Ok(None);
         };
+        // 持久化授权（尽力而为）：供「从 apk 中导入」后的补全在应用重启后仍能读取源 APK。
+        let _ = api.picker().persist_uri_permission(&uri).await;
         // 显示名缺失时用空串（前端会跳过扩展名校验，BKS 再由导入错误兜底弹密码框）。
         let name = api.get_name(&uri).await.unwrap_or_default();
         Ok(Some(PickedAndroidFile {

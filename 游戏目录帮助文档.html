@@ -1,0 +1,689 @@
+<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>GameCivs 模组制作帮助文档</title><style>
+:root{--bg:#0d1117;--panel:#161b22;--border:#30363d;--text:#c9d1d9;--heading:#e6edf3;--muted:#8b949e;--accent:#d4a843;--link:#58a6ff;--warn:#f85149;--ok:#3fb950;--code:#1c2128}
+*{box-sizing:border-box}body{margin:0;padding:0;background:var(--bg);color:var(--text);font:15px/1.75 -apple-system,"Noto Sans CJK SC","PingFang SC","Microsoft YaHei",sans-serif}
+.wrap{max-width:1080px;margin:0 auto;padding:28px 20px}
+h1{font-size:28px;color:var(--accent);border-bottom:2px solid var(--border);padding-bottom:12px;margin-bottom:6px}
+h2{font-size:20px;color:var(--heading);margin:36px 0 14px;padding-bottom:6px;border-bottom:1px solid var(--border)}
+h3{font-size:16px;color:#c9d1d9;margin:22px 0 8px}
+.subtitle{color:var(--muted);margin:0 0 24px;font-size:14px}
+table{border-collapse:collapse;width:100%;margin:10px 0;font-size:13.5px}
+th,td{border:1px solid var(--border);padding:7px 11px;text-align:left;vertical-align:top}
+th{background:#1c2431;color:#8b949e;font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.03em}
+tr:nth-child(even){background:rgba(255,255,255,.03)}
+code{font-family:ui-monospace,Menlo,Consolas,monospace;color:#79c0ff;background:var(--code);padding:1px 5px;border-radius:3px;font-size:.93em;white-space:nowrap}
+pre{background:var(--code);border:1px solid var(--border);border-radius:8px;padding:14px;overflow:auto;font-size:13px;line-height:1.6;color:#c9d1d9}
+pre code{background:none;padding:0;color:inherit;white-space:pre}
+.note{border-left:3px solid var(--accent);background:#1c1f16;padding:10px 16px;border-radius:0 8px 8px 0;margin:14px 0;color:#b8a97e;font-size:13.5px}
+.warn{border-left-color:var(--warn);background:#1c1214;color:#d48888}
+.ok{border-left-color:var(--ok);background:#0d1c12;color:#7ec97e}
+.toc{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:18px 22px;margin:0 0 24px}
+.toc h3{margin:0 0 10px;color:var(--accent);font-size:14px}
+.toc ol{margin:0;padding-left:22px;columns:2;column-gap:40px;font-size:13.5px}
+.toc li{margin:4px 0;break-inside:avoid}
+.toc a{color:var(--link);text-decoration:none}
+.swatch{display:inline-block;width:16px;height:16px;border-radius:3px;vertical-align:middle;border:1px solid #555;margin-right:7px}
+.klist{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}
+.klist code{cursor:default;font-size:12.5px}
+.kbadge{font-size:12px;padding:2px 8px;border-radius:4px;background:#21262d;color:#8b949e;border:1px solid var(--border)}
+.tag{display:inline-block;padding:2px 8px;border-radius:12px;font-size:11.5px;background:#1c2128;color:#8b949e;border:1px solid var(--border);margin:2px}
+</style></head><body><div class="wrap">
+<h1>GameCivs 模组制作帮助文档</h1>
+<p class="subtitle">基于 参考目录 + 暮色黄昏 0.25.1 APK 源码反推整理 · 共 478 个文件 · 离线单文件</p>
+<div class="toc"><h3>目录</h3><ol>
+<li><a href="#s1">目录结构与加载机制</a></li>
+<li><a href="#s2">JSON 配置格式约定</a></li>
+<li><a href="#s3">文明 / 领袖 / 民族精神</a></li>
+<li><a href="#s4">国策树 Missions 与事件 .txt</a></li>
+<li><a href="#s5">触发器 trigger 参考</a></li>
+<li><a href="#s6">效果 option 参考</a></li>
+<li><a href="#s7">科技树 / 优势 / 兵种</a></li>
+<li><a href="#s8">地图与剧本数据（省份 / 城市 / 剧本）</a></li>
+<li><a href="#s9">图片资源规范</a></li>
+<li><a href="#s10">§ 颜色代码表</a></li>
+<li><a href="#s11">常见坑与调试</a></li>
+</ol></div>
+<h2 id="s1">1. 目录结构与加载机制</h2>
+<p>游戏使用 <code>FileManager.loadFile()</code> 按以下顺序查找文件：先遍历每个已启用 mod 目录的 <code>external</code> 路径，再遍历 <code>internal</code> 路径，最后回退 APK 内置资源。这意味着<mark>同路径文件自动覆盖</mark>。</p>
+<pre><code>模组根目录/（APK 内即 assets/ 下）
+├── game/                              # 全局游戏数据（跨剧本共享）
+│   ├── Civilizations.txt              # 文明 TAG 清单（分号分隔）
+│   ├── civilizations/&lt;tag&gt;.json        # 文明定义（Tag / Name / iR / iG / iB / ReligionID / GroupID / Wiki）
+│   ├── Governments.json               # 政体定义（change_ideology 的整数 = 条目顺序）
+│   ├── NationalSpirit.json            # 民族精神
+│   ├── Ages.json / Religions.json     # 时代 / 宗教
+│   ├── buildings/Buildings.json       # 建筑（数组顺序 = 建筑 ID）
+│   ├── diseases/Diseases.json         # 疾病（数组顺序 = 疾病 ID）
+│   ├── characters/*.json              # 人物（add_general 系列的名字来源）
+│   ├── rulers/&lt;tag&gt;.json              # 领袖（rulers/rulersImages/H 为领袖图）
+│   ├── technologies/Technologies.json # 科技树
+│   ├── units/Units.json + &lt;兵种&gt;.json   # 兵种索引与单文件
+│   ├── advantages/Advantages.json     # 优势配置（advantagesImages/H 为图标）
+│   ├── missions/                      # 全局国策树：Missions.json + missionsEvents/ + missionsImages/
+│   ├── languages/                     # 翻译表（Bundle.properties / Bundle_cn_sp.properties …）
+│   ├── gameValues/GV_*.json           # 游戏数值配置（另见《配置说明文档.md》）
+│   └── events/ advisors/ generals/ settings/ ...  # 其余系统数据
+├── gfx/                               # 图片资源（flagsXH 国旗 / ns 民族精神 / decision 事件图 / government 政体照片 …）
+└── map/
+    ├── Maps.json                      # 地图清单（Folder:）
+    └── Earth3/                        # 一张地图（可有多个）
+        ├── Scenarios.txt              # 本图剧本清单（分号分隔）
+        ├── data/ProvinceDetails.json  # 省份 ID（单行 JSON，含 pid）
+        ├── cities/cities.json         # 城市 / 省份名（Name + p）
+        └── scenarios/TheGreatWar/     # 剧本（Data.json / descriptions/ / missions/ …，详见第 8 章）</code></pre>
+<h2 id="s2">2. JSON 配置格式约定</h2>
+<p>参考目录中的 JSON 文件并非严格 JSON。它们使用 Java/JS 风格语法，<strong>属性名不加双引号</strong>，且可能带有 <code># 行尾注释</code>。游戏使用的 libGDX JsonReader 解析器有容错能力，能解析缺失逗号与注释。</p>
+<pre><code>// 参考文件中的实际写法（libGDX 可解析）
+{
+    Tag: "ynqin",
+    Name: "药娘大清",
+    iR: 200,
+    iG: 110,
+    iB: 200,
+    ReligionID: 27,
+    GroupID: 1,
+    Wiki: null
+}
+
+// 建议的安全写法（严格 JSON，也能被 libGDX 解析）
+{
+    "Tag": "ynqin",
+    "Name": "药娘大清",
+    "iR": 200,
+    "iG": 110,
+    "iB": 200,
+    "ReligionID": 27,
+    "GroupID": 1,
+    "Wiki": null
+}</code></pre>
+<div class="note warn">用标准 <code>json.loads()</code> 校验这些文件会报错；不要依赖普通 JSON 校验工具。可以用 libGDX 的 JsonReader 或 Python 的 <code>json5</code> 模块做预检。</div>
+<div class="note warn">重复键名会被解析器覆盖（后写覆盖前写）。示例中 <code>MonthlyLegacy</code> 出现两次，最终以最后一次值为准，容易引发逻辑 bug。</div>
+<div class="note">真实文件里还有更松散的写法，游戏解析器都能读取：缺逗号（<code>Buildings.json</code> 实验室条目）、数组尾逗号（<code>MonthlyIncome: [0.3,]</code>）、文件头 <code>//</code> 注释行（<code>cities.json</code>）。据此判断修改是否生效时，不要只看严格 JSON 校验工具的结果。</div>
+<h2 id="s3">3. 文明 / 领袖 / 民族精神</h2>
+<h3>3.1 文明索引（Civilizations.txt）</h3>
+<p>以分号 <code>;</code> 分隔的 TAG 列表。只有在此注册的 TAG，游戏才会去加载 <code>game/civilizations/&lt;tag&gt;.json</code>。</p>
+<pre><code>ynqin;</code></pre>
+<h3>3.2 文明定义（civilizations/&lt;tag&gt;.json）</h3>
+<pre><code>{
+&quot;Tag&quot;: &quot;ynqin&quot;,
+&quot;Name&quot;: &quot;药娘大清&quot;,
+&quot;iR&quot;: 200,
+&quot;iG&quot;: 110,
+&quot;iB&quot;: 200,
+&quot;ReligionID&quot;: 27,
+&quot;GroupID&quot;: 1,
+&quot;Wiki&quot;: null
+}</code></pre>
+<table><thead><tr><th>字段</th><th>说明</th></tr></thead><tbody><tr><td><code>Tag</code></td><td>文明唯一标识，需与文件名和 <code>Civilizations.txt</code> 注册保持一致</td></tr><tr><td><code>Name</code></td><td>显示名称；优先级最高，若为中文直接采用</td></tr><tr><td><code>iR / iG / iB</code></td><td>国家地图色 0–255</td></tr><tr><td><code>ReligionID</code></td><td>宗教 ID，需在 <code>Religions.json</code> 注册</td></tr><tr><td><code>GroupID</code></td><td>文明组/文化圈 ID</td></tr><tr><td><code>Wiki</code></td><td>预留字段，通常为 <code>null</code></td></tr></tbody></table>
+<h3>3.3 领袖（rulers/&lt;tag&gt;.json）</h3>
+<pre><code>{
+	Rulers: [
+		{
+			Name: &quot;沙耶&quot;,
+			ImageID: 沙耶,
+			
+			BornDay: 11,
+			BornMonth: 1,
+			BornYear: 1900,
+			
+			ReignYear: 1910,
+		},
+	],
+	
+	Age_of_History: Rulers
+}</code></pre>
+<table><thead><tr><th>字段</th><th>说明</th></tr></thead><tbody><tr><td><code>Rulers</code></td><td>领袖数组，可定义多个</td></tr><tr><td><code>Name</code></td><td>显示名称</td></tr><tr><td><code>ImageID</code></td><td>领袖图片名（在 <code>game/rulers/rulersImages/H/</code> 下）</td></tr><tr><td><code>BornDay / BornMonth / BornYear</code></td><td>出生日期</td></tr><tr><td><code>ReignYear</code></td><td>在位年份（从哪一年开始显示）</td></tr><tr><td><code>Age_of_History</code></td><td>固定标记，值为 <code>Rulers</code>，不能省略</td></tr></tbody></table>
+<h3>3.4 民族精神（NationalSpirit.json）</h3>
+<pre><code>{
+	    &quot;id&quot;:&quot;药娘国度&quot;,#图片索引名称
+		&quot;name&quot;:&quot;药娘国度&quot;,#显示标题
+		&quot;desc&quot;:&quot;§!这个国家被药娘统治了\\n\\n§g建筑费用-20%\\n§g研究点数+20\\n研究效率+20%\\n§r生产效率-10%\\n§r每月政治点数-2\\n§r攻击力-8\\n§r防御力-16\\n§r人力恢复速度-32%\\n§r招聘时间+6%\\n§r招聘费用+12%\\n§g每月政治点数100&quot;,
+		&quot;Bonuses&quot;:{
+		    &quot;AdministrationBuildingsCost&quot;:-0.2,
+		    &quot;MilitaryBuildingsCost&quot;:-0.2,
+		    &quot;EconomyBuildingsCost&quot;:-0.2,
+		    &quot;Research&quot;:25,
+            &quot;ResearchPoints&quot;:25,
+            &quot;IncomeTaxation&quot;:-10,
+		    &quot;MonthlyLegacy&quot;:-2,
+			&quot;UnitsAttack&quot;:-8,
+			&quot;UnitsDefense&quot;:-16,
+            &quot;ManpowerRecoverySpeed&quot;:-0.32,
+            &quot;RecruitmentTime&quot;:6,
+            &quot;RecruitArmyCost&quot;:12,
+            &quot;MonthlyLegacy&quot;:100,
+        },
+    },</code></pre>
+<table><thead><tr><th>字段</th><th>说明</th></tr></thead><tbody><tr><td><code>id</code></td><td>必填 · 字符串 · 唯一标识，同时决定图标文件名 <code>gfx/ns/&lt;id&gt;.png</code></td></tr><tr><td><code>name</code></td><td>必填 · 字符串 · 显示标题（可留空）</td></tr><tr><td><code>desc</code></td><td>必填 · 字符串 · 描述文本，支持 <code>§</code> 颜色代码和 <code>\n</code> 换行</td></tr><tr><td><code>Bonuses</code></td><td>可选 · 对象 · 加成键值对</td></tr></tbody></table>
+<p>常见 Bonuses 键（参考目录出现过的）：</p>
+<div class="klist"><code>MonthlyIncome</code><code>Research</code><code>ResearchPoints</code><code>MonthlyLegacy</code><code>ManpowerRecoverySpeed</code><code>RecruitmentTime</code><code>RecruitArmyCost</code><code>IncomeTaxation</code><code>UnitsAttack</code><code>UnitsDefense</code><code>GeneralAttack</code><code>GeneralDefense</code><code>AdministrationBuildingsCost</code><code>MilitaryBuildingsCost</code><code>EconomyBuildingsCost</code></div>
+<div class="note warn"><code>\n</code> 在 JSON 字符串中表示字面 <code>\n</code>（两个字符），而非换行符。游戏文本渲染器会将字面 <code>\n</code> 和真实换行符都识别为换行。但如果用其他编辑器写入，注意双重转义。</div>
+<h2 id="s4">4. 国策树 Missions 与事件 .txt</h2>
+<h3>4.1 国策节点定义（Missions.json）</h3>
+<pre><code>{
+	Mission:
+	[
+		{
+			ID: 0,
+			Name: &quot;重视陆军&quot;,
+			ImageName: &quot;重视陆军.png&quot;,
+			
+			MissionEvent: &quot;重视陆军.txt&quot;,
+			
+			TreeColumn: 1,
+			TreeRow: 0,
+			
+			RequiredMission: -1,
+			RequiredMission2: -1,
+			
+			AI: 100,
+		},
+		{
+			ID: 1,
+			Name: &quot;重视装备&quot;,
+			ImageName: &quot;重视装备.png&quot;,
+			
+			MissionEvent: &quot;重视装备.txt&quot;,
+			
+			TreeColumn: 0,
+			TreeRow: 1,
+			
+			RequiredMission: 0,
+			RequiredMission2: -1,
+			
+			AI: 100,
+		},
+		{
+			ID: 2,
+			Name: &quot;重视装备II&quot;,
+			ImageName: &quot;重视装备II.png&quot;,
+			
+			MissionEvent: &quot;重视装备II.txt&quot;,
+			
+			TreeColumn: 0,
+			TreeRow: 3,
+			
+			RequiredMission: 1,
+			RequiredMission2: -1,
+			
+			AI: 100,
+		},
+		{
+			ID: 3,
+			Name: &quot;重视装备III&quot;,
+			ImageName: &quot;重视装备III.png&quot;,
+			
+			MissionEvent: &quot;重视装备III.txt&quot;,
+			
+			TreeColumn: 0,
+			TreeRow: 5,
+			
+			RequiredMission: 2,
+			RequiredMission2: -1,
+			
+			AI: 100,
+		},
+		{
+			ID: 4,
+			Name: &quot;重视军事学说&quot;,
+			ImageName: &quot;重视军事学说.png&quot;,
+			
+			M</code></pre>
+<table><thead><tr><th>字段</th><th>说明</th></tr></thead><tbody><tr><td><code>ID</code></td><td>整数 · 全局唯一</td></tr><tr><td><code>Name</code></td><td>国策显示名</td></tr><tr><td><code>ImageName</code></td><td>国策图片文件名</td></tr><tr><td><code>MissionEvent</code></td><td>对应的事件 .txt 文件名（不含路径）</td></tr><tr><td><code>TreeColumn</code></td><td>国策树列位置（0 开始）</td></tr><tr><td><code>TreeRow</code></td><td>国策树行位置（0 开始）</td></tr><tr><td><code>RequiredMission / RequiredMission2</code></td><td>前置国策 ID，-1 表示无</td></tr><tr><td><code>AI</code></td><td>AI 选择权重</td></tr></tbody></table>
+<h3>4.2 国策事件文件（.txt）</h3>
+<p>事件文件使用 <code>key=value</code> 行格式，分为三个区域：<strong>头部字段</strong>、<strong>触发器区块</strong>、<strong>选项区块</strong>。</p>
+<pre><code>id=专制主义
+title=专制主义
+desc=转变为专制主义
+
+image=国策通用.png
+
+show_in_missions=false
+mission_image=tww.png
+popUp=true
+pobssible_to_run=true
+no_background=true
+focus_dura=35
+no_text=true
+
+only_once=true
+
+trigger_and
+next_and
+has_variable_not=保守主义
+has_variable_not=商业主义
+has_variable_not=自由主义
+civ_capital_unrest_over=-1
+trigger_and_end
+
+option_btn
+name=
+change_ideology=10
+province_unrest_all=-99
+ai=50
+option_end</code></pre>
+<h3>头部字段速查</h3>
+<table><thead><tr><th>字段</th><th>说明</th></tr></thead><tbody><tr><td><code>id</code></td><td>事件唯一 ID（被 Missions.json 的 MissionEvent 引用）</td></tr><tr><td><code>title</code></td><td>事件标题（弹窗显示）</td></tr><tr><td><code>desc</code></td><td>事件描述文本（支持 § 颜色代码）</td></tr><tr><td><code>image</code></td><td>事件弹窗图片</td></tr><tr><td><code>show_in_missions</code></td><td>是否在国策树面板显示</td></tr><tr><td><code>mission_image</code></td><td>国策树节点图片（放在 missionsImages/H/ 下）</td></tr><tr><td><code>popUp</code></td><td>是否弹窗</td></tr><tr><td><code>possible_to_run</code></td><td>是否显示为可执行；解析器实际键名（0.25.1 实测）。参考文件中的 <code>pobssible_to_run</code> 不会被读取</td></tr><tr><td><code>no_background</code></td><td>是否去掉背景框</td></tr><tr><td><code>no_text</code></td><td>是否隐藏文字</td></tr><tr><td><code>run_in_background</code></td><td>是否后台执行（无 UI）</td></tr><tr><td><code>focus_dura</code></td><td>国策执行天数</td></tr><tr><td><code>only_once</code></td><td>是否只能执行一次</td></tr><tr><td><code>important</code></td><td>重要事件标记</td></tr><tr><td><code>super_event</code></td><td>超级事件标记</td></tr><tr><td><code>mission_desc</code></td><td>国策树描述</td></tr><tr><td><code>exact_day</code></td><td>精确触发日</td></tr></tbody></table>
+<div class="note warn">拼写陷阱：参考目录的所有事件文件都写成 <code>pobssible_to_run</code>（多了个 <code>b</code>）。对 0.25.1 APK 的字符串表逐一比对后确认：解析器只含 <code>possible_to_run</code> 这一个相关常量，<strong>带 b 的写法不会被读取</strong>（等同没写此字段）；如需该字段真正生效，请使用 <code>possible_to_run</code>。</div>
+<h3>4.3 事件里的 ID / 名字从哪来（速查）</h3>
+<p>下列字段的取值对应游戏数据的「顺序编号」或名称，改动数据文件会改变编号含义：</p>
+<table><thead><tr><th>取值</th><th>数据文件</th><th>编号规则</th><th>详见</th></tr></thead><tbody>
+<tr><td>文明 tag（<code>is_civ</code> / <code>annex_civ</code> …）</td><td><code>game/Civilizations.txt</code></td><td>分号清单中注册的 tag 字符串</td><td>§3.1 / §3.2</td></tr>
+<tr><td>政体整数（<code>change_ideology</code> …）</td><td><code>game/Governments.json</code></td><td><code>Government:</code> 数组条目顺序，从 0 起</td><td>§4.4</td></tr>
+<tr><td>建筑 ID（<code>province_add_building</code> …）</td><td><code>game/buildings/Buildings.json</code></td><td>建筑条目顺序，从 0 起</td><td>§4.5</td></tr>
+<tr><td>疾病 ID（<code>province_id_spread_disease</code>）</td><td><code>game/diseases/Diseases.json</code></td><td>疾病条目顺序，从 0 起</td><td>§4.5</td></tr>
+<tr><td>人物名（<code>add_general</code> 系列）</td><td><code>game/characters/*.json</code></td><td>文件内的 <code>Name</code></td><td>§4.6</td></tr>
+<tr><td>省份 ID（<code>province_*_id</code> / <code>CPID</code> …）</td><td><code>map/&lt;地图&gt;/data/ProvinceDetails.json</code></td><td>各省份条目的 <code>pid</code></td><td>§8.2</td></tr>
+<tr><td>科技 / 单位 ID（<code>unlock_tech</code> …）</td><td><code>game/technologies/</code>、<code>game/units/</code></td><td>条目顺序 / <code>ID</code> 字段</td><td>§7</td></tr>
+</tbody></table>
+<div class="note ok">AgeCivModTool 的事件编辑器会把上述文件解析成「值 → 名称」对照：在这些字段处直接给出候选列表，不用再手翻数据文件。</div>
+<h3>4.4 政体（Governments.json）</h3>
+<pre><code>{
+	Government: [
+		{
+			Name: "临时政府",        # 第 1 项 → change_ideology=0
+			Extra_Tag: "",
+			...
+		},
+		{
+			Name: "绝对君主制",      # 第 2 项 → change_ideology=1
+			Extra_Tag: "m",
+			...
+		},
+		...
+	]
+}</code></pre>
+<table><thead><tr><th>字段</th><th>说明</th></tr></thead><tbody><tr><td><code>Name</code></td><td>政体名（编辑器对照显示用）</td></tr><tr><td><code>Extra_Tag</code></td><td>政体内部标签后缀，游戏逻辑使用，保持原样即可</td></tr><tr><td><code>GOV_GROUP_ID</code></td><td>政体组（从 0 起）</td></tr><tr><td>其余键</td><td>AI 权重 / 统治者称谓 / 颜色等，见文件内注释</td></tr></tbody></table>
+<h3>4.5 建筑与疾病（buildings/ · diseases/）</h3>
+<p><b>建筑</b>：<code>province_add_building</code>、<code>province_id_build_add</code>、<code>province_has_building</code> 等使用建筑 ID = <code>buildings/Buildings.json</code> 中条目的顺序（从 0 起）：</p>
+<pre><code>{
+	Buildings:
+	[
+		{ Name: ["基础设施"], ... },                        # → 0
+		{ Name: ["民用工厂"], ... },                        # → 1
+		{ Name: ["铁路", "铁路Ⅱ", "铁路Ⅲ", "铁路Ⅳ"], ... },  # → 2（多级建筑：Name 数组即各级名称）
+		...
+	]
+}</code></pre>
+<p><b>疾病</b>：<code>province_id_spread_disease</code> 使用疾病 ID = <code>diseases/Diseases.json</code> 中条目的顺序；名称为英文键，中文名在根语言表（如 <code>BlackDeath = 黑死病</code>）：</p>
+<pre><code>{
+	Disease:
+	[
+		{ Name: "BlackDeath", ... },   # → 0（黑死病）
+		{ Name: "Smallpox", ... },     # → 1（天花）
+		...
+	]
+}</code></pre>
+<h3>4.6 人物（characters/）</h3>
+<p><code>add_general</code> / <code>add_general2</code> / <code>add_advisor_character</code> 等字段填写人物名，定义在 <code>game/characters/*.json</code>：</p>
+<pre><code>[
+{
+	Name: "gre乔治一世",
+	ImageID: gre乔治一世,
+
+	BornDay: 1, BornMonth: 3, BornYear: 1880,
+
+	Attack: -1, Defense: -1,
+},
+]</code></pre>
+<div class="note">编辑器同时收录 <code>Name</code> 与文件名作为候选（两者偶有不同）；填写时以文件内 <code>Name</code> 为准。</div>
+<h3>4.7 翻译表（languages/）</h3>
+<p>文明名在 <code>languages/civilizations/Bundle.properties</code>（默认）与 <code>Bundle_cn_sp.properties</code>（简中，优先）；其它名称（疾病等）用根语言表 <code>languages/Bundle_cn_sp.properties</code>。格式为 Java Properties：<code>键 = 值</code>，<code>#</code> / <code>!</code> 开头为注释行，同键重复时后者覆盖。</p>
+<h2 id="s5">5. 触发器（trigger_and … trigger_and_end）</h2>
+<p>触发器位于 <code>trigger_and</code> 和 <code>trigger_and_end</code> 之间。<code>next_and</code> / <code>next_or</code> 连接多个条件（AND / OR 组合）。</p>
+<div class="note">源码解析器还支持 <code>trigger_or</code>、<code>trigger_and_not</code>、<code>trigger_or_not</code> 等变体，以及 <code>trigger_and_not_end</code> 等结束标记。</div>
+<h3>参考目录中出现过的触发器键</h3>
+<table><thead><tr><th>键</th><th>说明</th><th>示例值</th></tr></thead><tbody><tr><td><code>is_civ</code></td><td>国家 ID（tag 字符串）</td><td>ynqin</td></tr><tr><td><code>is_player</code></td><td>是否为玩家控制</td><td>true</td></tr><tr><td><code>is_not_player</code></td><td>是否不为玩家</td><td>true</td></tr><tr><td><code>civ_is_at_war</code></td><td>是否处于战争中</td><td>（空）</td></tr><tr><td><code>civ_is_not_at_war</code></td><td>是否不处于战争</td><td>（空）</td></tr><tr><td><code>has_variable</code></td><td>变量是否存在</td><td>变量名</td></tr><tr><td><code>has_variable_not</code></td><td>变量是否不存在</td><td>变量名</td></tr><tr><td><code>civ_gold_over</code></td><td>金钱大于某值</td><td>2800</td></tr><tr><td><code>civ_prestige_over</code></td><td>威望大于某值</td><td>20000</td></tr><tr><td><code>civ_capital_unrest_over</code></td><td>首都动荡大于某值</td><td>-1</td></tr><tr><td><code>province_controlled_by</code></td><td>某省份由某国控制</td><td>省份ID=国家tag</td></tr><tr><td><code>province_is_occupied</code></td><td>某省份是否被占领</td><td>省份ID</td></tr><tr><td><code>exists_any</code></td><td>选项组中任意一个存在</td><td>…</td></tr><tr><td><code>exists_any_not</code></td><td>选项组中全部不存在</td><td>…</td></tr><tr><td><code>focus_dura</code></td><td>国策执行时长（天）</td><td>32</td></tr></tbody></table>
+<h3>源码解析器支持的全部触发器键（500 个字符串）</h3>
+<p style="color:var(--muted);font-size:13px">以下全部来自 APK <code>EventsManager.loadEvent()</code> 的字符串常量表。带 <code>_below</code>/<code>_over</code> 后缀的键通常需要配数值。</p>
+<div class="klist"><code>administrative_buildings_constructed_below</code><code>administrative_buildings_constructed_over</code><code>alliance_special_is_leader</code><code>alliance_special_is_leader_id</code><code>alliance_special_is_member_id</code><code>alliance_special_is_not_member_id</code><code>buildings_constructed_below</code><code>buildings_constructed_over</code><code>civ_administrative_advisor_skill_below</code><code>civ_administrative_advisor_skill_over</code><code>civ_advisor_age_over</code><code>civ_advisor_construction_cost_over</code><code>civ_advisor_production_efficiency_over</code><code>civ_allies_below</code><code>civ_allies_over</code><code>civ_battle_width_below</code><code>civ_battle_width_over</code><code>civ_capital_buildings_below</code><code>civ_capital_buildings_over</code><code>civ_capital_city_below</code><code>civ_capital_city_over</code><code>civ_capital_continent_is</code><code>civ_capital_continent_is_not</code><code>civ_capital_economy_below</code><code>civ_capital_economy_over</code><code>civ_capital_fort_level_below</code><code>civ_capital_fort_level_over</code><code>civ_capital_growth_rate_below</code><code>civ_capital_growth_rate_over</code><code>civ_capital_income_below</code><code>civ_capital_income_over</code><code>civ_capital_infrastructure_below</code><code>civ_capital_infrastructure_over</code><code>civ_capital_manpower_below</code><code>civ_capital_manpower_over</code><code>civ_capital_population_below</code><code>civ_capital_population_over</code><code>civ_capital_religion_is</code><code>civ_capital_tax_efficiency_below</code><code>civ_capital_tax_efficiency_over</code><code>civ_capital_unrest_below</code><code>civ_capital_unrest_over</code><code>civ_conquered_provinces_below</code><code>civ_conquered_provinces_over</code><code>civ_defensive_pacts_below</code><code>civ_defensive_pacts_over</code><code>civ_diplomacy_below</code><code>civ_diplomacy_over</code><code>civ_economic_advisor_skill_below</code><code>civ_economic_advisor_skill_over</code><code>civ_economy_below</code><code>civ_economy_over</code><code>civ_gold_below</code><code>civ_gold_over</code><code>civ_government_is</code><code>civ_has_resource_over</code><code>civ_has_rivalry</code><code>civ_has_rivalry_not</code><code>civ_have_guarantee</code><code>civ_have_military_access</code><code>civ_income_economy_below</code><code>civ_income_economy_over</code><code>civ_income_production_below</code><code>civ_income_production_over</code><code>civ_income_taxation_below</code><code>civ_income_taxation_over</code><code>civ_inflation_below</code><code>civ_inflation_over</code><code>civ_innovation_advisor_skill_below</code><code>civ_innovation_advisor_skill_over</code><code>civ_is_at_war</code><code>civ_is_at_war_days_over</code><code>civ_is_largest_producer</code><code>civ_is_not_at_war</code><code>civ_largest_producer_over</code><code>civ_legacy_below</code><code>civ_legacy_over</code><code>civ_legacy_per_month_below</code><code>civ_legacy_per_month_over</code><code>civ_loans_below</code><code>civ_loans_over</code><code>civ_manpower_below</code><code>civ_manpower_over</code><code>civ_manpower_perc_below</code><code>civ_manpower_perc_over</code><code>civ_max_manpower_below</code><code>civ_max_manpower_over</code><code>civ_military_academy_below</code><code>civ_military_academy_for_generals_below</code><code>civ_military_academy_for_generals_over</code><code>civ_military_academy_over</code><code>civ_military_advisor_skill_below</code><code>civ_military_advisor_skill_over</code><code>civ_neighbors_below</code><code>civ_neighbors_over</code><code>civ_non_aggression_pacts_below</code><code>civ_non_aggression_pacts_over</code><code>civ_nuclear_reactor_below</code><code>civ_nuclear_reactor_over</code><code>civ_population_below</code><code>civ_population_over</code><code>civ_prestige_below</code><code>civ_prestige_over</code><code>civ_production_over</code><code>civ_provinces_below</code><code>civ_provinces_over</code><code>civ_rank_position_below</code><code>civ_rank_position_over</code><code>civ_regiments_below</code><code>civ_regiments_limit_below</code><code>civ_regiments_limit_over</code><code>civ_regiments_over</code><code>civ_religion_is</code><code>civ_research_per_month_below</code><code>civ_research_per_month_over</code><code>civ_supreme_court_below</code><code>civ_supreme_court_over</code><code>civ_tag_government_is</code><code>civ_tag_government_is_not</code><code>civ_tag_religion_is</code><code>civ_tag_religion_is_not</code><code>civ_total_income_below</code><code>civ_total_income_over</code><code>civ_unlocked_advantages_below</code><code>civ_unlocked_advantages_over</code><code>civ_unlocked_legacies_below</code><code>civ_unlocked_legacies_over</code><code>civ_unlocked_technologies_below</code><code>civ_unlocked_technologies_over</code><code>civ_vassals_below</code><code>civ_vassals_over</code><code>civ_wars_total_below</code><code>civ_wars_total_over</code><code>civs_are_at_war</code><code>civs_are_neighbors</code><code>civs_are_not_at_war</code><code>civs_are_not_neighbors</code><code>civs_are_rivals</code><code>civs_have_alliance</code><code>civs_have_defensive_pact</code><code>civs_have_non_aggression</code><code>civs_have_truce</code><code>civs_opinion_below</code><code>civs_opinion_over</code><code>developed_infrastructure_below</code><code>developed_infrastructure_over</code><code>economy_buildings_constructed_below</code><code>economy_buildings_constructed_over</code><code>exists</code><code>exists_any</code><code>exists_any_not</code><code>has_ns</code><code>has_variable</code><code>has_variable_civ</code><code>has_variable_not</code><code>increased_growth_rate_below</code><code>increased_growth_rate_over</code><code>increased_manpower_below</code><code>increased_manpower_over</code><code>increased_tax_efficiency_below</code><code>increased_tax_efficiency_over</code><code>invested_in_economy_below</code><code>invested_in_economy_over</code><code>is_civ</code><code>is_law</code><code>is_not_player</code><code>is_not_puppet</code><code>is_player</code><code>is_puppet</code><code>largest_producer_production_over</code><code>military_buildings_constructed_below</code><code>military_buildings_constructed_over</code><code>not_exists</code><code>playing_time_below</code><code>playing_time_over</code><code>province_buildings_below</code><code>province_buildings_limit_below</code><code>province_buildings_limit_over</code><code>province_buildings_over</code><code>province_civ_has_core</code><code>province_controlled_by</code><code>province_defense_lvl_below</code><code>province_defense_lvl_over</code><code>province_economy_below</code><code>province_economy_over</code><code>province_growth_rate_below</code><code>province_growth_rate_over</code><code>province_has_building</code><code>province_income_below</code><code>province_income_over</code><code>province_infrastructure_below</code><code>province_infrastructure_over</code><code>province_is_capital</code><code>province_is_not_occupied</code><code>province_is_occupied</code><code>province_is_under_siege</code><code>province_manpower_below</code><code>province_manpower_over</code><code>province_not_controlled_by</code><code>province_population_below</code><code>province_population_over</code><code>province_religion_is</code><code>province_religion_is_not</code><code>province_tax_efficiency_below</code><code>province_tax_efficiency_over</code><code>province_unrest_below</code><code>province_unrest_over</code><code>random_chance</code><code>recruited_advisors_below</code><code>recruited_advisors_over</code><code>tech_completed</code><code>unique_capital_buildings_constructed_below</code><code>unique_capital_buildings_constructed_over</code><code>war_score</code><code>year_below</code><code>year_over</code></div>
+<h2 id="s6">6. 效果（option_btn … option_end）</h2>
+<p>每个 <code>option_btn</code>…<code>option_end</code> 块代表一个玩家可选选项，其中包含的效果会按顺序执行。</p>
+<h3>常用效果键</h3>
+<table><thead><tr><th>键</th><th>说明</th></tr></thead><tbody><tr><td><code>name</code></td><td>选项显示文本</td></tr><tr><td><code>ai</code></td><td>AI 选择权重（0–100）</td></tr><tr><td><code>bonus_duration</code></td><td>加成持续天数（通常先写再写各 bonus_*）</td></tr><tr><td><code>bonus_monthly_income</code></td><td>每月收入加成</td></tr><tr><td><code>bonus_monthly_legacy</code></td><td>每月政治点数加成</td></tr><tr><td><code>bonus_tax_efficiency</code></td><td>税收效率加成</td></tr><tr><td><code>bonus_research</code></td><td>研究点数加成</td></tr><tr><td><code>bonus_research_points</code></td><td>研究效率加成</td></tr><tr><td><code>bonus_units_attack</code></td><td>单位攻击力加成</td></tr><tr><td><code>bonus_units_defense</code></td><td>单位防御力加成</td></tr><tr><td><code>bonus_generals_attack</code></td><td>将领攻击力加成</td></tr><tr><td><code>bonus_generals_defense</code></td><td>将领防御力加成</td></tr><tr><td><code>bonus_manpower_recovery_speed</code></td><td>人力恢复速度加成</td></tr><tr><td><code>bonus_recruitment_time</code></td><td>招聘时间增减（负=更快）</td></tr><tr><td><code>bonus_recruit_army_cost</code></td><td>招聘费用增减</td></tr><tr><td><code>bonus_army_movement_speed</code></td><td>军队移速加成</td></tr><tr><td><code>bonus_production_efficiency</code></td><td>生产效率加成</td></tr><tr><td><code>bonus_income_production</code></td><td>生产收入加成</td></tr><tr><td><code>bonus_economy_buildings_cost</code></td><td>经济建筑费用增减</td></tr><tr><td><code>gold</code></td><td>直接加金钱</td></tr><tr><td><code>legacy</code></td><td>直接加政治点数</td></tr><tr><td><code>manpower</code></td><td>直接加人力</td></tr><tr><td><code>add_ns</code></td><td>添加民族精神（值为 NS id 或空=触发后续事件选择）</td></tr><tr><td><code>remove_ns</code></td><td>移除民族精神</td></tr><tr><td><code>add_ruler</code></td><td>添加领袖（预定义）</td></tr><tr><td><code>add_ruler_custom</code></td><td>添加自定义领袖</td></tr><tr><td><code>add_advisor</code></td><td>添加顾问</td></tr><tr><td><code>change_ideology</code></td><td>改变政体（整数 ID；对应 Governments.json 条目顺序，见 §4.4）</td></tr><tr><td><code>declare_war</code></td><td>宣战（值为目标国家 tag）</td></tr><tr><td><code>white_peace</code></td><td>白和</td></tr><tr><td><code>annex</code></td><td>吞并（值为国家 tag）</td></tr><tr><td><code>annex_civ</code></td><td>吞并指定国家全部领土</td></tr><tr><td><code>make_puppet</code></td><td>建立傀儡国</td></tr><tr><td><code>move_capital</code></td><td>迁都（省份 ID）</td></tr><tr><td><code>province_economy_all</code></td><td>全国省份经济+值</td></tr><tr><td><code>province_infrastructure_all</code></td><td>全国省份基础设施+值</td></tr><tr><td><code>province_unrest_all</code></td><td>全国省份动荡+值</td></tr><tr><td><code>province_economy_id</code></td><td>省份经济（格式：省份ID=数值）</td></tr><tr><td><code>run_event</code></td><td>触发事件 ID</td></tr><tr><td><code>set_civ_tag</code></td><td>改变国家 tag</td></tr><tr><td><code>unlock_tech</code></td><td>解锁科技</td></tr></tbody></table>
+<div class="note warn"><code>legcy</code> 出现在 <code>ynqin中部工厂.txt</code>，是 <code>legacy</code> 的拼写错误。解析器实际不识别 <code>legcy</code>，这条效果可能静默失效。</div>
+<h3>源码解析器支持的全部效果键</h3>
+<div class="klist"><code>add_advisor</code><code>add_advisor2</code><code>add_alliance</code><code>add_army_struct</code><code>add_army_struct2</code><code>add_building</code><code>add_counter</code><code>add_decision</code><code>add_defensive_pact</code><code>add_general</code><code>add_general2</code><code>add_general3</code><code>add_guarantee</code><code>add_military_access</code><code>add_new_army</code><code>add_non_aggression</code><code>add_ns</code><code>add_ruler</code><code>add_ruler_custom</code><code>add_truce</code><code>add_variable</code><code>add_variable2</code><code>advantage_points</code><code>ae_set</code><code>annex</code><code>annex_by_civ_from_civ</code><code>annex_by_civ_from_civ2</code><code>annex_civ</code><code>annex_civ2</code><code>annex_from_civ</code><code>annexed_by_civ</code><code>annexed_by_civ2</code><code>bonus_administration_buildings_cost</code><code>bonus_advisor_cost</code><code>bonus_advisors_max_level</code><code>bonus_aggressive_expansion</code><code>bonus_all_characters_life_expectancy</code><code>bonus_army_maintenance</code><code>bonus_army_morale_recovery</code><code>bonus_army_movement_speed</code><code>bonus_battle_width</code><code>bonus_buildings_maintenance_cost</code><code>bonus_construction_cost</code><code>bonus_construction_time</code><code>bonus_core_cost</code><code>bonus_corruption</code><code>bonus_develop_infrastructure_cost</code><code>bonus_diplomacy_points</code><code>bonus_discipline</code><code>bonus_disease_death_rate</code><code>bonus_duration</code><code>bonus_economy_buildings_cost</code><code>bonus_general_cost</code><code>bonus_generals_attack</code><code>bonus_generals_defense</code><code>bonus_growth_rate</code><code>bonus_improve_relations_modifier</code><code>bonus_income_economy</code><code>bonus_income_from_vassals</code><code>bonus_income_production</code><code>bonus_income_taxation</code><code>bonus_increase_growth_rate_cost</code><code>bonus_increase_manpower_cost</code><code>bonus_increase_tax_efficiency_cost</code><code>bonus_inflation</code><code>bonus_invest_in_economy_cost</code><code>bonus_loan_interest</code><code>bonus_loans_limit</code><code>bonus_maintenance_cost</code><code>bonus_manpower_recovery_from_disbanded_army</code><code>bonus_manpower_recovery_speed</code><code>bonus_max_manpower</code><code>bonus_max_manpower_percentage</code><code>bonus_max_morale</code><code>bonus_maximum_amount_of_gold</code><code>bonus_military_buildings_cost</code><code>bonus_monthly_income</code><code>bonus_monthly_legacy</code><code>bonus_monthly_legacy_percentage</code><code>bonus_production_efficiency</code><code>bonus_province_maintenance</code><code>bonus_recruit_army_cost</code><code>bonus_recruit_army_first_line_cost</code><code>bonus_recruit_army_second_line_cost</code><code>bonus_recruitment_time</code><code>bonus_regiments_limit</code><code>bonus_reinforcement_speed</code><code>bonus_religion_cost</code><code>bonus_research</code><code>bonus_research_points</code><code>bonus_revolutionary_risk</code><code>bonus_siege_effectiveness</code><code>bonus_tax_efficiency</code><code>bonus_units_attack</code><code>bonus_units_defense</code><code>bonus_war_score_cost</code><code>capital_city_level</code><code>change_ideology</code><code>change_ideology_civ</code><code>change_law</code><code>change_law2</code><code>change_religion</code><code>change_religion_civ</code><code>decision_desc</code><code>decision_image</code><code>declare_war</code><code>declare_war2</code><code>explode</code><code>gold</code><code>gold_monthly_income</code><code>historic_choice</code><code>inflation</code><code>kill_advisor</code><code>kill_ruler</code><code>kill_ruler_chance</code><code>legacy</code><code>legacy_monthly</code><code>make_puppet</code><code>manpower</code><code>military_academy</code><code>military_academy_generals</code><code>move_capital</code><code>nuclear_reactor</code><code>play_music</code><code>player_set_civ</code><code>price_change</code><code>price_change_down</code><code>price_change_group</code><code>price_change_group_down</code><code>price_change_group_up</code><code>price_change_random</code><code>price_change_random_down</code><code>price_change_random_up</code><code>price_change_up</code><code>promote_advisor</code><code>province_add_building</code><code>province_add_core_civ</code><code>province_buildings_below</code><code>province_buildings_limit_below</code><code>province_buildings_limit_over</code><code>province_buildings_over</code><code>province_civ_has_core</code><code>province_controlled_by</code><code>province_defense_lvl_below</code><code>province_defense_lvl_over</code><code>province_destroy_building</code><code>province_devastation</code><code>province_devastation_all</code><code>province_devastation_capital</code><code>province_devastation_id</code><code>province_economy</code><code>province_economy_all</code><code>province_economy_below</code><code>province_economy_capital</code><code>province_economy_id</code><code>province_economy_over</code><code>province_growth_rate</code><code>province_growth_rate_all</code><code>province_growth_rate_below</code><code>province_growth_rate_capital</code><code>province_growth_rate_id</code><code>province_growth_rate_over</code><code>province_has_building</code><code>province_income_below</code><code>province_income_over</code><code>province_infrastructure</code><code>province_infrastructure_all</code><code>province_infrastructure_below</code><code>province_infrastructure_capital</code><code>province_infrastructure_id</code><code>province_infrastructure_over</code><code>province_is_capital</code><code>province_is_not_occupied</code><code>province_is_occupied</code><code>province_is_under_siege</code><code>province_manpower</code><code>province_manpower_all</code><code>province_manpower_below</code><code>province_manpower_capital</code><code>province_manpower_id</code><code>province_manpower_over</code><code>province_not_controlled_by</code><code>province_nuke</code><code>province_popset</code><code>province_popset2</code><code>province_population</code><code>province_population_all</code><code>province_population_below</code><code>province_population_capital</code><code>province_population_over</code><code>province_religion</code><code>province_religion_all</code><code>province_religion_capital</code><code>province_religion_id</code><code>province_religion_is</code><code>province_religion_is_not</code><code>province_remove_core_civ</code><code>province_tax_efficiency</code><code>province_tax_efficiency_all</code><code>province_tax_efficiency_below</code><code>province_tax_efficiency_capital</code><code>province_tax_efficiency_id</code><code>province_tax_efficiency_over</code><code>province_unrest</code><code>province_unrest_all</code><code>province_unrest_below</code><code>province_unrest_capital</code><code>province_unrest_id</code><code>province_unrest_over</code><code>relations_change</code><code>relations_set</code><code>remove_alliance</code><code>remove_building</code><code>remove_decision</code><code>remove_ns</code><code>remove_variable</code><code>remove_variable2</code><code>research</code><code>run_event</code><code>run_event_instantly</code><code>run_in_background</code><code>run_script</code><code>set_civ_tag</code><code>set_civ_tag2</code><code>set_civ_tag_reset</code><code>set_civ_tag_reset2</code><code>set_counter</code><code>show_when_fail</code><code>skip_focus</code><code>skip_goal</code><code>start_decision</code><code>start_decision2</code><code>supreme_court</code><code>switch_ability</code><code>taking_decision</code><code>tooltip</code><code>unlock_tech</code><code>white_peace</code><code>white_peace2</code></div>
+<h2 id="s7">7. 科技树 / 优势 / 兵种</h2>
+<h3>科技节点（Technologies.json）</h3>
+<pre><code>{
+	Technology:
+	[
+		{
+			ID: 0,
+			Name: &quot;毒气科技&quot;,
+			ImageID: 0,
+			MaintainTechnologyName: true,
+			
+			TreeColumn: 3,
+			TreeRow: 0,
+			
+			RequiredTech: -1,
+			RequiredTech2: -1,
+			
+			ResearchCost: 30,
+			
+			UnlocksAccessToTheSea: true,
+			
+			Repeatable: false,
+			AI: 0,
+		},
+		{
+			ID: 1,
+			Name: &quot;毒气桶&quot;,
+			ImageID: 1,
+			MaintainTechnologyName: true,
+			
+			TreeColumn: 1,
+			TreeRow: 1,
+			
+			RequiredTech: 0,
+			RequiredTech2: -1,
+			
+			ResearchCost: 35,
+			
+			Repeatable: false,
+			AI: 5,
+		},
+		{
+			ID: 2,
+			Name: &quot;瓦斯&quot;,
+			ImageID: 2,
+			MaintainTechnologyName: true,
+			
+			TreeColumn: 1,
+			TreeRow: 2,
+			
+			RequiredTech: 1,
+			RequiredTech2: -1,
+			
+			ResearchCost: 35,
+			
+			Repeatable: false,
+			AI: 5,
+		},
+		{
+			ID: 3,
+			Name: &quot;发射器&quot;,
+			ImageID: 3,
+			MaintainTechnolo</code></pre>
+<table><thead><tr><th>字段</th><th>说明</th></tr></thead><tbody><tr><td><code>ID</code></td><td>科技唯一整数 ID（单位/建筑的 RequiredTechID 引用它）</td></tr><tr><td><code>Name</code></td><td>科技名</td></tr><tr><td><code>ImageID</code></td><td>图标索引</td></tr><tr><td><code>TreeColumn / TreeRow</code></td><td>树格坐标</td></tr><tr><td><code>RequiredTech / RequiredTech2</code></td><td>前置科技 ID，-1 无</td></tr><tr><td><code>ResearchCost</code></td><td>研究费用</td></tr><tr><td><code>Repeatable</code></td><td>是否可重复研究</td></tr><tr><td><code>AI</code></td><td>AI 研究权重</td></tr><tr><td><code>UnlocksAccessToTheSea</code></td><td>解锁出海口（特殊功能）</td></tr><tr><td><code>MaintainTechnologyName</code></td><td>是否保持科技名显示</td></tr></tbody></table>
+<h3>优势（advantages/Advantages.json）</h3>
+<pre><code>{
+	Advantage: #优势列表
+	[
+		{
+			ImageID: [194, 195, 196],
+			GroupID: 2,
+			
+			RequiredTechID: 71,
+			
+			ReinforcementSpeed: [5, 15, 25],
+			
+			AI: 5,
+		},
+		{
+			ImageID: [149, 150, 151],
+			GroupID: 2,
+			
+			RequiredTechID: 12,
+			
+			MaximumLevelOfTheMilitaryAcademyForGenerals: [1, 3, 5],
+			
+			AI: 5,
+		},
+		{
+			ImageID: [4, 5, 6],
+			GroupID: 1,
+			
+			RequiredTechID: -1,
+			
+			Gold: [1500, 2000, 3000],
+			
+			AI: 5,
+		},
+		{
+			ImageID: [18, 19, 20],
+			GroupID: 1,
+			
+			RequiredTechID: 17,
+			
+			MonthlyIncome: [24, 48, 96],
+			
+			AI: 5,
+		},
+		{
+			ImageID: [7, 8, 9],
+			GroupID: 0,
+			
+			RequiredTechID: 75,
+			
+			MonthlyLegacy: [4, 8, 16],
+			
+			AI: 5,
+		},
+		{
+			ImageID: [48, 49, 50],
+			GroupID: 0,
+			
+			RequiredTechID: 38,
+			
+			ResearchPoints: [5, 10, 15],
+			
+			AI: 5,
+		},
+		{
+			ImageID: [105, 106, 107],
+			GroupID: 2,
+			
+			RequiredTechID: 16,
+			
+			UnitsAt</code></pre>
+<table><thead><tr><th>字段</th><th>说明</th></tr></thead><tbody><tr><td><code>ImageID</code></td><td>数组 · 3 个连续图片 ID，分别对应 1/2/3 级图标</td></tr><tr><td><code>GroupID</code></td><td>分类 0–3（管理/经济/军事/外交）</td></tr><tr><td><code>RequiredTechID</code></td><td>解锁科技，-1 无</td></tr><tr><td><code>效果键</code></td><td>值为三元数组，如 <code>[1500, 2000, 3000]</code> 代表 1/2/3 级的数值</td></tr><tr><td><code>AI</code></td><td>AI 选择权重</td></tr></tbody></table>
+<p>参考目录中出现过的优势效果键：</p>
+<div class="klist"><code>Gold</code><code>MonthlyIncome</code><code>MonthlyLegacy</code><code>ResearchPoints</code><code>ReinforcementSpeed</code><code>MaximumLevelOfTheMilitaryAcademyForGenerals</code><code>Discipline</code><code>AdministrationBuildingsCost</code><code>EconomyBuildingsCost</code><code>MilitaryBuildingsCost</code></div>
+<h3>兵种索引（units/Units.json）</h3>
+<pre><code>{
+	Army: [
+		{
+			File: &quot;Warior.json&quot;,
+			ID: 0,
+
+			Line: 0,
+		},
+		{
+			File: &quot;Spearmen.json&quot;,
+			ID: 1,
+
+			Line: 1,
+		},
+		{
+			File: &quot;Cavalry.json&quot;,
+			ID: 2,
+
+			Line: 1,
+		},
+		{
+			File: &quot;Archer.json&quot;,
+			ID: 3,
+
+			Line: 0,
+		},
+		{
+			File: &quot;Canon.json&quot;,
+			ID: 4,
+
+			Line: 0,
+		},
+		{
+			File: &quot;后勤.json&quot;,
+			ID: 5,
+
+			Line: 2,
+		},
+		{
+			File: &quot;Settler.json&quot;,
+			ID: 6,
+
+			Line: 2,
+		},
+		{
+			File: &quot;机械化部队.json&quot;,
+			ID: 7,
+
+			Line: 0,
+		},
+		{
+			File: &quot;近卫掷弹骑兵.json&quot;,
+			ID: 8,
+
+			Line: 0,
+		},
+	],
+	Age_of_History: Army
+}</code></pre>
+<table><thead><tr><th>字段</th><th>说明</th></tr></thead><tbody><tr><td><code>File</code></td><td>单位定义 JSON 文件名</td></tr><tr><td><code>ID</code></td><td>单位全局整数 ID</td></tr><tr><td><code>Line</code></td><td>战斗位置线（0=前排，1=侧翼，2=后勤）待进一步确认</td></tr></tbody></table>
+<h3>单个兵种（units/&lt;名&gt;.json）</h3>
+<pre><code>{
+	Army: [
+		{
+			Name: &quot;骑兵&quot;,
+			ImageID: 69,
+			
+			UnitLevel: 0,
+			
+			Attack: 35,
+			Defense: 600,
+			MovementSpeed: 1.2,
+			
+			AttackRange: 1,
+			SiegeProgress: 10000,
+			
+			RequiredTechID: -1,
+			
+			Cost: 12,
+			MaintenanceCost: 0.36,
+			
+			RecruitmentTime: 1800,
+		},
+		{
+			Name: &quot;骑兵连&quot;,
+			ImageID: 69,
+			
+			UnitLevel: 1,
+			
+			Attack: 40,
+			Defense: 800,
+			MovementSpeed: 1.4,
+			
+			AttackRange: 10,
+			SiegeProgress: 10000,
+			
+			RequiredTechID: 45,
+			
+			Cost: 14,
+			MaintenanceCost: 0.4,
+			
+			RecruitmentTime: 900,
+		},
+	],
+	
+	Age_of_History: Army
+}</code></pre>
+<table><thead><tr><th>字段</th><th>说明</th></tr></thead><tbody><tr><td><code>Name</code></td><td>显示名</td></tr><tr><td><code>ImageID</code></td><td>图标索引</td></tr><tr><td><code>UnitLevel</code></td><td>0=基础，1=升级型，2=精英型</td></tr><tr><td><code>Attack / Defense</code></td><td>攻击力 / 防御力</td></tr><tr><td><code>MovementSpeed</code></td><td>移动速度（倍率）</td></tr><tr><td><code>AttackRange</code></td><td>攻击距离</td></tr><tr><td><code>SiegeProgress</code></td><td>围城进度贡献</td></tr><tr><td><code>RequiredTechID</code></td><td>解锁科技 ID，-1 无</td></tr><tr><td><code>Cost</code></td><td>招募费用</td></tr><tr><td><code>MaintenanceCost</code></td><td>维护费用</td></tr><tr><td><code>RecruitmentTime</code></td><td>招募时间（秒）</td></tr><tr><td><code>Age_of_History</code></td><td>固定标记，值为 <code>Army</code></td></tr></tbody></table>
+<h2 id="s8">8. 地图与剧本数据</h2>
+<h3>8.1 地图索引与剧本清单</h3>
+<p><code>map/Maps.json</code> 列出全部地图文件夹（可有多个）；每张地图的剧本清单在同目录 <code>Scenarios.txt</code>（分号分隔）：</p>
+<pre><code>// map/Maps.json
+{
+	Map: [
+		{ Folder: "EarthM" },
+		{ Folder: "Earth3" },
+	]
+}
+
+// map/Earth3/Scenarios.txt
+TheGreatWar;</code></pre>
+<h3>8.2 省份与城市数据（省份 ID 的来源）</h3>
+<p><code>province_*</code> 系列字段、<code>CPID</code> 等使用的省份 ID，来自各地图的 <code>data/ProvinceDetails.json</code>（单行 JSON，每条省份含 <code>pid</code>）；省份 / 城市名在 <code>cities/cities.json</code>（<code>Name</code> + <code>p</code>）：</p>
+<pre><code>// map/Earth3/cities/cities.json（节选）
+[
+{
+	Name: "里斯本",
+	x: 7898,
+	y: 2879,
+	p: 11
+},
+{
+	Name: "马德里",
+	p: 6561
+},
+...
+]</code></pre>
+<div class="note">不同地图各有一套省份 ID：全局国策树（<code>game/missions</code>）按全部地图合并查找；剧本国策树（<code>scenarios/&lt;剧本&gt;/missions</code>）只对应其所属地图。</div>
+<h3>8.3 剧本初始配置（Data.json）</h3>
+<pre><code>[
+{
+	CivTAG: "uni_n",
+	CivID: 1,
+	PCID: 1,
+	CPID: 825,
+	Economy: 500
+},
+{
+	CivTAG: "ger_普",
+	CivID: 5,
+	PCID: 5,
+	CPID: 592,
+	Economy: 650
+},
+...
+]</code></pre>
+<table><thead><tr><th>字段</th><th>说明</th></tr></thead><tbody><tr><td><code>CivTAG</code></td><td>文明 tag（对应 Civilizations.txt）</td></tr><tr><td><code>CivID</code></td><td>起始地块 ID</td></tr><tr><td><code>PCID</code></td><td>核心地块 ID</td></tr><tr><td><code>CPID</code></td><td>首都省份 ID</td></tr><tr><td><code>Economy</code></td><td>初始经济</td></tr><tr><td><code>TechnologyID / Manpower / Population</code></td><td>可选：开局科技 / 人力 / 人口</td></tr></tbody></table>
+<h3>8.4 剧本目录全貌</h3>
+<pre><code>scenarios/TheGreatWar/
+├── Data.json               # 各国开局数据（见 8.3）
+├── Details.json            # 剧本元信息（年代 / 作者 / 开局默认值 …）
+├── Desc.json               # 剧本简介文本键（; 分隔）
+├── descriptions/&lt;tag&gt;.txt   # 各国国家简介（自由换行）
+├── missions/&lt;tag&gt;.json      # 各国国策树（与 Missions.json 同结构）
+│   ├── missionsEvents/     # 该国策树的事件脚本
+│   └── missionsImages/H/   # 该国策树图片
+├── Alliances.json / Truces.json / Relations.json / …      # 外交初始状态
+├── Cores.json / Buildings.json / Armies.json / Characters.json  # 其余初始状态
+└── events/list_*.txt + common/   # 剧本事件清单与内容</code></pre>
+<h2 id="s9">9. 图片资源规范</h2>
+<table><thead><tr><th>资源</th><th>目录（<code>assets/</code> 下）</th><th>命名</th><th>说明</th></tr></thead><tbody>
+<tr><td>国旗</td><td><code>gfx/flagsXH/</code></td><td><code>&lt;TAG&gt;.png</code></td><td>如 <code>ynqin.png</code>（另有 <code>gfx/flags/</code>、<code>gfx/flagsH/</code> 变体）</td></tr>
+<tr><td>民族精神图标</td><td><code>gfx/ns/</code></td><td><code>&lt;id&gt;.png</code></td><td>id 与 NationalSpirit.json 中一致（如 <code>atr0.png</code>）</td></tr>
+<tr><td>国策树节点图</td><td><code>game/missions/missionsImages/H/</code></td><td><code>&lt;mission_image&gt;.png</code></td><td>对应事件 txt 的 <code>mission_image</code> 字段；剧本的在 <code>scenarios/&lt;剧本&gt;/missions/missionsImages/H/</code></td></tr>
+<tr><td>事件 / 决策图</td><td><code>gfx/decision/</code></td><td><code>&lt;image&gt;.png</code></td><td>对应事件 txt 的 <code>image</code> 字段</td></tr>
+<tr><td>优势图标</td><td><code>game/advantages/advantagesImages/H/</code></td><td><code>&lt;ImageID&gt;.png</code></td><td>3 级连续 ID</td></tr>
+<tr><td>政体照片</td><td><code>gfx/government/H/</code></td><td><code>gov_*.png</code></td><td>如 <code>gov_0.png</code></td></tr>
+<tr><td>疾病图标</td><td><code>game/diseases/images/H/</code></td><td><code>&lt;id&gt;.png</code></td><td>如 <code>0.png</code> / <code>0b.png</code></td></tr>
+<tr><td>领袖图片</td><td><code>game/rulers/rulersImages/H/</code></td><td>按领袖 json 的 <code>ImageID</code></td><td>如 <code>247.png</code></td></tr>
+<tr><td>宗教 / 文化图片</td><td><code>gfx/religion/</code></td><td>—</td><td>—</td></tr>
+</tbody></table>
+<h2 id="s10">10. § 颜色代码表</h2>
+<p>颜色配置来自 <code>assets/rainfall/polaris_core.json → textColors</code>，由 <code>TextColorRenderer.getColor()</code> 按 <code>char</code> 精确匹配。alpha 恒为 FF。仅支持<strong>小写</strong>代码。</p>
+<table><thead><tr><th>代码</th><th>HEX</th><th>RGB</th><th>预览</th><th>备注</th></tr></thead><tbody><tr><td><code>§5</code></td><td><span class="swatch" style="background:#E2990E"></span><code>#E2990E</code></td><td>226,153,14</td><td style="color:#E2990E">示例文字</td><td></td></tr><tr><td><code>§4</code></td><td><span class="swatch" style="background:#D27475"></span><code>#D27475</code></td><td>210,116,117</td><td style="color:#D27475">示例文字</td><td></td></tr><tr><td><code>§3</code></td><td><span class="swatch" style="background:#CBCC02"></span><code>#CBCC02</code></td><td>203,204,2</td><td style="color:#CBCC02">示例文字</td><td></td></tr><tr><td><code>§2</code></td><td><span class="swatch" style="background:#4B4B4B"></span><code>#4B4B4B</code></td><td>75,75,75</td><td style="color:#4B4B4B">示例文字</td><td></td></tr><tr><td><code>§1</code></td><td><span class="swatch" style="background:#000000"></span><code>#000000</code></td><td>0,0,0</td><td style="color:#000000">示例文字</td><td></td></tr><tr><td><code>§f</code></td><td><span class="swatch" style="background:#EF805C"></span><code>#EF805C</code></td><td>239,128,92</td><td style="color:#EF805C">示例文字</td><td></td></tr><tr><td><code>§m</code></td><td><span class="swatch" style="background:#2B389E"></span><code>#2B389E</code></td><td>43,56,158</td><td style="color:#2B389E">示例文字</td><td></td></tr><tr><td><code>§a</code></td><td><span class="swatch" style="background:#920000"></span><code>#920000</code></td><td>146,0,0</td><td style="color:#920000">示例文字</td><td></td></tr><tr><td><code>§d</code></td><td><span class="swatch" style="background:#2F8A87"></span><code>#2F8A87</code></td><td>47,138,135</td><td style="color:#2F8A87">示例文字</td><td></td></tr><tr><td><code>§j</code></td><td><span class="swatch" style="background:#C3B091"></span><code>#C3B091</code></td><td>195,176,145</td><td style="color:#C3B091">示例文字</td><td></td></tr><tr><td><code>§i</code></td><td><span class="swatch" style="background:#448A45"></span><code>#448A45</code></td><td>68,138,69</td><td style="color:#448A45">示例文字</td><td></td></tr><tr><td><code>§s</code></td><td><span class="swatch" style="background:#795234"></span><code>#795234</code></td><td>121,82,52</td><td style="color:#795234">示例文字</td><td></td></tr><tr><td><code>§o</code></td><td><span class="swatch" style="background:#00AEEF"></span><code>#00AEEF</code></td><td>0,174,239</td><td style="color:#00AEEF">示例文字</td><td></td></tr><tr><td><code>§z</code></td><td><span class="swatch" style="background:#916DD9"></span><code>#916DD9</code></td><td>145,109,217</td><td style="color:#916DD9">示例文字</td><td></td></tr><tr><td><code>§n</code></td><td><span class="swatch" style="background:#7C3000"></span><code>#7C3000</code></td><td>124,48,0</td><td style="color:#7C3000">示例文字</td><td></td></tr><tr><td><code>§q</code></td><td><span class="swatch" style="background:#A91B4F"></span><code>#A91B4F</code></td><td>169,27,79</td><td style="color:#A91B4F">示例文字</td><td></td></tr><tr><td><code>§h</code></td><td><span class="swatch" style="background:#9D6637"></span><code>#9D6637</code></td><td>157,102,55</td><td style="color:#9D6637">示例文字</td><td></td></tr><tr><td><code>§r</code></td><td><span class="swatch" style="background:#E03C30"></span><code>#E03C30</code></td><td>224,60,48</td><td style="color:#E03C30">示例文字</td><td></td></tr><tr><td><code>§b</code></td><td><span class="swatch" style="background:#1C559F"></span><code>#1C559F</code></td><td>28,85,159</td><td style="color:#1C559F">示例文字</td><td></td></tr><tr><td><code>§y</code></td><td><span class="swatch" style="background:#CDAC25"></span><code>#CDAC25</code></td><td>205,172,37</td><td style="color:#CDAC25">示例文字</td><td></td></tr><tr><td><code>§g</code></td><td><span class="swatch" style="background:#1C933A"></span><code>#1C933A</code></td><td>28,147,58</td><td style="color:#1C933A">示例文字</td><td></td></tr><tr><td><code>§c</code></td><td><span class="swatch" style="background:#1EABB5"></span><code>#1EABB5</code></td><td>30,171,181</td><td style="color:#1EABB5">示例文字</td><td></td></tr><tr><td><code>§p</code></td><td><span class="swatch" style="background:#522371"></span><code>#522371</code></td><td>82,35,113</td><td style="color:#522371">示例文字</td><td></td></tr><tr><td><code>§0</code></td><td><span class="swatch" style="background:#FFFFFF"></span><code>#FFFFFF</code></td><td>255,255,255</td><td style="color:#FFFFFF">示例文字</td><td>基础色（配置写 #FFFFFF 但被解析器拦截，永远不生效）</td></tr></tbody></table>
+<div class="note warn"><code>§0</code>、<code>§_</code>（下划线，阴影开关）、<code>§!</code>（本模组大量文本用它当占位符）和<strong>大写字母</strong>均不产生颜色变化，直接回退到当前基础色。</div>
+<h2 id="s11">11. 常见坑与调试</h2>
+<h3>参考目录中的已知问题</h3>
+<table>
+<tr><th>问题</th><th>位置</th><th>影响</th></tr>
+<tr><td><code>pobssible_to_run</code> 多写一个 <code>b</code></td><td>所有 missionsEvents/*.txt</td><td>0.25.1 解析器字符串表中不存在该拼写 → 字段不会被读取；正确键为 <code>possible_to_run</code></td></tr>
+<tr><td><code>legcy=25</code> 拼写错误</td><td>ynqin中部工厂.txt</td><td>源码只有 <code>legacy</code>，此效果可能不执行</td></tr>
+<tr><td><code>MonthlyLegacy</code> 重复定义</td><td>NationalSpirit.json 药娘国度条目</td><td>后值覆盖前值，不是叠加</td></tr>
+<tr><td><code>Governments.json</code> 为空（0 字节）</td><td>game/</td><td>游戏会回退到 APK 内置的政体定义</td></tr>
+<tr><td><code>Religions.json</code> 为空（0 字节）</td><td>game/</td><td>同上，回退内置宗教定义</td></tr>
+<tr><td><code>Ages.json</code> 为空（0 字节）</td><td>game/</td><td>回退内置时代配置</td></tr>
+</table>
+<h3>调试建议</h3>
+<ol>
+<li>改前先备份原始文件，改后重启游戏观察日志。</li>
+<li>触发器/效果失效优先检查拼写，对照本文件的"源码支持键"列表。</li>
+<li>用 MT 管理器打开 APK 内置同名文件对比字段差异。</li>
+<li>图片缺失不崩溃但会显示 <code>default.png</code>，检查文件名大小写。</li>
+<li><code>_backup</code> 目录不会被游戏读取，可以放心当版本存档。</li>
+</ol>
+</div></body></html>

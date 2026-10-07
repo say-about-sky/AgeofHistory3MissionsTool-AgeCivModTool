@@ -34,7 +34,9 @@ const ARSC_ALIGN: u64 = 4;
 /// 原生库对齐字节数（16 KiB，兼容 Android 15 的 16KB 页设备）。
 const SO_ALIGN: u64 = 16 * 1024;
 const ZIP32_LIMIT: u64 = 0xFFFF_FFFF;
-
+/// 「从 apk 中导入」写入解包目录的源 APK 标记文件（内容为 APK 路径或 URI；
+/// 事件编辑器补全据此直接从源 APK 读取游戏数据，打包时跳过、不进入产物）。
+pub(crate) const SOURCE_APK_MARKER: &str = ".ageciv-source";
 /// 打包进度回调：`completed` / `total` 为字节数。
 pub type PackProgress<'a> = &'a (dyn Fn(u64, u64) + Sync);
 
@@ -375,9 +377,10 @@ fn collect_files(root: &Path, relative: &str, files: &mut Vec<String>) -> Result
     Ok(())
 }
 
-/// 打包时跳过：旧签名残留（META-INF 下的签名文件）与用户签名密钥。
+/// 打包时跳过：旧签名残留（META-INF 下的签名文件）、用户签名密钥与
+/// 「从 apk 中导入」写入的源 APK 标记（供事件编辑器补全读取，不进入产物）。
 fn should_skip_apk_entry(relative: &str) -> bool {
-    if relative == "signing.pem" {
+    if relative == "signing.pem" || relative == SOURCE_APK_MARKER {
         return true;
     }
     let Some(rest) = relative.strip_prefix("META-INF/") else {

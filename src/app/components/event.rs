@@ -2,8 +2,9 @@ use dioxus::prelude::*;
 use serde::Serialize;
 use wasm_bindgen_futures::JsFuture;
 
+use super::event_lookup::{game_dir_key, load_event_lookup, scenario_map_key, EventLookup};
 use super::undo::{UndoRegistration, UndoScope};
-use super::{event_grid::EventGrid, event_parser::{diagnostics, MissionEvent}, WorkDirectory};
+use super::{event_grid::EventGrid, event_parser::{diagnostics, MissionEvent}, mind::Shared, WorkDirectory};
 use crate::app::tauri_bridge::invoke;
 
 #[derive(Serialize)]
@@ -236,6 +237,53 @@ pub fn EventPanel(
 	let busy = use_signal(|| false);
 	let mut last_save_request = use_signal(|| *save_request.read());
 
+	// —— 文明/政体对照表（值单元格的自动补全与名称提示） ——
+	// 按「游戏数据目录」缓存：全局与各剧本资源根共享同一份 `assets/game` 数据，
+	// 切换剧本标签页不重复读取；工作区切换或首次打开时后台加载。
+	// 注意：先读 `missions_root`（订阅信号）再检查工作区，避免面板先于工作区
+	// 挂载时效应未建立任何依赖而不再触发。
+	let mut lookup = use_signal(|| Shared::new(EventLookup::default()));
+	let mut lookup_loaded_key = use_signal(|| None::<String>);
+	let mut lookup_generation = use_signal(|| 0_u64);
+	let directory_for_lookup = work_directory.clone();
+	use_effect(move || {
+		let root = missions_root
+			.read()
+			.clone()
+			.unwrap_or_else(|| "missions".to_string());
+		let Some(directory) = directory_for_lookup.clone() else {
+			return;
+		};
+		// 缓存键包含剧本地图上下文：同一地图的不同剧本共享数据，切换不重读；
+		// 全局根（无地图上下文）与剧本根数据源不同（合并全部地图 / 单地图），分别缓存。
+		let key = format!(
+			"{}|{}|{}|{}",
+			directory.root_path,
+			directory.folder_id.clone().unwrap_or_default(),
+			game_dir_key(&root),
+			scenario_map_key(&root)
+		);
+		if lookup_loaded_key.peek().as_deref() == Some(key.as_str()) {
+			return;
+		}
+		lookup_loaded_key.set(Some(key));
+		let generation = lookup_generation.with_mut(|value| {
+			*value = value.wrapping_add(1);
+			*value
+		});
+		spawn(async move {
+			let loaded = load_event_lookup(&directory, &root).await;
+			// 迟到的响应不能覆盖后发请求（切换工作区/资源根期间）。
+			if *lookup_generation.peek() != generation {
+				return;
+			}
+			match loaded {
+				Ok(loaded) => lookup.set(Shared::new(loaded)),
+				Err(_) => lookup.set(Shared::new(EventLookup::default())),
+			}
+		});
+	});
+
 	// —— 全局撤销集成 ——
 	// 待应用的撤销/重做快照：由注册的执行器写入，effect 统一落地（避免直接 set 触发追踪误注册）。
 	let mut pending_apply = use_signal(|| None::<MissionEvent>);
@@ -440,7 +488,7 @@ pub fn EventPanel(
 	rsx! {
         aside { class: "events-pane", style: "width: {width}px;",
             div { class: "pane-heading",
-                span { "国策事件" }
+                span { "事件编辑器" }
                 span {
                     class: "pane-count",
                     title: "{selected_name.as_deref().unwrap_or_default()}",
@@ -451,7 +499,7 @@ pub fn EventPanel(
                 div { class: "event-editor",
                     label { "missionsEvents / {file_name}" }
                     if event.read().is_some() {
-                        EventGrid { event }
+                        EventGrid { event, lookup: lookup.read().clone() }
                     } else if busy_now {
                         div { class: "event-grid-empty", "正在读取..." }
                     } else {

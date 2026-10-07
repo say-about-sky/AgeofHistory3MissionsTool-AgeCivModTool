@@ -31,3 +31,5 @@ cargo tauri android dev --open
 
 @REM  移动打包好的apk文件到output目录
 move /Y A:\android\AgeCivModTool\src-tauri\gen\android\app\build\outputs\apk\universal\release\app-universal-release-unsigned.apk output\AgeCivModTool.apk
+
+@REM  更改apk版本: AgeCivModTool\src-tauri\tauri.conf.json

@@ -230,10 +230,12 @@ impl MindMapState {
                 text: mission.name.clone(),
                 image_name: mission.image_name.clone(),
                 mission_event: mission_event_file(&mission.mission_event, &mission.name),
+                // 找不到图片（图标文件缺失 / ImageName 为空）标记为「无图标」：
+                // 按游戏原版逻辑，没有图片的国策显示为纯黑卡片。
                 icon_index: icon_index_by_name
                     .get(&mission.image_name)
                     .copied()
-                    .unwrap_or(0),
+                    .unwrap_or(usize::MAX),
                 tree_column: mission.tree_column,
                 tree_row: mission.tree_row,
                 children: Vec::new(),
@@ -297,6 +299,10 @@ pub enum FocusTarget {
 pub fn MindMapCanvas(
     initial_icons: Shared<Vec<FocusIcon>>,
     missions: Shared<Vec<MissionRecord>>,
+    // 本树所属资源根（missions / assets/game/missions / 剧本 missions）。
+    missions_root: String,
+    // 工作区现有事件脚本的相对路径（判断「空国策」并提供 新建事件 / 链接事件）。
+    event_files: Shared<Vec<String>>,
     active_tab_id: Signal<Option<String>>,
     tab_id: String,
     on_save: EventHandler<Vec<MissionRecord>>,
@@ -336,9 +342,11 @@ pub fn MindMapCanvas(
     // 与磁盘内容一致的节点快照：脏标记与保存确认都以它为基准。
     let mut initial_nodes = use_signal(|| state.read().nodes.clone());
     let mut context_menu = use_signal(|| None::<(f64, f64, Option<usize>)>);
-    let mut new_node_text = use_signal(|| "新卡片".to_string());
+    let mut new_node_text = use_signal(|| "新国策".to_string());
     let mut selected_icon = use_signal(|| 0_usize);
     let mut icon_picker_open = use_signal(|| false);
+    // 「链接事件」选择器：为没有事件的空国策列出本资源根下现有的事件脚本。
+    let mut linking_event_open = use_signal(|| false);
     let mut editing_node = use_signal(|| None::<usize>);
     let mut confirming_delete = use_signal(|| None::<usize>);
     let mut new_node_column = use_signal(|| 0_u32);
@@ -430,15 +438,19 @@ pub fn MindMapCanvas(
         on_nodes_change.call(snapshot);
     });
 
-    // 保存成功后（父级递增 save_ack）把当前节点记为最新基准，从而清除脏标记。
-    let mut last_save_ack = use_signal(|| save_ack);
-    use_effect(move || {
-        if save_ack == *last_save_ack.read() {
-            return;
+    // 保存成功（父级递增 save_ack）后，以「发起保存时的快照」为新基准清除脏标记。
+    // 注意：`save_ack` 是普通 props 而非信号——必须经 `use_reactive` 声明为依赖，
+    // 否则组件因父级状态重渲染时本 effect 不会重跑，脏标记永久残留
+    //（表现为「保存后关闭标签页仍提示有未保存的修改」）。
+    // 用保存请求时的快照而非当前节点：保存期间的新编辑仍保持脏标记。
+    let mut pending_save_snapshot = use_signal(|| None::<Vec<MindNode>>);
+    use_effect(use_reactive((&save_ack,), move |(_ack,)| {
+        let snapshot = pending_save_snapshot.peek().clone();
+        if let Some(snapshot) = snapshot {
+            pending_save_snapshot.set(None);
+            initial_nodes.set(snapshot);
         }
-        last_save_ack.set(save_ack);
-        initial_nodes.set(state.read().nodes.clone());
-    });
+    }));
 
     // 节点与基准不一致时向父级上报脏状态（关闭标签页前提示用）。
     let mut last_dirty = use_signal(|| false);
@@ -464,6 +476,11 @@ pub fn MindMapCanvas(
         if !is_active {
             return;
         }
+
+        // 记录「发起保存时」的节点快照：保存成功后以它为已落盘基准（见 save_ack effect），
+        // 保存期间的新编辑仍保持脏标记，避免把未落盘的改动当作已保存。
+        let snapshot = state.read().nodes.clone();
+        pending_save_snapshot.set(Some(snapshot));
 
         let current = state.read();
         let records = current
@@ -704,9 +721,10 @@ pub fn MindMapCanvas(
         let position = evt.client_coordinates();
         let (world_x, world_y) = screen_to_world(position.x, position.y);
         let (column, row) = world_to_grid(world_x, world_y);
-        new_node_text.set("新卡片".to_string());
+        new_node_text.set("新国策".to_string());
         selected_icon.set(0);
         icon_picker_open.set(false);
+        linking_event_open.set(false);
         editing_node.set(None);
         confirming_delete.set(None);
         new_node_column.set(column);
@@ -721,8 +739,9 @@ pub fn MindMapCanvas(
             new_node_row.set(node.tree_row.saturating_add(1));
             selected_icon.set(node.icon_index);
         }
-        new_node_text.set("新卡片".to_string());
+        new_node_text.set("新国策".to_string());
         icon_picker_open.set(false);
+        linking_event_open.set(false);
         editing_node.set(None);
         confirming_delete.set(None);
         context_menu.set(Some((screen_x, screen_y, Some(node_id))));
@@ -798,6 +817,52 @@ pub fn MindMapCanvas(
     let node_row = *new_node_row.read();
     let selected_icon_index = *selected_icon.read();
     let picker_open = *icon_picker_open.read();
+    let linking_open = *linking_event_open.read();
+    // 右键目标卡片是否没有事件脚本（空国策：菜单提供 新建事件 / 链接事件）。
+    let target_event_missing = menu_position
+        .and_then(|(_, _, target)| target)
+        .is_some_and(|node_id| {
+            state.read().node(node_id).is_some_and(|node| {
+                let file = mission_event_file(&node.mission_event, &node.text);
+                let path = format!("{missions_root}/missionsEvents/{file}");
+                !event_files.iter().any(|existing| existing == &path)
+            })
+        });
+    // 「链接事件」候选：本资源根下现有的事件脚本名（仅在选择器打开时快照）。
+    let link_event_items: Vec<(String, EventHandler<()>)> = if linking_open {
+        let prefix = format!("{missions_root}/missionsEvents/");
+        let mut names: Vec<String> = event_files
+            .iter()
+            .filter_map(|path| path.strip_prefix(&prefix).map(str::to_string))
+            .collect();
+        names.sort();
+        let target = menu_position.and_then(|(_, _, target)| target);
+        names
+            .into_iter()
+            .map(|name| {
+                let chosen = name.clone();
+                let mut state = state;
+                let mut context_menu = context_menu;
+                let mut linking_event_open = linking_event_open;
+                let commit_history = commit_history;
+                let target = target;
+                let handler = EventHandler::new(move |_: ()| {
+                    commit_history();
+                    let mut current = state.write();
+                    if let Some(node_id) = target {
+                        if let Some(node) = current.node_mut(node_id) {
+                            node.mission_event = chosen.clone();
+                        }
+                    }
+                    linking_event_open.set(false);
+                    context_menu.set(None);
+                });
+                (name, handler)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     // 仅在图标选择器打开时快照图标列表，避免画布平移/缩放时反复克隆所有图标数据。
     // 图标来源：本树已载入的图标 + 用户在资源管理器中双击手动载入的图标；
     // 不再自动加载完整图标目录，避免图标过多时渲染卡死。
@@ -827,12 +892,17 @@ pub fn MindMapCanvas(
         Vec::new()
     };
     let editing_node_id = *editing_node.read();
-    let menu_max_height = if picker_open {
+    let menu_max_height = if picker_open || linking_open {
         344
     } else if editing_node_id.is_some() {
         150
     } else if matches!(menu_position, Some((_, _, Some(_)))) {
-        176
+        // 空国策菜单多出「新建事件 / 链接事件」两项。
+        if target_event_missing {
+            210
+        } else {
+            176
+        }
     } else {
         52
     };
@@ -906,7 +976,8 @@ pub fn MindMapCanvas(
             if !save_status.is_empty() {
                 div {
                     role: "status",
-                    style: "position: absolute; top: 12px; right: 12px; z-index: 5; padding: 8px; background: white; border: 1px solid #dce5f4; border-radius: 6px; box-shadow: 0 2px 8px rgba(71, 98, 145, 0.12);",
+                    // z-index 25：浮在资源管理器/事件面板（.drawer z 20）之上；标题栏(30)、菜单(40)、弹窗(60)仍在更上层。
+                    style: "position: absolute; top: 12px; right: 12px; z-index: 25; padding: 8px; background: white; border: 1px solid #dce5f4; border-radius: 6px; box-shadow: 0 2px 8px rgba(71, 98, 145, 0.12);",
                     "{save_status}"
                 }
             }
@@ -914,7 +985,8 @@ pub fn MindMapCanvas(
             if is_connecting {
                 div {
                     role: "status",
-                    style: "position: absolute; top: 12px; left: 12px; z-index: 5; display: flex; align-items: center; gap: 10px; padding: 8px 10px; background: white; border: 1px solid #80a6e6; border-radius: 6px; box-shadow: 0 2px 8px rgba(71, 98, 145, 0.12);",
+                    // 连接提示同样浮在所有面板之上，避免被资源管理器遮住。
+                    style: "position: absolute; top: 12px; left: 12px; z-index: 25; display: flex; align-items: center; gap: 10px; padding: 8px 10px; background: white; border: 1px solid #80a6e6; border-radius: 6px; box-shadow: 0 2px 8px rgba(71, 98, 145, 0.12);",
                     span { "连接模式：点击另一张卡片完成连线" }
                     button {
                         r#type: "button",
@@ -1054,7 +1126,28 @@ pub fn MindMapCanvas(
                             if target_node.is_some() {
                                 "创建分支"
                             } else {
-                                "创建卡片"
+                                "创建国策"
+                            }
+                        }
+                    } else if linking_open {
+                        button {
+                            r#type: "button",
+                            onclick: move |_| linking_event_open.set(false),
+                            "返回"
+                        }
+                        div { class: "context-event-list",
+                            if link_event_items.is_empty() {
+                                span { style: "padding: 6px 4px; font-size: 11px; line-height: 1.4; text-align: center; opacity: 0.75;",
+                                    "该资源根下暂无可链接的事件脚本"
+                                }
+                            }
+                            for (event_name , link_handler) in link_event_items {
+                                button {
+                                    r#type: "button",
+                                    title: "{event_name}",
+                                    onclick: move |_| link_handler.call(()),
+                                    "{event_name}"
+                                }
                             }
                         }
                     } else if let Some(edit_node_id) = editing_node_id {
@@ -1101,6 +1194,44 @@ pub fn MindMapCanvas(
                             "返回"
                         }
                     } else if let Some(confirm_id) = *confirming_delete.read() {
+                        // 仅删除卡片：保留事件脚本文件。
+                        button {
+                            r#type: "button",
+                            onclick: move |_| {
+                                commit_history();
+                                let mut current = state.write();
+                                current.nodes.retain(|node| node.id != confirm_id);
+                                for node in &mut current.nodes {
+                                    node.children.retain(|child_id| *child_id != confirm_id);
+                                }
+                                if current.dragging == Some(confirm_id) {
+                                    current.dragging = None;
+                                }
+                                if current.connecting_from == Some(confirm_id) {
+                                    current.connecting_from = None;
+                                }
+                                confirming_delete.set(None);
+                                context_menu.set(None);
+                            },
+                            "删除卡片"
+                        }
+                        // 仅删除事件脚本文件：保留卡片（卡片仍指向同名脚本）。
+                        button {
+                            r#type: "button",
+                            onclick: move |_| {
+                                let event_file_name = state
+                                    .read()
+                                    .node(confirm_id)
+                                    .map(|node| mission_event_file(&node.mission_event, &node.text));
+                                if let Some(file_name) = event_file_name {
+                                    on_delete_event_file.call(file_name);
+                                }
+                                confirming_delete.set(None);
+                                context_menu.set(None);
+                            },
+                            "删除事件"
+                        }
+                        // 删除卡片与事件脚本（原行为）。
                         button {
                             r#type: "button",
                             onclick: move |_| {
@@ -1126,7 +1257,7 @@ pub fn MindMapCanvas(
                                 confirming_delete.set(None);
                                 context_menu.set(None);
                             },
-                            "确认删除卡片与脚本"
+                            "删除国策和事件"
                         }
                         button {
                             r#type: "button",
@@ -1134,15 +1265,41 @@ pub fn MindMapCanvas(
                             "取消"
                         }
                     } else if let Some(parent_id) = target_node {
-                        button {
-                            r#type: "button",
-                            onclick: move |_| {
-                                if let Some(node) = state.read().node(parent_id) {
-                                    on_edit_event.call(mission_event_file(&node.mission_event, &node.text));
-                                }
-                                context_menu.set(None);
-                            },
-                            "编辑事件"
+                        if target_event_missing {
+                            // 空国策（没有事件）：提供 新建事件 / 链接事件。
+                            button {
+                                r#type: "button",
+                                onclick: move |_| {
+                                    let node_info = state
+                                        .read()
+                                        .node(parent_id)
+                                        .map(|node| {
+                                            (mission_event_file(&node.mission_event, &node.text), node.text.clone())
+                                        });
+                                    if let Some((file_name, text)) = node_info {
+                                        on_create_event_file
+                                            .call((file_name, default_event(&text).to_text()));
+                                    }
+                                    context_menu.set(None);
+                                },
+                                "新建事件"
+                            }
+                            button {
+                                r#type: "button",
+                                onclick: move |_| linking_event_open.set(true),
+                                "链接事件"
+                            }
+                        } else {
+                            button {
+                                r#type: "button",
+                                onclick: move |_| {
+                                    if let Some(node) = state.read().node(parent_id) {
+                                        on_edit_event.call(mission_event_file(&node.mission_event, &node.text));
+                                    }
+                                    context_menu.set(None);
+                                },
+                                "编辑事件"
+                            }
                         }
                         button {
                             r#type: "button",
@@ -1157,7 +1314,7 @@ pub fn MindMapCanvas(
                         button {
                             r#type: "button",
                             onclick: move |_| {
-                                new_node_text.set("新卡片".to_string());
+                                new_node_text.set("新国策".to_string());
                                 icon_picker_open.set(true);
                             },
                             "创建分支"
@@ -1170,14 +1327,14 @@ pub fn MindMapCanvas(
                                 current.dragging = None;
                                 context_menu.set(None);
                             },
-                            "连接到已有卡片"
+                            "连接国策"
                         }
                         button {
                             r#type: "button",
                             onclick: move |_| {
                                 confirming_delete.set(Some(parent_id));
                             },
-                            "删除卡片"
+                            "删除"
                         }
                     } else {
                         button {
@@ -1185,7 +1342,7 @@ pub fn MindMapCanvas(
                             onclick: move |_| {
                                 icon_picker_open.set(true);
                             },
-                            "创建卡片"
+                            "创建国策"
                         }
                     }
                 }
@@ -1280,13 +1437,26 @@ fn NodeView(
                     stroke_width: "3",
                 }
             }
-            image {
-                href: "{icon.as_str()}",
-                x: "{x}",
-                y: "{y}",
-                width: "{NODE_WIDTH}",
-                height: "{NODE_HEIGHT}",
-                preserve_aspect_ratio: "xMidYMid meet",
+            if icon.as_str().is_empty() {
+                // 没有图片的国策：按游戏原版逻辑用纯黑卡片代替
+                // （也让卡片保持可点击/可拖动：空 <image> 不参与命中测试）。
+                rect {
+                    x: "{x}",
+                    y: "{y}",
+                    width: "{NODE_WIDTH}",
+                    height: "{NODE_HEIGHT}",
+                    rx: "2",
+                    fill: "#000000",
+                }
+            } else {
+                image {
+                    href: "{icon.as_str()}",
+                    x: "{x}",
+                    y: "{y}",
+                    width: "{NODE_WIDTH}",
+                    height: "{NODE_HEIGHT}",
+                    preserve_aspect_ratio: "xMidYMid meet",
+                }
             }
             text {
                 x: "{center_x}",

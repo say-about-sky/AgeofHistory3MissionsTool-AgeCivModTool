@@ -28,35 +28,49 @@ pub fn list_workspace_files(work_directory: String) -> Result<Vec<WorkspaceFile>
     Ok(entries)
 }
 
-/// 递归收集目录下的条目（目录在前、文件在后会打乱顺序，这里按路径排序保证稳定）。
+/// 递归收集目录下的条目。每层目录内「文件夹优先、其次文件」，
+/// 同组内按名称不区分大小写排序（与 Android SAF 目录列表保持一致）。
 fn append_workspace_entries(
     root: &Path,
     directory: &Path,
     entries: &mut Vec<WorkspaceFile>,
 ) -> Result<(), String> {
-    let mut children = fs::read_dir(directory)
+    // 先收集（路径, 是否文件夹, 名称）再排序：避免在比较函数里反复 stat。
+    let mut children: Vec<(PathBuf, bool, String)> = fs::read_dir(directory)
         .map_err(|error| error.to_string())?
         .map(|entry| entry.map(|entry| entry.path()))
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| error.to_string())?;
-    children.sort();
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|path| {
+            let is_directory = fs::symlink_metadata(&path)
+                .map_err(|error| error.to_string())?
+                .file_type()
+                .is_dir();
+            let name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            Ok((path, is_directory, name))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    children.sort_by(|left, right| {
+        right
+            .1
+            .cmp(&left.1)
+            .then_with(|| left.2.to_lowercase().cmp(&right.2.to_lowercase()))
+            .then_with(|| left.2.cmp(&right.2))
+    });
 
-    for path in children {
-        let file_type = fs::symlink_metadata(&path)
-            .map_err(|error| error.to_string())?
-            .file_type();
+    for (path, is_directory, name) in children {
         let relative_path = path
             .strip_prefix(root)
             .map_err(|error| error.to_string())?
             .to_string_lossy()
             .replace('\\', "/");
-        let is_directory = file_type.is_dir();
         entries.push(WorkspaceFile {
-            name: path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned(),
+            name,
             relative_path,
             is_directory,
         });
@@ -195,5 +209,49 @@ pub async fn reveal_workspace_item<R: tauri::Runtime>(
             opener.open_file(&uri).await
         };
         result.map_err(|error| format!("系统无法打开该条目：{error}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ageciv-workspace-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 每层目录：文件夹优先、其次文件（同组按名称不区分大小写），
+    /// 且子目录内容紧跟父目录行（前序 DFS，资源管理器按此顺序渲染）。
+    #[test]
+    fn workspace_listing_puts_directories_before_files() {
+        let dir = temp_dir("order");
+        fs::write(dir.join("aardvark.json"), "{}").unwrap();
+        fs::write(dir.join("Apple.json"), "{}").unwrap();
+        fs::create_dir_all(dir.join("missionsEvents")).unwrap();
+        fs::write(dir.join("missionsEvents").join("zz.txt"), "z").unwrap();
+        fs::write(dir.join("missionsEvents").join("aa.txt"), "a").unwrap();
+        fs::create_dir_all(dir.join("missionsImages")).unwrap();
+
+        let files = list_workspace_files(dir.to_string_lossy().into_owned()).unwrap();
+        let order: Vec<String> = files
+            .iter()
+            .map(|file| file.relative_path.clone())
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                "missionsEvents",
+                "missionsEvents/aa.txt",
+                "missionsEvents/zz.txt",
+                "missionsImages",
+                "aardvark.json",
+                "Apple.json",
+            ]
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }

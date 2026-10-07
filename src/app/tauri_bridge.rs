@@ -1,6 +1,7 @@
 use js_sys::Promise;
 use serde::Deserialize;
-use wasm_bindgen::prelude::*;
+use wasm_bindgen::{prelude::*, JsCast};
+use wasm_bindgen_futures::JsFuture;
 
 #[wasm_bindgen]
 extern "C" {
@@ -62,4 +63,21 @@ pub fn listen_workspace_changed(on_changed: impl FnMut() + 'static) {
 	});
 	let _ = listen_event("workspace-changed", event_listener.as_ref());
 	event_listener.forget();
+}
+
+/// 等待指定毫秒（`setTimeout` 包装成 Promise）：用于「短暂提示后自动收起」等场景。
+pub async fn sleep_ms(milliseconds: u32) {
+	let promise = Promise::new(&mut |resolve, _reject| {
+		let callback = Closure::once_into_js(move || {
+			let _ = resolve.call0(&JsValue::UNDEFINED);
+		});
+		if let Some(window) = web_sys::window() {
+			let handler: &js_sys::Function = callback.unchecked_ref();
+			let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+				handler,
+				milliseconds as i32,
+			);
+		}
+	});
+	let _ = JsFuture::from(promise).await;
 }

@@ -276,6 +276,32 @@ pub async fn read_text_in_dir<R: tauri::Runtime>(
         .map_err(|error| describe(error, &format!("读取失败（{file_name}）")))
 }
 
+/// 批量读取目录内的文本文件（目录只解析一次；缺失/读取失败的文件跳过），
+/// 返回（文件名，内容）列表。用于事件编辑器的文明对照表等成批小文件场景。
+pub async fn read_text_files_in_dir<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    folder_id: &str,
+    dir_path: &str,
+    names: Vec<String>,
+) -> Result<Vec<(String, String)>, String> {
+    let api = app.android_fs_async();
+    let root = root_uri(folder_id);
+    let dir = resolve_dir(api, &root, dir_path).await?;
+    let mut out = Vec::new();
+    for name in names {
+        if name.trim().is_empty() || name.contains('/') || name.contains('\\') {
+            continue;
+        }
+        let Ok(file) = api.resolve_file_uri(&dir, &name).await else {
+            continue;
+        };
+        if let Ok(text) = api.read_to_string(&file).await {
+            out.push((name, text));
+        }
+    }
+    Ok(out)
+}
+
 /// 写入（必要时创建目录与文件）目录内单个文本文件。
 pub async fn write_text_in_dir<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,

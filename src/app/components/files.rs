@@ -440,7 +440,7 @@ pub fn Files(
                 span { "资源管理器" }
                 span { class: "pane-count", "{entries.len()}" }
             }
-            if let Some(path) = work_directory {
+            if work_directory.is_some() {
                 div { class: "explorer-search",
                     input {
                         r#type: "text",
@@ -477,7 +477,6 @@ pub fn Files(
                         }
                     }
                 }
-                div { class: "workspace-root", title: "{path}", "工作区" }
                 div {
                     class: "file-list",
                     id: "explorer-list",

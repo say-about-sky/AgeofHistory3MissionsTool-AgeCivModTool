@@ -309,7 +309,7 @@ pub fn Frame(
                     r#type: "button",
                     onclick: move |_| on_toggle_events.call(()),
                     span { class: "toolbar-icon", "✎" }
-                    "国策事件"
+                    "事件编辑器"
                 }
             }
         }

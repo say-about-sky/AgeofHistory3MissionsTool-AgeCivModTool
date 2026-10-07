@@ -5,6 +5,7 @@ pub mod files;
 pub mod frame;
 pub mod event;
 pub mod event_grid;
+pub mod event_lookup;
 pub mod event_parser;
 pub mod event_schema;
 pub mod game_text;

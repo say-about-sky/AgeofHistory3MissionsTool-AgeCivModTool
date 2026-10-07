@@ -1,0 +1,545 @@
+//! 事件编辑器「文明 / 政体 / 省份 / 建筑 / 疾病 / 人物对照表」。
+//!
+//! 数据由后端命令提供（解析核心移植自 ScvGen 库，见
+//! `src-tauri/src/commands/missions_db.rs`）：
+//! - 文明：tag → 名称（`Civilizations.txt` + 翻译 `.properties` + `civilizations/*.json`）；
+//! - 政体：整数序号 → 名称（`Governments.json` 的 `Name:` / `Extra_Tag:` 顺序扫描，
+//!   序号即游戏内使用的「政体整数」）；
+//! - 省份：地图（`assets/map/Maps.json` 发现）省份 ID → 地名（`cities/cities.json`）；
+//! - 建筑 / 疾病：定义数组顺序即 ID（疾病名称经根语言表翻译）；
+//! - 人物：`characters/**.json` 的 `Name` 与文件名（供 add_general 系列补全）。
+//!
+//! 供 `event_grid` 为对应值单元格提供 datalist 自动补全与「值 → 名称」对照提示。
+
+use serde::{Deserialize, Serialize};
+use wasm_bindgen_futures::JsFuture;
+
+use super::WorkDirectory;
+use crate::app::tauri_bridge::invoke;
+
+/// 文明对照条目。
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct CivItem {
+	pub tag: String,
+	pub name: String,
+}
+
+/// 政体对照条目（`index` 为游戏内「政体整数」）。
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct GovItem {
+	pub index: u32,
+	pub name: String,
+}
+
+/// 数值 ID + 名称对照条目（省份 / 建筑 / 疾病共用）。
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct IdNameItem {
+	pub id: u32,
+	pub name: String,
+}
+
+/// 事件编辑器对照表（后端 `load_event_lookup` 命令返回结构的镜像）。
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+pub struct EventLookup {
+	#[serde(default)]
+	pub civs: Vec<CivItem>,
+	#[serde(default)]
+	pub governments: Vec<GovItem>,
+	/// 人物名称（add_general / add_general2 等）。
+	#[serde(default)]
+	pub characters: Vec<String>,
+	/// 省份清单（`id` 升序，名称可能为空）。
+	#[serde(default)]
+	pub provinces: Vec<IdNameItem>,
+	/// 建筑清单（数组顺序即 ID）。
+	#[serde(default)]
+	pub buildings: Vec<IdNameItem>,
+	/// 疾病清单（数组顺序即 ID）。
+	#[serde(default)]
+	pub diseases: Vec<IdNameItem>,
+}
+
+impl EventLookup {
+	/// 是否没有任何对照数据（未加载或工作区没有游戏数据文件）。
+	pub fn is_empty(&self) -> bool {
+		self.civs.is_empty()
+			&& self.governments.is_empty()
+			&& self.characters.is_empty()
+			&& self.provinces.is_empty()
+			&& self.buildings.is_empty()
+			&& self.diseases.is_empty()
+	}
+
+	/// 按 tag 查文明名称（ASCII 大小写不敏感，中文等非 ASCII 精确匹配）。
+	pub fn civ_name(&self, tag: &str) -> Option<&str> {
+		self.civs
+			.iter()
+			.find(|item| item.tag.eq_ignore_ascii_case(tag))
+			.map(|item| item.name.as_str())
+	}
+
+	/// 按序号查政体名称。
+	pub fn gov_name(&self, index: u32) -> Option<&str> {
+		self.governments
+			.binary_search_by_key(&index, |item| item.index)
+			.ok()
+			.map(|position| self.governments[position].name.as_str())
+	}
+
+	/// 按 ID 查省份名称（无地名时返回 None）。
+	pub fn province_name(&self, id: u32) -> Option<&str> {
+		name_of(&self.provinces, id)
+	}
+
+	/// 按 ID 查建筑名称。
+	pub fn building_name(&self, id: u32) -> Option<&str> {
+		name_of(&self.buildings, id)
+	}
+
+	/// 按 ID 查疾病名称（中译优先）。
+	pub fn disease_name(&self, id: u32) -> Option<&str> {
+		name_of(&self.diseases, id)
+	}
+}
+
+/// 按 ID 二分查找非空名称（后端输出按 ID 升序）。
+fn name_of(items: &[IdNameItem], id: u32) -> Option<&str> {
+	items
+		.binary_search_by_key(&id, |item| item.id)
+		.ok()
+		.map(|position| items[position].name.as_str())
+		.filter(|name| !name.is_empty())
+}
+
+/// 值单元格中每一段（以 `=` 分隔）的语义。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ValuePart {
+	/// 文明 tag（如 `atr`、`fra`）。
+	Civ,
+	/// 政体整数（`Governments.json` 顺序号）。
+	Gov,
+	/// 省份 ID（如 `move_capital`）。
+	Province,
+	/// 省份 ID，且值段以 `;` 结尾（如 `province_add_building` 的 `3994;`）。
+	ProvinceSemi,
+	/// 建筑整数 ID（`Buildings.json` 顺序号）。
+	Building,
+	/// 疾病整数 ID（`Diseases.json` 顺序号）。
+	Disease,
+	/// 人物名称（`characters` 清单，值本身就是名称）。
+	Character,
+	/// 普通文本段（不提供补全与提示）。
+	Plain,
+}
+
+pub const CIV_DATALIST_ID: &str = "evdl-civ";
+pub const GOV_DATALIST_ID: &str = "evdl-gov";
+pub const PROVINCE_DATALIST_ID: &str = "evdl-prov";
+pub const BUILDING_DATALIST_ID: &str = "evdl-build";
+pub const DISEASE_DATALIST_ID: &str = "evdl-disease";
+pub const CHARACTER_DATALIST_ID: &str = "evdl-char";
+
+/// 分段语义对应的 datalist id（`Plain` 无候选列表）。
+pub fn datalist_id(kind: ValuePart) -> &'static str {
+	match kind {
+		ValuePart::Civ => CIV_DATALIST_ID,
+		ValuePart::Gov => GOV_DATALIST_ID,
+		ValuePart::Province | ValuePart::ProvinceSemi => PROVINCE_DATALIST_ID,
+		ValuePart::Building => BUILDING_DATALIST_ID,
+		ValuePart::Disease => DISEASE_DATALIST_ID,
+		ValuePart::Character => CHARACTER_DATALIST_ID,
+		ValuePart::Plain => "",
+	}
+}
+
+/// 值段固定后缀（分段输入框在拼接时自动附加，显示时自动去除）。
+pub fn part_suffix(kind: ValuePart) -> &'static str {
+	match kind {
+		ValuePart::ProvinceSemi => ";",
+		_ => "",
+	}
+}
+
+/// 按键名查询值分段语义；返回 `None` 表示该键与对照表无关。
+///
+/// 依据《国策系统说明文档.md》与 `event_schema` 的注解整理：
+/// 只有标注「文明ID / tag / civ」的段位返回 [`ValuePart::Civ`]，
+/// 只有「政体」相关字段返回 [`ValuePart::Gov`]；省份 / 建筑 / 疾病 / 人物同理。
+pub fn value_parts(key: &str) -> Option<&'static [ValuePart]> {
+	use ValuePart::*;
+	let parts: &'static [ValuePart] = match key {
+		// ===== 触发条件 =====
+		"is_civ" | "is_player" | "is_not_player" | "exists_any" | "exists_any_not"
+		| "province_controlled_by" | "civ_has_truce_with" => &[Civ],
+		"civ_is_vassal_of_civ" | "civs_are_at_war" => &[Civ, Civ],
+		"has_variable_civ" => &[Civ, Plain],
+		"province_has_building" => &[Province, Building],
+		"province_core_of" => &[Province, Plain],
+		// ===== 收益效果 =====
+		"change_ideology" => &[Gov],
+		"change_ideology_civ" => &[Civ, Gov],
+		"set_civ_tag" | "set_civ_tag_reset" | "player_set_civ" | "annex_civ" | "annexed_by_civ"
+		| "white_peace" | "declare_war" | "white_peace2" | "alliance" | "non_aggression_pact"
+		| "military_access" | "vassalize" => &[Civ],
+		"set_civ_tag2" | "make_puppet" | "declare_war2" | "add_defensive_pact"
+		| "add_guarantee" | "add_truce" => &[Civ, Civ],
+		"annex_by_civ_from_civ" => &[Civ, Civ, Civ],
+		"relation_change" | "relation_set" | "change_religion_civ" | "add_variable_civ"
+		| "remove_variable_civ" | "annex_provinces_from_civ" => &[Civ, Plain],
+		// 省份（第二段为数值/未确认语义时按 Plain 处理）
+		"move_capital" | "province_id_nuke" => &[Province],
+		"province_economy_id" | "province_manpower_id" | "province_devastation_id"
+		| "province_id_pop_set" | "province_id_core_add" | "province_id_core_remove" => {
+			&[Province, Plain]
+		}
+		"province_id_build_add" | "province_id_build_remove" => &[Province, Building],
+		"province_id_spread_disease" => &[Province, Disease],
+		// 值段以 `;` 结尾的 Lambda 格式：`省份ID;=建筑ID=整数`
+		"province_add_building" => &[ProvinceSemi, Building, Plain],
+		// 人物名称（add_general 旧版也接受 true，候选列表只是建议）
+		"add_general" | "add_general2" | "add_general_character" | "add_advisor_character" => {
+			&[Character]
+		}
+		"add_general_character_attack_defense" => &[Character, Plain, Plain],
+		_ => return None,
+	};
+	Some(parts)
+}
+
+/// 替换 `value` 中以 `=` 分隔的第 `index` 段（不足处补空段），返回拼接结果。
+/// `suffix` 为该段的固定后缀（如 `ProvinceSemi` 的 `;`），写入时自动附加。
+pub fn replace_value_part(value: &str, index: usize, suffix: &str, new_part: &str) -> String {
+	let mut parts: Vec<String> = value.split('=').map(str::to_string).collect();
+	while parts.len() <= index {
+		parts.push(String::new());
+	}
+	parts[index] = if suffix.is_empty() {
+		new_part.to_string()
+	} else {
+		format!("{new_part}{suffix}")
+	};
+	parts.join("=")
+}
+
+/// 拼接「值段 → 名称」对照提示（只显示能查到的段，拼写中间状态的段不打扰）。
+pub fn name_hint(lookup: &EventLookup, parts: &[ValuePart], value: &str) -> String {
+	let mut pieces: Vec<String> = Vec::new();
+	for (index, part) in value.split('=').enumerate() {
+		let Some(kind) = parts.get(index) else {
+			continue;
+		};
+		let part = part.trim();
+		if part.is_empty() {
+			continue;
+		}
+		match kind {
+			ValuePart::Civ => {
+				if let Some(name) = lookup.civ_name(part) {
+					pieces.push(format!("{part}={name}"));
+				}
+			}
+			ValuePart::Gov => {
+				if let Ok(index) = part.parse::<u32>() {
+					if let Some(name) = lookup.gov_name(index) {
+						pieces.push(format!("{part}={name}"));
+					}
+				}
+			}
+			ValuePart::Province | ValuePart::ProvinceSemi => {
+				let text = part.trim_end_matches(';').trim();
+				if let Ok(id) = text.parse::<u32>() {
+					if let Some(name) = lookup.province_name(id) {
+						pieces.push(format!("{text}={name}"));
+					}
+				}
+			}
+			ValuePart::Building => {
+				if let Ok(id) = part.parse::<u32>() {
+					if let Some(name) = lookup.building_name(id) {
+						pieces.push(format!("{part}={name}"));
+					}
+				}
+			}
+			ValuePart::Disease => {
+				if let Ok(id) = part.parse::<u32>() {
+					if let Some(name) = lookup.disease_name(id) {
+						pieces.push(format!("{part}={name}"));
+					}
+				}
+			}
+			// 人物名称本身就是值，无需再对照。
+			ValuePart::Character | ValuePart::Plain => {}
+		}
+	}
+	pieces.join(" · ")
+}
+
+/// 对照表缓存键：同一游戏数据目录（全局与各剧本资源根共享 `assets/game`）只需加载一次。
+///
+/// 与后端 `missions_db::game_dir_candidates` 的首选项推导规则保持一致：
+/// `…/assets/game/missions` → `…/assets/game`；
+/// `…/assets/map/<地图>/scenarios/<剧本>/missions` → `<前缀>/assets/game`；
+/// 经典 `missions` → 其上级目录。
+pub fn game_dir_key(missions_root: &str) -> String {
+	let segments: Vec<&str> = missions_root
+		.split('/')
+		.filter(|segment| !segment.is_empty())
+		.collect();
+	for (index, segment) in segments.iter().enumerate() {
+		if *segment != "assets" {
+			continue;
+		}
+		if segments.get(index + 1) == Some(&"game") {
+			return segments[..index + 2].join("/");
+		}
+		if segments.get(index + 2).is_some()
+			&& segments.get(index + 3) == Some(&"scenarios")
+			&& segments.get(index + 4).is_some()
+			&& segments.get(index + 5) == Some(&"missions")
+		{
+			let prefix = segments[..index].join("/");
+			return if prefix.is_empty() {
+				"assets/game".to_string()
+			} else {
+				format!("{prefix}/assets/game")
+			};
+		}
+	}
+	if segments.len() > 1 {
+		segments[..segments.len() - 1].join("/")
+	} else {
+		String::new()
+	}
+}
+
+/// 剧本上下文键：`…/assets/map/<地图>/scenarios/<剧本>/…` → `<地图>`；其余（全局根）→ 空串。
+///
+/// 与后端 `missions_db::scenario_map_of` 的路径规则对应：剧本根按其所属地图
+/// 加载省份数据（多地图工作区）；全局根按全部地图合并。
+pub fn scenario_map_key(missions_root: &str) -> String {
+	let segments: Vec<&str> = missions_root
+		.split('/')
+		.filter(|segment| !segment.is_empty())
+		.collect();
+	for (index, segment) in segments.iter().enumerate() {
+		if *segment != "map" {
+			continue;
+		}
+		if segments.get(index + 2).copied() != Some("scenarios") {
+			continue;
+		}
+		if let Some(map) = segments.get(index + 1) {
+			return (*map).to_string();
+		}
+	}
+	String::new()
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LookupArgs {
+	work_directory: String,
+	missions_root: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LookupScopedArgs {
+	folder_id: String,
+	missions_root: String,
+}
+
+/// 加载对照表：真实路径模式走 `load_event_lookup`，SAF 模式走 `load_event_lookup_scoped`。
+///
+/// 工作区没有游戏数据文件时后端返回空表（编辑器不显示补全但不报错）。
+pub async fn load_event_lookup(
+	directory: &WorkDirectory,
+	missions_root: &str,
+) -> Result<EventLookup, String> {
+	if let Some(folder_id) = &directory.folder_id {
+		let args = serde_wasm_bindgen::to_value(&LookupScopedArgs {
+			folder_id: folder_id.clone(),
+			missions_root: missions_root.to_string(),
+		})
+		.map_err(|error| error.to_string())?;
+		let value = JsFuture::from(invoke("load_event_lookup_scoped", args))
+			.await
+			.map_err(|error| format!("加载文明对照表失败：{error:?}"))?;
+		serde_wasm_bindgen::from_value(value)
+			.map_err(|error| format!("文明对照表格式错误：{error}"))
+	} else {
+		let args = serde_wasm_bindgen::to_value(&LookupArgs {
+			work_directory: directory.root_path.clone(),
+			missions_root: missions_root.to_string(),
+		})
+		.map_err(|error| error.to_string())?;
+		let value = JsFuture::from(invoke("load_event_lookup", args))
+			.await
+			.map_err(|error| format!("加载文明对照表失败：{error:?}"))?;
+		serde_wasm_bindgen::from_value(value)
+			.map_err(|error| format!("文明对照表格式错误：{error}"))
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn sample_lookup() -> EventLookup {
+		EventLookup {
+			civs: vec![
+				CivItem { tag: "atr".into(), name: "奥地利".into() },
+				CivItem { tag: "fra".into(), name: "法兰西".into() },
+				CivItem { tag: "ger".into(), name: "德意志国".into() },
+				CivItem { tag: "bah".into(), name: "巴哈马".into() },
+			],
+			governments: vec![
+				GovItem { index: 0, name: "临时政府".into() },
+				GovItem { index: 10, name: "专制主义".into() },
+			],
+			characters: vec!["约瑟夫·霞飞".into(), "斐迪南·福熙".into()],
+			provinces: vec![
+				IdNameItem { id: 11, name: "里斯本".into() },
+				IdNameItem { id: 3475, name: "北平".into() },
+				IdNameItem { id: 12049, name: String::new() },
+			],
+			buildings: vec![
+				IdNameItem { id: 6, name: "要塞".into() },
+				IdNameItem { id: 10, name: "补给中心".into() },
+			],
+			diseases: vec![
+				IdNameItem { id: 0, name: "黑死病".into() },
+				IdNameItem { id: 1, name: "天花".into() },
+			],
+		}
+	}
+
+	#[test]
+	fn value_parts_covers_civ_and_gov_fields() {
+		let civ: &[ValuePart] = &[ValuePart::Civ];
+		let civ_pair: &[ValuePart] = &[ValuePart::Civ, ValuePart::Civ];
+		let civ_triple: &[ValuePart] = &[ValuePart::Civ, ValuePart::Civ, ValuePart::Civ];
+		let gov: &[ValuePart] = &[ValuePart::Gov];
+		let civ_gov: &[ValuePart] = &[ValuePart::Civ, ValuePart::Gov];
+
+		assert_eq!(value_parts("is_civ"), Some(civ));
+		assert_eq!(value_parts("annex_by_civ_from_civ"), Some(civ_triple));
+		assert_eq!(value_parts("civ_is_vassal_of_civ"), Some(civ_pair));
+		assert_eq!(value_parts("change_ideology"), Some(gov));
+		assert_eq!(value_parts("change_ideology_civ"), Some(civ_gov));
+		// 与文明/政体无关的键不参与。
+		assert_eq!(value_parts("gold"), None);
+		assert_eq!(value_parts("legacy"), None);
+	}
+
+	#[test]
+	fn value_parts_covers_province_building_disease_character_fields() {
+		let province: &[ValuePart] = &[ValuePart::Province];
+		let province_plain: &[ValuePart] = &[ValuePart::Province, ValuePart::Plain];
+		let province_building: &[ValuePart] = &[ValuePart::Province, ValuePart::Building];
+		let province_disease: &[ValuePart] = &[ValuePart::Province, ValuePart::Disease];
+		let semi_building: &[ValuePart] = &[
+			ValuePart::ProvinceSemi,
+			ValuePart::Building,
+			ValuePart::Plain,
+		];
+		let character: &[ValuePart] = &[ValuePart::Character];
+
+		assert_eq!(value_parts("move_capital"), Some(province));
+		assert_eq!(value_parts("province_economy_id"), Some(province_plain));
+		assert_eq!(value_parts("province_has_building"), Some(province_building));
+		assert_eq!(value_parts("province_id_build_add"), Some(province_building));
+		assert_eq!(value_parts("province_id_spread_disease"), Some(province_disease));
+		assert_eq!(value_parts("province_add_building"), Some(semi_building));
+		assert_eq!(value_parts("add_general2"), Some(character));
+		assert_eq!(value_parts("add_general"), Some(character));
+		// 后缀与 datalist 归属。
+		assert_eq!(part_suffix(ValuePart::ProvinceSemi), ";");
+		assert_eq!(part_suffix(ValuePart::Province), "");
+		assert_eq!(datalist_id(ValuePart::ProvinceSemi), PROVINCE_DATALIST_ID);
+		assert_eq!(datalist_id(ValuePart::Character), CHARACTER_DATALIST_ID);
+	}
+
+	#[test]
+	fn civ_and_gov_name_lookup_work() {
+		let lookup = sample_lookup();
+		assert_eq!(lookup.civ_name("atr"), Some("奥地利"));
+		// ASCII 大小写不敏感。
+		assert_eq!(lookup.civ_name("ATR"), Some("奥地利"));
+		assert_eq!(lookup.civ_name("xxx"), None);
+		assert_eq!(lookup.gov_name(10), Some("专制主义"));
+		assert_eq!(lookup.gov_name(9), None);
+		// 省份 / 建筑 / 疾病名称（无名称的省份返回 None）。
+		assert_eq!(lookup.province_name(3475), Some("北平"));
+		assert_eq!(lookup.province_name(12049), None);
+		assert_eq!(lookup.building_name(6), Some("要塞"));
+		assert_eq!(lookup.disease_name(1), Some("天花"));
+	}
+
+	#[test]
+	fn name_hint_maps_each_segment() {
+		let lookup = sample_lookup();
+		let parts = value_parts("declare_war2").unwrap();
+		assert_eq!(name_hint(&lookup, parts, "fra=ger"), "fra=法兰西 · ger=德意志国");
+		// 拼写中间状态不显示，不干扰输入。
+		assert_eq!(name_hint(&lookup, parts, "fr"), "");
+		assert_eq!(name_hint(&lookup, parts, "fra="), "fra=法兰西");
+		// 政体整数。
+		let parts = value_parts("change_ideology").unwrap();
+		assert_eq!(name_hint(&lookup, parts, "10"), "10=专制主义");
+		assert_eq!(name_hint(&lookup, parts, "3"), "");
+		// 文明=政体混合。
+		let parts = value_parts("change_ideology_civ").unwrap();
+		assert_eq!(name_hint(&lookup, parts, "ger=0"), "ger=德意志国 · 0=临时政府");
+		// 省份 / 建筑 / 疾病（含 `;` 后缀与空名称）。
+		let parts = value_parts("move_capital").unwrap();
+		assert_eq!(name_hint(&lookup, parts, "3475"), "3475=北平");
+		assert_eq!(name_hint(&lookup, parts, "12049"), "");
+		let parts = value_parts("province_has_building").unwrap();
+		assert_eq!(name_hint(&lookup, parts, "11=6"), "11=里斯本 · 6=要塞");
+		let parts = value_parts("province_add_building").unwrap();
+		assert_eq!(name_hint(&lookup, parts, "3475;=6=0"), "3475=北平 · 6=要塞");
+		let parts = value_parts("province_id_spread_disease").unwrap();
+		assert_eq!(name_hint(&lookup, parts, "11=1"), "11=里斯本 · 1=天花");
+		// 人物名称本身就是值，不产生对照提示。
+		let parts = value_parts("add_general2").unwrap();
+		assert_eq!(name_hint(&lookup, parts, "约瑟夫·霞飞"), "");
+	}
+
+	#[test]
+	fn replace_value_part_rebuilds_value() {
+		assert_eq!(replace_value_part("fra=ger", 1, "", "atr"), "fra=atr");
+		assert_eq!(replace_value_part("fra", 1, "", "ger"), "fra=ger");
+		assert_eq!(replace_value_part("", 0, "", "atr"), "atr");
+		assert_eq!(replace_value_part("a=b=c", 0, "", "x"), "x=b=c");
+		// 固定后缀：写入时自动附加（`province_add_building` 的 `省份ID;`）。
+		assert_eq!(replace_value_part("", 0, ";", "3994"), "3994;");
+		assert_eq!(replace_value_part("3994;=6=0", 0, ";", "3475"), "3475;=6=0");
+	}
+
+	#[test]
+	fn game_dir_key_matches_backend_layouts() {
+		assert_eq!(
+			game_dir_key("暮色黄昏_世界大战0.25.1/assets/game/missions"),
+			"暮色黄昏_世界大战0.25.1/assets/game"
+		);
+		assert_eq!(
+			game_dir_key("包名/assets/map/Earth3/scenarios/TheGreatWar/missions"),
+			"包名/assets/game"
+		);
+		assert_eq!(game_dir_key("assets/game/missions"), "assets/game");
+		assert_eq!(game_dir_key("missions"), "");
+		assert_eq!(game_dir_key("foo/missions"), "foo");
+	}
+
+	#[test]
+	fn scenario_map_key_extracts_map_folder() {
+		assert_eq!(
+			scenario_map_key("包名/assets/map/Earth3/scenarios/TheGreatWar/missions"),
+			"Earth3"
+		);
+		// 全局根 / 经典根：无地图上下文。
+		assert_eq!(scenario_map_key("包名/assets/game/missions"), "");
+		assert_eq!(scenario_map_key("missions"), "");
+	}
+}

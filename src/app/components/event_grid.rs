@@ -8,12 +8,16 @@
 //! 表格列为：键 | 值 | 说明 | 删除。
 //! 键输入提供 Schema 自动补全，值按类型渲染（bool 为下拉框，其余文本），
 //! 与 Schema 类型不符的单元格红框提示，保存时仍会原样写入。
+//! 文明ID / tag / civ 与政体整数字段：值按 `=` 分段渲染，各段挂 datalist 候选，
+//! 并在下方显示「值 → 名称」对照提示（数据来自 `event_lookup` 对照表）。
 
 use dioxus::prelude::*;
 
+use super::event_lookup::{self, datalist_id, name_hint, part_suffix, value_parts, EventLookup, ValuePart};
 use super::event_parser::{EntryLine, MissionEvent, NextOp, TriggerBlock, TriggerKind};
 use super::event_schema::{self, FieldCategory, ValueSpec, ValueType};
 use super::game_text::{has_game_codes, GameTextPreview};
+use super::mind::Shared;
 
 /// 值单元格的输入方式。
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -104,6 +108,79 @@ fn effect_suggestions(event: &MissionEvent) -> Vec<String> {
 	keys
 }
 
+/// 值单元格中的一个分段输入框（文明/政体/省份等字段按 `=` 拆分后各占一段，
+/// 分别挂对应的 datalist 提供自动补全；`suffix` 为拼接时自动附加的固定后缀）。
+#[component]
+fn ValuePartInput(
+	text: String,
+	list_id: &'static str,
+	suffix: &'static str,
+	invalid: bool,
+	segment_index: usize,
+	full_value: String,
+	on_value: EventHandler<String>,
+) -> Element {
+	rsx! {
+        input {
+            class: if invalid { "event-cell-input invalid" } else { "event-cell-input" },
+            value: "{text}",
+            list: "{list_id}",
+            spellcheck: "false",
+            oninput: move |evt: FormEvent| {
+                let joined = event_lookup::replace_value_part(
+                    &full_value,
+                    segment_index,
+                    suffix,
+                    &evt.value(),
+                );
+                on_value.call(joined);
+            },
+        }
+    }
+}
+
+/// 文明 / 政体候选列表（独立组件：对照表不变时按 `Shared` 指针判定跳过重渲染，
+/// 避免数千条候选在每次输入时反复 diff）。
+#[component]
+fn LookupDatalists(lookup: Shared<EventLookup>) -> Element {
+	rsx! {
+        datalist { id: "{event_lookup::CIV_DATALIST_ID}",
+            for item in lookup.civs.iter() {
+                option { value: "{item.tag}", "{item.name}" }
+            }
+        }
+        datalist { id: "{event_lookup::GOV_DATALIST_ID}",
+            for item in lookup.governments.iter() {
+                option { value: "{item.index}", "{item.name}" }
+            }
+        }
+        datalist { id: "{event_lookup::PROVINCE_DATALIST_ID}",
+            for item in lookup.provinces.iter() {
+                if item.name.is_empty() {
+                    option { value: "{item.id}" }
+                } else {
+                    option { value: "{item.id}", "{item.name}" }
+                }
+            }
+        }
+        datalist { id: "{event_lookup::BUILDING_DATALIST_ID}",
+            for item in lookup.buildings.iter() {
+                option { value: "{item.id}", "{item.name}" }
+            }
+        }
+        datalist { id: "{event_lookup::DISEASE_DATALIST_ID}",
+            for item in lookup.diseases.iter() {
+                option { value: "{item.id}", "{item.name}" }
+            }
+        }
+        datalist { id: "{event_lookup::CHARACTER_DATALIST_ID}",
+            for name in lookup.characters.iter() {
+                option { value: "{name}" }
+            }
+        }
+    }
+}
+
 /// 表格行（键 | 值 | 说明 | 删除）。`show_delete` 为 false 时删除格留空。
 #[component]
 fn GridRow(
@@ -113,6 +190,7 @@ fn GridRow(
 	invalid: bool,
 	note: String,
 	datalist: &'static str,
+	lookup: Shared<EventLookup>,
 	show_delete: bool,
 	key_readonly: bool,
 	on_key: EventHandler<String>,
@@ -123,6 +201,36 @@ fn GridRow(
 ) -> Element {
 	let show_preview = input_kind == CellInput::Text && has_game_codes(&value);
 	let key_title = if key_readonly { "必填项目的键固定不可修改" } else { "" };
+	// 文明 / 政体相关键：值按 `=` 分段渲染，各段挂对应的 datalist 并显示「值 → 名称」对照。
+	let parts = if input_kind == CellInput::Text {
+		value_parts(&field_key)
+	} else {
+		None
+	};
+	let segment_values: Vec<String> = value.split('=').map(str::to_string).collect();
+	let segment_count = parts
+		.map(|parts| parts.len().max(segment_values.len()))
+		.unwrap_or(0);
+	let hint = parts
+		.map(|parts| name_hint(&lookup, parts, &value))
+		.unwrap_or_default();
+	// 分段渲染数据：（段索引、显示文本、候选列表、固定后缀）。
+	// 固定后缀（如 province_add_building 的 `;`）只在拼接时写出，显示时隐藏。
+	let segment_render: Vec<(usize, String, &'static str, &'static str)> = (0..segment_count)
+		.map(|index| {
+			let kind = parts
+				.map(|parts| parts.get(index).copied().unwrap_or(ValuePart::Plain))
+				.unwrap_or(ValuePart::Plain);
+			let suffix = part_suffix(kind);
+			let raw = segment_values.get(index).cloned().unwrap_or_default();
+			let text = if suffix.is_empty() {
+				raw
+			} else {
+				raw.strip_suffix(suffix).unwrap_or(&raw).to_string()
+			};
+			(index, text, datalist_id(kind), suffix)
+		})
+		.collect();
 	rsx! {
         div { class: "event-grid-row",
             div { class: "event-cell event-cell-key",
@@ -147,6 +255,29 @@ fn GridRow(
                         option { value: "", "（留空）" }
                         option { value: "true", "true" }
                         option { value: "false", "false" }
+                    }
+                } else if parts.is_some() {
+                    div { class: "event-value-parts",
+                        for (index , text , list_id , suffix) in segment_render {
+                            if index > 0 {
+                                span { class: "event-value-sep", "=" }
+                            }
+                            ValuePartInput {
+                                text,
+                                list_id,
+                                suffix,
+                                invalid,
+                                segment_index: index,
+                                full_value: value.clone(),
+                                on_value,
+                            }
+                        }
+                    }
+                    if !hint.is_empty() {
+                        div { class: "event-value-hint", "{hint}" }
+                    }
+                    if show_preview {
+                        GameTextPreview { text: value.clone() }
                     }
                 } else {
                     input {
@@ -201,6 +332,7 @@ fn GridSection(
 	title: String,
 	rows: Vec<(usize, String, String)>,
 	datalist: &'static str,
+	lookup: Shared<EventLookup>,
 	can_add: bool,
 	can_remove: bool,
 	editable_key: bool,
@@ -236,6 +368,7 @@ fn GridSection(
                     invalid: is_invalid(&key, &value),
                     note: note_for(&key),
                     datalist,
+                    lookup: lookup.clone(),
                     show_delete: can_remove,
                     key_readonly: !editable_key,
                     on_key: move |new_key: String| on_key.call((index, new_key)),
@@ -269,8 +402,9 @@ fn mutate_event(event: Signal<Option<MissionEvent>>, f: impl FnOnce(&mut Mission
 }
 
 /// 特化 Excel 表格编辑器。直接编辑 `MissionEvent` 信号。
+/// `lookup` 为文明/政体对照表（事件面板加载后传入，供值单元格补全与名称提示）。
 #[component]
-pub fn EventGrid(event: Signal<Option<MissionEvent>>) -> Element {
+pub fn EventGrid(event: Signal<Option<MissionEvent>>, lookup: Shared<EventLookup>) -> Element {
 	let mut editing_key: Signal<Option<(usize, HeaderGroup)>> = use_signal(|| None);
 	let snapshot = event.read().clone();
 	let Some(data) = snapshot else {
@@ -495,11 +629,16 @@ pub fn EventGrid(event: Signal<Option<MissionEvent>>) -> Element {
                     option { value: "{key}" }
                 }
             }
+            // 文明 / 政体值候选（供值单元格分段输入框引用；无数据时不渲染）
+            if !lookup.is_empty() {
+                LookupDatalists { lookup: lookup.clone() }
+            }
 
             GridSection {
                 title: "必填项目".to_string(),
                 rows: required_rows,
                 datalist: "evdl-header",
+                lookup: lookup.clone(),
                 can_add: false,
                 can_remove: false,
                 editable_key: false,
@@ -515,6 +654,7 @@ pub fn EventGrid(event: Signal<Option<MissionEvent>>) -> Element {
                 title: "可填项目".to_string(),
                 rows: optional_rows,
                 datalist: "evdl-header",
+                lookup: lookup.clone(),
                 can_add: true,
                 can_remove: true,
                 editable_key: true,
@@ -530,6 +670,7 @@ pub fn EventGrid(event: Signal<Option<MissionEvent>>) -> Element {
                 title: "其他（未识别字段）".to_string(),
                 rows: unknown_rows,
                 datalist: "evdl-header",
+                lookup: lookup.clone(),
                 can_add: true,
                 can_remove: true,
                 editable_key: true,
@@ -590,6 +731,7 @@ pub fn EventGrid(event: Signal<Option<MissionEvent>>) -> Element {
                             invalid: is_invalid(&entry.key, entry.value_or_default()),
                             note: note_for(&entry.key),
                             datalist: "evdl-trigger",
+                            lookup: lookup.clone(),
                             show_delete: true,
                             key_readonly: false,
                             on_key: move |new_key: String| set_condition_key((block_index, row_index, new_key)),
@@ -642,6 +784,7 @@ pub fn EventGrid(event: Signal<Option<MissionEvent>>) -> Element {
                             invalid: is_invalid(&entry.key, entry.value_or_default()),
                             note: note_for(&entry.key),
                             datalist: "evdl-effect",
+                            lookup: lookup.clone(),
                             show_delete: true,
                             key_readonly: false,
                             on_key: move |new_key: String| set_effect_key((option_index, row_index, new_key)),

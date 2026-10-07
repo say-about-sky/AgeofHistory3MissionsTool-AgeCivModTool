@@ -90,6 +90,8 @@ pub fn run() {
             commands::workspace::list_workspace_files,
             commands::workspace_watch::start_workspace_watch,
             commands::workspace_watch::stop_workspace_watch,
+            commands::missions_db::load_event_lookup,
+            commands::missions_db::load_event_lookup_scoped,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

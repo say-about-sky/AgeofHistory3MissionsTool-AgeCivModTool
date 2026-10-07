@@ -181,6 +181,12 @@ pub async fn import_apk_sections<R: tauri::Runtime>(
         apk_extract_destination(&work_directory, apk_name.as_deref(), Path::new(&apk_path))?;
     fs::create_dir_all(&destination)
         .map_err(|error| format!("创建导入目录失败 {}：{error}", destination.display()))?;
+    // 记录源 APK 位置：事件编辑器补全在该工作区缺少游戏数据文件时直接从源 APK 读取
+    // （路径或 `content://` URI；打包时该标记文件会被跳过）。
+    let _ = fs::write(
+        destination.join(crate::apk_pack::SOURCE_APK_MARKER),
+        &apk_path,
+    );
     #[cfg(target_os = "android")]
     {
         // 与整体解压一致：写入 .nomedia 避免媒体库逐文件登记。
@@ -666,6 +672,11 @@ mod tests {
         fs::write(workspace.join("META-INF/MANIFEST.MF"), "old-signature").unwrap();
         fs::write(workspace.join("META-INF/CERT.SF"), "old-signature").unwrap();
         fs::write(workspace.join("signing.pem"), "custom-key").unwrap();
+        fs::write(
+            workspace.join(crate::apk_pack::SOURCE_APK_MARKER),
+            "D:\\源包.apk",
+        )
+        .unwrap();
         fs::write(workspace.join("game.txt"), "hello").unwrap();
 
         let (output, entries) = package_workspace(&workspace).unwrap();
@@ -678,6 +689,8 @@ mod tests {
         assert!(names.contains(&"game.txt"));
         assert!(!names.iter().any(|name| name.starts_with("META-INF")));
         assert!(!names.contains(&"signing.pem"));
+        // 「从 apk 中导入」写入的源 APK 标记只服务本地补全，不进入产物。
+        assert!(!names.contains(&crate::apk_pack::SOURCE_APK_MARKER));
 
         let _ = fs::remove_dir_all(&dir);
     }
