@@ -1,20 +1,30 @@
 use dioxus::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
+use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 
 use super::{
-	FocusIcon, FocusTarget, MindMapCanvas, MissionRecord, WorkDirectory,
+	FocusIcon, FocusTarget, MindMapCanvas, MissionRecord, Shared, WorkDirectory,
 	event::{delete_event_text, rename_event_text, save_event_text, EventPanel},
 	files::{ExplorerClipboard, ExplorerCommand, Files, WorkspaceFile},
 	frame::Frame,
+	missions_roots::{
+		default_tree_path, missions_root_label, missions_root_of, missions_subfile, missions_tree_file,
+	},
+	undo::{
+		focus_wants_native_undo, now_ms, pop_applicable, UndoDepths, UndoEntry, UndoRegistration,
+		UndoScope, UndoZone, UNDO_LIMIT, UNDO_MERGE_WINDOW_MS,
+	},
 };
-use crate::app::tauri_bridge::{invoke, open_directory_dialog};
+use crate::app::tauri_bridge::{invoke, listen_apk_progress, listen_workspace_changed, open_dialog};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct MissionFileArgs {
 	work_directory: String,
+	missions_root: String,
 	file_name: String,
 }
 
@@ -22,6 +32,7 @@ struct MissionFileArgs {
 #[serde(rename_all = "camelCase")]
 struct SaveMissionsFileArgs {
 	work_directory: String,
+	missions_root: String,
 	file_name: String,
 	missions: Vec<MissionRecord>,
 }
@@ -30,6 +41,7 @@ struct SaveMissionsFileArgs {
 #[serde(rename_all = "camelCase")]
 struct MissionIconsArgs {
 	work_directory: String,
+	missions_root: String,
 	names: Vec<String>,
 }
 
@@ -53,6 +65,61 @@ struct FolderDialogOptions {
 	title: String,
 }
 
+#[derive(Serialize)]
+struct FileDialogFilter {
+	name: String,
+	extensions: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct FileDialogOptions {
+	directory: bool,
+	multiple: bool,
+	title: String,
+	filters: Vec<FileDialogFilter>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExtractApkArgs {
+	work_directory: String,
+	apk_path: String,
+	/// 系统选择器提供的显示文件名（Android content:// URI 无法解析文件名；桌面端为 None）。
+	apk_name: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PackageApkArgs {
+	work_directory: String,
+	/// 打包源目录（工作区内相对路径，空串表示工作区根）。
+	source_directory: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SignApkArgs {
+	work_directory: String,
+	/// 要签名的 APK（工作区内相对路径）。
+	relative_path: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImportSigningKeyArgs {
+	work_directory: String,
+	/// 所选密钥文件路径（Android 端为 content:// URI）。
+	key_path: String,
+	/// BKS 密钥库密码（PEM 文件为 None）。
+	password: Option<String>,
+}
+
+/// APK 操作命令的返回：仅取用面向用户的提示文本。
+#[derive(Deserialize)]
+struct ApkOperationSummary {
+	message: String,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ScopedFolder {
@@ -66,11 +133,6 @@ struct ScopedEntry {
 	name: String,
 	path: String,
 	is_dir: bool,
-}
-
-#[derive(Deserialize)]
-struct ScopedTextFile {
-	contents: String,
 }
 
 #[derive(Serialize)]
@@ -139,17 +201,13 @@ async fn open_all_files_access_settings() -> Result<bool, String> {
 		.ok_or_else(|| "全盘文件授权结果无效".to_string())
 }
 
-async fn scoped_request<T: Serialize>(command: &str, request: &T) -> Result<JsValue, String> {
-	let request = serde_wasm_bindgen::to_value(request).map_err(|error| error.to_string())?;
-	let args = js_sys::Object::new();
-	js_sys::Reflect::set(&args, &JsValue::from_str("req"), &request)
-		.map_err(|error| format!("准备存储请求失败：{error:?}"))?;
-	JsFuture::from(invoke(
-		&format!("plugin:scoped-storage|{command}"),
-		args.into(),
-	))
-	.await
-	.map_err(|error| format!("访问 Android 工作区失败：{error:?}"))
+/// 调用 Android scoped 命令（参数为 camelCase serde 结构，返回 void）。
+async fn invoke_scoped<T: Serialize>(command: &str, context: &str, args: &T) -> Result<(), String> {
+	let args = serde_wasm_bindgen::to_value(args).map_err(|error| error.to_string())?;
+	JsFuture::from(invoke(command, args))
+		.await
+		.map_err(|error| format!("{context}：{error:?}"))?;
+	Ok(())
 }
 
 
@@ -188,17 +246,17 @@ async fn scoped_read_files_in_dir(
 }
 
 async fn scoped_read_text_file(folder_id: &str, path: String) -> Result<String, String> {
-	let value = scoped_request(
-		"read_text_file",
-		&ScopedFilePath {
-			folder_id: folder_id.to_string(),
-			path,
-		},
-	)
-	.await?;
-	let file: ScopedTextFile = serde_wasm_bindgen::from_value(value)
-		.map_err(|error| format!("读取工作区文本失败：{error}"))?;
-	Ok(file.contents)
+	let args = serde_wasm_bindgen::to_value(&ScopedFilePath {
+		folder_id: folder_id.to_string(),
+		path,
+	})
+	.map_err(|error| error.to_string())?;
+	let value = JsFuture::from(invoke("read_scoped_text_file", args))
+		.await
+		.map_err(|error| format!("读取工作区文本失败：{error:?}"))?;
+	value
+		.as_string()
+		.ok_or_else(|| "工作区文本读取结果无效".to_string())
 }
 
 async fn scoped_write_text_file(
@@ -206,29 +264,29 @@ async fn scoped_write_text_file(
 	path: String,
 	contents: String,
 ) -> Result<(), String> {
-	scoped_request(
-		"write_text_file",
-		&ScopedWriteTextFile {
-			folder_id: folder_id.to_string(),
-			path,
-			contents,
-			recursive: true,
-		},
-	)
-	.await?;
+	let args = serde_wasm_bindgen::to_value(&ScopedWriteTextFile {
+		folder_id: folder_id.to_string(),
+		path,
+		contents,
+		recursive: true,
+	})
+	.map_err(|error| error.to_string())?;
+	JsFuture::from(invoke("write_scoped_text_file", args))
+		.await
+		.map_err(|error| format!("写入工作区文本失败：{error:?}"))?;
 	Ok(())
 }
 
 async fn scoped_mkdir(folder_id: &str, path: String) -> Result<(), String> {
-	scoped_request(
-		"mkdir",
-		&ScopedMkdir {
-			folder_id: folder_id.to_string(),
-			path,
-			recursive: true,
-		},
-	)
-	.await?;
+	let args = serde_wasm_bindgen::to_value(&ScopedMkdir {
+		folder_id: folder_id.to_string(),
+		path,
+		recursive: true,
+	})
+	.map_err(|error| error.to_string())?;
+	JsFuture::from(invoke("mkdir_scoped_dir", args))
+		.await
+		.map_err(|error| format!("创建工作区目录失败：{error:?}"))?;
 	Ok(())
 }
 
@@ -289,8 +347,9 @@ struct ScopedRemoveDir {
 
 async fn copy_item(directory: &WorkDirectory, source: &str, target: &str) -> Result<(), String> {
 	if let Some(folder_id) = &directory.folder_id {
-		scoped_request(
-			"copy",
+		invoke_scoped(
+			"copy_scoped_item",
+			"复制文件失败",
 			&ScopedTransfer {
 				from_folder_id: folder_id.clone(),
 				from_path: join_scoped_path(&directory.root_path, source),
@@ -299,7 +358,6 @@ async fn copy_item(directory: &WorkDirectory, source: &str, target: &str) -> Res
 			},
 		)
 		.await
-		.map(|_| ())
 	} else {
 		let args = serde_wasm_bindgen::to_value(&WorkspaceTransferArgs {
 			work_directory: directory.root_path.clone(),
@@ -316,8 +374,9 @@ async fn copy_item(directory: &WorkDirectory, source: &str, target: &str) -> Res
 
 async fn move_item(directory: &WorkDirectory, source: &str, target: &str) -> Result<(), String> {
 	if let Some(folder_id) = &directory.folder_id {
-		scoped_request(
-			"move",
+		invoke_scoped(
+			"move_scoped_item",
+			"移动文件失败",
 			&ScopedTransfer {
 				from_folder_id: folder_id.clone(),
 				from_path: join_scoped_path(&directory.root_path, source),
@@ -326,7 +385,6 @@ async fn move_item(directory: &WorkDirectory, source: &str, target: &str) -> Res
 			},
 		)
 		.await
-		.map(|_| ())
 	} else {
 		let args = serde_wasm_bindgen::to_value(&WorkspaceTransferArgs {
 			work_directory: directory.root_path.clone(),
@@ -349,8 +407,9 @@ async fn delete_item(
 	if let Some(folder_id) = &directory.folder_id {
 		let path = join_scoped_path(&directory.root_path, target);
 		if is_directory {
-			scoped_request(
-				"remove_dir",
+			invoke_scoped(
+				"remove_scoped_dir",
+				"删除工作区目录失败",
 				&ScopedRemoveDir {
 					folder_id: folder_id.clone(),
 					path,
@@ -358,17 +417,16 @@ async fn delete_item(
 				},
 			)
 			.await
-			.map(|_| ())
 		} else {
-			scoped_request(
-				"remove_file",
+			invoke_scoped(
+				"remove_scoped_file",
+				"删除工作区文件失败",
 				&ScopedRemoveFile {
 					folder_id: folder_id.clone(),
 					path,
 				},
 			)
 			.await
-			.map(|_| ())
 		}
 	} else {
 		let args = serde_wasm_bindgen::to_value(&WorkspacePathArgs {
@@ -383,18 +441,51 @@ async fn delete_item(
 	}
 }
 
-async fn reveal_item(directory: &WorkDirectory, target: &str) -> Result<(), String> {
-	if directory.folder_id.is_some() {
-		return Err("Android 暂不支持打开文件位置".to_string());
-	}
-	let args = serde_wasm_bindgen::to_value(&WorkspacePathArgs {
+/// 「打开文件位置」参数：work_directory 为真实路径模式的工作区根（SAF 模式为空），
+/// tree_uri 为 Android SAF 授权 URI（SAF 模式取 folder_id，真实路径模式取保留的 tree_uri）。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RevealItemArgs {
+	work_directory: String,
+	target: String,
+	tree_uri: Option<String>,
+	is_directory: bool,
+}
+
+/// 解析 SAF 目录下已存在子目录的文档 URI（Android 真实路径模式新建工作区后记录）。
+async fn resolve_scoped_child_uri(folder_id: &str, relative: &str) -> Result<String, String> {
+	let args = serde_wasm_bindgen::to_value(&ScopedChildDirArgs {
+		folder_id: folder_id.to_string(),
+		relative: relative.to_string(),
+	})
+	.map_err(|error| error.to_string())?;
+	let value = JsFuture::from(invoke("resolve_scoped_child_dir_uri", args))
+		.await
+		.map_err(|error| format!("解析目录位置失败：{}", describe_picker_error(&error)))?;
+	value
+		.as_string()
+		.ok_or_else(|| "目录 URI 无效".to_string())
+}
+
+/// 打开文件位置：桌面端在系统文件管理器中选中条目；Android 端弹出「用哪个应用打开」选择器。
+async fn reveal_item(
+	directory: &WorkDirectory,
+	target: &str,
+	is_directory: bool,
+) -> Result<(), String> {
+	let args = serde_wasm_bindgen::to_value(&RevealItemArgs {
 		work_directory: directory.root_path.clone(),
 		target: target.to_string(),
+		tree_uri: directory
+			.folder_id
+			.clone()
+			.or_else(|| directory.tree_uri.clone()),
+		is_directory,
 	})
 	.map_err(|error| error.to_string())?;
 	JsFuture::from(invoke("reveal_workspace_item", args))
 		.await
-		.map_err(|error| format!("打开文件位置失败：{error:?}"))?;
+		.map_err(|error| describe_picker_error(&error))?;
 	Ok(())
 }
 
@@ -442,6 +533,13 @@ struct ScopedFolderIdArgs {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ScopedChildDirArgs {
+	folder_id: String,
+	relative: String,
+}
+
+#[derive(Serialize)]
 struct ReadablePathArgs {
 	path: String,
 }
@@ -461,7 +559,7 @@ async fn resolve_scoped_real_path(folder_id: &str) -> Result<Option<String>, Str
 	Ok(value.as_string().filter(|path| !path.is_empty()))
 }
 
-/// 校验真实路径可读；失败则退回 scoped-storage 通道。
+/// 校验真实路径可读；失败则退回 scoped 通道。
 async fn is_workspace_path_readable(path: &str) -> Result<bool, String> {
 	let args = serde_wasm_bindgen::to_value(&ReadablePathArgs {
 		path: path.to_string(),
@@ -493,6 +591,55 @@ fn is_picker_cancel_error(error: &JsValue) -> bool {
 	})
 }
 
+/// 所选文件：桌面端为真实路径、Android 端为系统选择器返回的 content:// URI，
+/// 并携带显示文件名（用于 .apk/.bks 扩展名判断与解压目录命名）。
+struct PickedImportFile {
+	location: String,
+	name: String,
+}
+
+/// 从路径字符串取文件名（桌面选择器返回值；兼容 / 与 \ 分隔）。
+fn file_name_of_path(path: &str) -> String {
+	path.rsplit(['/', '\\']).next().unwrap_or(path).to_string()
+}
+
+/// Android：调用原生 SAF 文件选择器（与「打开工作区」同一系统组件），
+/// 返回所选的 content:// URI 与显示文件名；用户取消返回 None。
+async fn pick_android_file(mime_types: Vec<String>) -> Result<Option<PickedImportFile>, String> {
+	let args = serde_wasm_bindgen::to_value(&PickAndroidFileArgs { mime_types })
+		.map_err(|error| error.to_string())?;
+	let value = JsFuture::from(invoke("pick_android_file", args))
+		.await
+		.map_err(|error| {
+			format!(
+				"无法打开 Android 文件选择器：{}",
+				describe_picker_error(&error)
+			)
+		})?;
+	if value.is_null() || value.is_undefined() {
+		return Ok(None);
+	}
+	let picked: PickedAndroidFile = serde_wasm_bindgen::from_value(value)
+		.map_err(|error| format!("读取所选文件失败：{error}"))?;
+	Ok(Some(PickedImportFile {
+		location: picked.uri,
+		name: picked.name,
+	}))
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PickAndroidFileArgs {
+	/// 供系统选择器过滤的 MIME 类型（空数组表示不过滤）。
+	mime_types: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct PickedAndroidFile {
+	uri: String,
+	name: String,
+}
+
 /// 把 JS 侧错误转成尽量可读的提示（优先 `message`，避免直接输出对象调试串）。
 fn describe_picker_error(error: &JsValue) -> String {
 	if let Some(message) =
@@ -509,7 +656,7 @@ fn describe_picker_error(error: &JsValue) -> String {
 async fn pick_folder(title: &str) -> Result<Option<WorkDirectory>, String> {
 	if is_android().await? {
 		let value = match JsFuture::from(invoke(
-			"plugin:scoped-storage|pick_folder",
+			"pick_android_folder",
 			js_sys::Object::new().into(),
 		))
 		.await
@@ -535,6 +682,7 @@ async fn pick_folder(title: &str) -> Result<Option<WorkDirectory>, String> {
 					display_path: name,
 					folder_id: None,
 					root_path: real_path,
+					tree_uri: Some(folder.id.clone()),
 				}));
 			}
 		}
@@ -542,6 +690,7 @@ async fn pick_folder(title: &str) -> Result<Option<WorkDirectory>, String> {
 			display_path: name,
 			folder_id: Some(folder.id),
 			root_path: String::new(),
+			tree_uri: None,
 		}));
 	}
 
@@ -551,7 +700,7 @@ async fn pick_folder(title: &str) -> Result<Option<WorkDirectory>, String> {
 		title: title.to_string(),
 	})
 	.map_err(|error| error.to_string())?;
-	let value = match JsFuture::from(open_directory_dialog(options)).await {
+	let value = match JsFuture::from(open_dialog(options)).await {
 		Ok(value) => value,
 		Err(error) if is_picker_cancel_error(&error) => return Ok(None),
 		Err(error) => return Err(format!("无法打开文件管理器：{}", describe_picker_error(&error))),
@@ -560,7 +709,239 @@ async fn pick_folder(title: &str) -> Result<Option<WorkDirectory>, String> {
 		display_path: path.clone(),
 		folder_id: None,
 		root_path: path,
+		tree_uri: None,
 	}))
+}
+
+/// 选择单个 APK 文件；用户取消时返回 None。
+/// 桌面端用系统文件对话框（返回真实路径）；Android 端用原生 SAF 选择器（返回 content:// URI）。
+async fn pick_apk_file(title: &str) -> Result<Option<PickedImportFile>, String> {
+	if is_android().await? {
+		// APK 供方 MIME 不一（部分文件管理器报 octet-stream/zip），宽松过滤 + 后续按显示名校验。
+		return pick_android_file(vec![
+			"application/vnd.android.package-archive".to_string(),
+			"application/octet-stream".to_string(),
+			"application/zip".to_string(),
+		])
+		.await;
+	}
+	let options = serde_wasm_bindgen::to_value(&FileDialogOptions {
+		directory: false,
+		multiple: false,
+		title: title.to_string(),
+		filters: vec![FileDialogFilter {
+			name: "APK 安装包".to_string(),
+			extensions: vec!["apk".to_string()],
+		}],
+	})
+	.map_err(|error| error.to_string())?;
+	let value = match JsFuture::from(open_dialog(options)).await {
+		Ok(value) => value,
+		Err(error) if is_picker_cancel_error(&error) => return Ok(None),
+		Err(error) => {
+			return Err(format!("无法打开文件选择器：{}", describe_picker_error(&error)))
+		}
+	};
+	if value.is_null() || value.is_undefined() {
+		return Ok(None);
+	}
+	let path = value
+		.as_string()
+		.filter(|path| !path.is_empty())
+		.or_else(|| {
+			// 个别平台单选也会返回数组。
+			serde_wasm_bindgen::from_value::<Vec<String>>(value.clone())
+				.ok()
+				.and_then(|paths| paths.into_iter().find(|path| !path.is_empty()))
+		});
+	Ok(path.map(|path| PickedImportFile {
+		name: file_name_of_path(&path),
+		location: path,
+	}))
+}
+
+/// 解析「从 apk 中导入 / 导出到 apk」的目标 APK：
+/// 优先使用资源管理器中高亮选中的 apk（工作区相对路径，真实路径模式下才可用）；
+/// 未正确选中时打开系统文件管理器让用户选择（Android 端为 content:// URI）。
+/// 返回（位置, 显示文件名），用户取消时返回 None。
+async fn resolve_target_apk(
+	work_directory: &WorkDirectory,
+	selected: Option<String>,
+	title: &str,
+) -> Result<Option<(String, Option<String>)>, String> {
+	if let Some(selected) = selected.filter(|path| path.to_ascii_lowercase().ends_with(".apk")) {
+		return Ok(Some((
+			join_scoped_path(&work_directory.root_path, &selected),
+			None,
+		)));
+	}
+	match pick_apk_file(title).await? {
+		Some(apk) => Ok(Some((
+			apk.location,
+			(!apk.name.is_empty()).then_some(apk.name),
+		))),
+		None => Ok(None),
+	}
+}
+
+/// 选择 PEM / BKS 签名密钥文件；用户取消时返回 None。
+/// 桌面端用系统文件对话框；Android 端用原生 SAF 选择器（不按类型过滤）。
+async fn pick_pem_file(title: &str) -> Result<Option<PickedImportFile>, String> {
+	if is_android().await? {
+		return pick_android_file(Vec::new()).await;
+	}
+	let options = serde_wasm_bindgen::to_value(&FileDialogOptions {
+		directory: false,
+		multiple: false,
+		title: title.to_string(),
+		filters: vec![FileDialogFilter {
+			name: "签名密钥".to_string(),
+			extensions: vec![
+				"pem".to_string(),
+				"bks".to_string(),
+				"key".to_string(),
+				"crt".to_string(),
+				"cer".to_string(),
+			],
+		}],
+	})
+	.map_err(|error| error.to_string())?;
+	let value = match JsFuture::from(open_dialog(options)).await {
+		Ok(value) => value,
+		Err(error) if is_picker_cancel_error(&error) => return Ok(None),
+		Err(error) => {
+			return Err(format!("无法打开文件选择器：{}", describe_picker_error(&error)))
+		}
+	};
+	if value.is_null() || value.is_undefined() {
+		return Ok(None);
+	}
+	let path = value
+		.as_string()
+		.filter(|path| !path.is_empty())
+		.or_else(|| {
+			serde_wasm_bindgen::from_value::<Vec<String>>(value.clone())
+				.ok()
+				.and_then(|paths| paths.into_iter().find(|path| !path.is_empty()))
+		});
+	Ok(path.map(|path| PickedImportFile {
+		name: file_name_of_path(&path),
+		location: path,
+	}))
+}
+
+/// 解压 APK 到工作区根目录（apk_name 为系统选择器显示名，用于解压目录命名）。
+async fn extract_apk_into_workspace(
+	work_directory: &str,
+	apk_path: &str,
+	apk_name: Option<&str>,
+) -> Result<String, String> {
+	let args = serde_wasm_bindgen::to_value(&ExtractApkArgs {
+		work_directory: work_directory.to_string(),
+		apk_path: apk_path.to_string(),
+		apk_name: apk_name.map(str::to_string),
+	})
+	.map_err(|error| error.to_string())?;
+	let value = JsFuture::from(invoke("extract_apk_to_workspace", args))
+		.await
+		.map_err(|error| format!("解压 APK 失败：{}", describe_picker_error(&error)))?;
+	let summary: ApkOperationSummary = serde_wasm_bindgen::from_value(value)
+		.map_err(|error| format!("解压结果格式错误：{error}"))?;
+	Ok(summary.message)
+}
+
+/// 「从 apk 中导入」：只把 missions / Earth3-scenarios 版块解压到工作区（保留完整路径）。
+async fn import_apk_sections_into_workspace(
+	work_directory: &str,
+	apk_path: &str,
+	apk_name: Option<&str>,
+) -> Result<String, String> {
+	let args = serde_wasm_bindgen::to_value(&ExtractApkArgs {
+		work_directory: work_directory.to_string(),
+		apk_path: apk_path.to_string(),
+		apk_name: apk_name.map(str::to_string),
+	})
+	.map_err(|error| error.to_string())?;
+	let value = JsFuture::from(invoke("import_apk_sections", args))
+		.await
+		.map_err(|error| format!("导入 APK 失败：{}", describe_picker_error(&error)))?;
+	let summary: ApkOperationSummary = serde_wasm_bindgen::from_value(value)
+		.map_err(|error| format!("导入结果格式错误：{error}"))?;
+	Ok(summary.message)
+}
+
+/// 「导出到 apk」：把工作区版块以更新替换方式写回目标 APK。
+async fn export_apk_sections_to_apk(
+	work_directory: &str,
+	apk_path: &str,
+	apk_name: Option<&str>,
+) -> Result<String, String> {
+	let args = serde_wasm_bindgen::to_value(&ExtractApkArgs {
+		work_directory: work_directory.to_string(),
+		apk_path: apk_path.to_string(),
+		apk_name: apk_name.map(str::to_string),
+	})
+	.map_err(|error| error.to_string())?;
+	let value = JsFuture::from(invoke("export_apk_sections", args))
+		.await
+		.map_err(|error| format!("导出 APK 失败：{}", describe_picker_error(&error)))?;
+	let summary: ApkOperationSummary = serde_wasm_bindgen::from_value(value)
+		.map_err(|error| format!("导出结果格式错误：{error}"))?;
+	Ok(summary.message)
+}
+
+/// 打包工作区内的目录为 APK（产物位于源目录同级，不签名）。
+async fn package_workspace_apk(
+	work_directory: &str,
+	source_directory: &str,
+) -> Result<String, String> {
+	let args = serde_wasm_bindgen::to_value(&PackageApkArgs {
+		work_directory: work_directory.to_string(),
+		source_directory: source_directory.to_string(),
+	})
+	.map_err(|error| error.to_string())?;
+	let value = JsFuture::from(invoke("package_workspace_as_apk", args))
+		.await
+		.map_err(|error| format!("打包 APK 失败：{}", describe_picker_error(&error)))?;
+	let summary: ApkOperationSummary = serde_wasm_bindgen::from_value(value)
+		.map_err(|error| format!("打包结果格式错误：{error}"))?;
+	Ok(summary.message)
+}
+
+/// 对选中的 APK 就地签名（v1+v2+v3）。
+/// `relative_path` 可为工作区内相对路径（资源管理器选中）或桌面端文件选择器返回的绝对路径。
+async fn sign_workspace_apk(work_directory: &str, relative_path: &str) -> Result<String, String> {
+	let args = serde_wasm_bindgen::to_value(&SignApkArgs {
+		work_directory: work_directory.to_string(),
+		relative_path: relative_path.to_string(),
+	})
+	.map_err(|error| error.to_string())?;
+	let value = JsFuture::from(invoke("sign_apk_file", args))
+		.await
+		.map_err(|error| format!("签名 APK 失败：{}", describe_picker_error(&error)))?;
+	let summary: ApkOperationSummary = serde_wasm_bindgen::from_value(value)
+		.map_err(|error| format!("签名结果格式错误：{error}"))?;
+	Ok(summary.message)
+}
+
+/// 把所选 PEM/BKS 密钥导入为工作区默认签名密钥（写入工作区 signing.pem）。
+async fn import_signing_key_to_workspace(
+	work_directory: &str,
+	key_path: &str,
+	password: Option<String>,
+) -> Result<String, String> {
+	let args = serde_wasm_bindgen::to_value(&ImportSigningKeyArgs {
+		work_directory: work_directory.to_string(),
+		key_path: key_path.to_string(),
+		password,
+	})
+	.map_err(|error| error.to_string())?;
+	let value = JsFuture::from(invoke("import_signing_key", args))
+		.await
+		.map_err(|error| format!("添加签名密钥失败：{}", describe_picker_error(&error)))?;
+	let summary: ApkOperationSummary = serde_wasm_bindgen::from_value(value)
+		.map_err(|error| format!("密钥导入结果格式错误：{error}"))?;
+	Ok(summary.message)
 }
 
 async fn load_workspace_files(
@@ -629,12 +1010,11 @@ async fn load_tree_records(
 		}
 		Ok(parsed.missions)
 	} else {
-		let file_name = json_path
-			.strip_prefix("missions/")
-			.unwrap_or(json_path)
-			.to_string();
+		let (missions_root, file_name) = missions_tree_file(json_path)
+			.ok_or_else(|| format!("不是有效的国策树文件：{json_path}"))?;
 		let args = serde_wasm_bindgen::to_value(&MissionFileArgs {
 			work_directory: work_directory.root_path.clone(),
+			missions_root,
 			file_name,
 		})
 		.map_err(|error| error.to_string())?;
@@ -649,6 +1029,7 @@ async fn load_tree_records(
 /// 仅加载该树实际引用到的图标（缺失的图标静默跳过）。
 async fn load_tree_icons(
 	work_directory: &WorkDirectory,
+	json_path: &str,
 	missions: &[MissionRecord],
 	mut progress: Signal<Option<LoadProgress>>,
 ) -> Result<Vec<FocusIcon>, String> {
@@ -666,9 +1047,12 @@ async fn load_tree_icons(
 	names.sort();
 	names.dedup();
 
+	let missions_root = missions_root_of(json_path).unwrap_or_else(|| "missions".to_string());
 	if let Some(folder_id) = &work_directory.folder_id {
-		let icon_directory =
-			join_scoped_path(&work_directory.root_path, "missions/missionsImages/H");
+		let icon_directory = join_scoped_path(
+			&work_directory.root_path,
+			&format!("{missions_root}/missionsImages/H"),
+		);
 		let total_icons = names.len();
 		let mut icons = Vec::with_capacity(total_icons);
 		let mut completed = 0_usize;
@@ -685,6 +1069,7 @@ async fn load_tree_icons(
 	} else {
 		let args = serde_wasm_bindgen::to_value(&MissionIconsArgs {
 			work_directory: work_directory.root_path.clone(),
+			missions_root: missions_root.clone(),
 			names,
 		})
 		.map_err(|error| error.to_string())?;
@@ -716,8 +1101,11 @@ async fn load_single_icon(
 			data_url: icon.data_url,
 		}))
 	} else {
+		let missions_root =
+			missions_root_of(relative_path).unwrap_or_else(|| "missions".to_string());
 		let args = serde_wasm_bindgen::to_value(&MissionIconsArgs {
 			work_directory: work_directory.root_path.clone(),
+			missions_root,
 			names: vec![name.to_string()],
 		})
 		.map_err(|error| error.to_string())?;
@@ -752,12 +1140,12 @@ async fn save_tree_file(
 		)
 		.await
 	} else {
+		let (missions_root, file_name) = missions_tree_file(json_path)
+			.ok_or_else(|| format!("不是有效的国策树文件：{json_path}"))?;
 		let args = serde_wasm_bindgen::to_value(&SaveMissionsFileArgs {
 			work_directory: work_directory.root_path.clone(),
-			file_name: json_path
-				.strip_prefix("missions/")
-				.unwrap_or(json_path)
-				.to_string(),
+			missions_root,
+			file_name,
 			missions: records,
 		})
 		.map_err(|error| error.to_string())?;
@@ -766,6 +1154,45 @@ async fn save_tree_file(
 			.map_err(|error| format!("保存国策配置失败：{error:?}"))?;
 		Ok(())
 	}
+}
+
+/// 标签页显示名：经典资源用文件名，嵌套资源加资源标签前缀避免同名混淆。
+fn tree_tab_title(json_path: &str) -> String {
+	match missions_tree_file(json_path) {
+		Some((root, name)) => {
+			let stem = name.trim_end_matches(".json").to_string();
+			if root == "missions" {
+				stem
+			} else {
+				format!("{}/{}", missions_root_label(&root), stem)
+			}
+		}
+		None => json_path.to_string(),
+	}
+}
+
+/// 字节数格式化为 MB（保留一位小数，进度条字节单位用）。
+fn format_size(bytes: u64) -> String {
+	format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+}
+
+/// 打包候选目录：工作区一级子目录中直接包含 `AndroidManifest.xml` 的目录。
+fn package_candidates(files: &[WorkspaceFile]) -> Vec<String> {
+	let mut directories: Vec<String> = files
+		.iter()
+		.filter(|file| !file.is_directory && file.name == "AndroidManifest.xml")
+		.filter_map(|file| {
+			let parent = file.relative_path.rsplit_once('/')?.0;
+			if parent.contains('/') {
+				None
+			} else {
+				Some(parent.to_string())
+			}
+		})
+		.collect();
+	directories.sort();
+	directories.dedup();
+	directories
 }
 
 #[derive(Serialize)]
@@ -793,15 +1220,61 @@ struct LoadProgress {
 const ICON_READ_CHUNK_SIZE: usize = 8;
 
 /// 一个已打开的国策树标签页：持有该树的配置与引用图标，关闭标签页即释放。
+/// missions / icons 用共享句柄存储：父级重渲染时只做引用计数克隆与指针比较，
+/// 不再深拷贝/深比较整棵数据（大图标库可达数 MB）。
 #[derive(Clone, PartialEq)]
 struct TreeTab {
 	id: String,
 	title: String,
 	json_path: String,
-	missions: Vec<MissionRecord>,
-	icons: Vec<FocusIcon>,
+	missions: Shared<Vec<MissionRecord>>,
+	icons: Shared<Vec<FocusIcon>>,
 	dirty: bool,
 	save_ack: u64,
+}
+
+/// 按分区存放的撤销/重做栈（非响应式容器，避免高频注册触发整树重渲染）。
+#[derive(Default)]
+struct ZoneUndoStacks {
+	canvas_undo: Vec<UndoEntry>,
+	canvas_redo: Vec<UndoEntry>,
+	events_undo: Vec<UndoEntry>,
+	events_redo: Vec<UndoEntry>,
+	explorer_undo: Vec<UndoEntry>,
+	explorer_redo: Vec<UndoEntry>,
+}
+
+impl ZoneUndoStacks {
+	fn undo_mut(&mut self, zone: UndoZone) -> &mut Vec<UndoEntry> {
+		match zone {
+			UndoZone::Canvas => &mut self.canvas_undo,
+			UndoZone::Events => &mut self.events_undo,
+			UndoZone::Explorer => &mut self.explorer_undo,
+		}
+	}
+
+	fn redo_mut(&mut self, zone: UndoZone) -> &mut Vec<UndoEntry> {
+		match zone {
+			UndoZone::Canvas => &mut self.canvas_redo,
+			UndoZone::Events => &mut self.events_redo,
+			UndoZone::Explorer => &mut self.explorer_redo,
+		}
+	}
+
+	fn clear(&mut self) {
+		*self = Self::default();
+	}
+
+	fn depths(&self) -> UndoDepths {
+		UndoDepths {
+			canvas_undo: self.canvas_undo.len(),
+			canvas_redo: self.canvas_redo.len(),
+			events_undo: self.events_undo.len(),
+			events_redo: self.events_redo.len(),
+			explorer_undo: self.explorer_undo.len(),
+			explorer_redo: self.explorer_redo.len(),
+		}
+	}
 }
 
 /// 单个国策树画布：以 key 挂载保持编辑状态，非激活时隐藏而非卸载。
@@ -813,18 +1286,24 @@ fn TreeCanvas(
 	save_status: String,
 	focus_request: Signal<Option<(FocusTarget, u64)>>,
 	pending_icon: Signal<Option<(String, FocusIcon)>>,
-	is_android: bool,
+	on_undo_push: EventHandler<UndoRegistration>,
 	on_save: EventHandler<(String, Vec<MissionRecord>)>,
-	on_edit_event: EventHandler<String>,
-	on_create_event_file: EventHandler<(String, String)>,
-	on_delete_event_file: EventHandler<String>,
-	on_rename_event_file: EventHandler<(String, String)>,
+	on_edit_event: EventHandler<(String, String)>,
+	on_create_event_file: EventHandler<(String, String, String)>,
+	on_delete_event_file: EventHandler<(String, String)>,
+	on_rename_event_file: EventHandler<(String, String, String)>,
 	on_nodes_change: EventHandler<(Vec<String>, Vec<String>)>,
 	on_dirty_change: EventHandler<(String, bool)>,
 ) -> Element {
 	let save_tab_id = tab.id.clone();
 	let dirty_tab_id = tab.id.clone();
 	let canvas_tab_id = tab.id.clone();
+	let tab_missions_root =
+		missions_root_of(&tab.json_path).unwrap_or_else(|| "missions".to_string());
+	let event_root_edit = tab_missions_root.clone();
+	let event_root_create = tab_missions_root.clone();
+	let event_root_delete = tab_missions_root.clone();
+	let event_root_rename = tab_missions_root.clone();
 	let is_active = active_tab_id.read().as_deref() == Some(tab.id.as_str());
 	rsx! {
         div {
@@ -838,12 +1317,20 @@ fn TreeCanvas(
                 on_save: move |records| on_save.call((save_tab_id.clone(), records)),
                 save_request,
                 save_status,
-                on_edit_event,
-                on_create_event_file,
-                on_delete_event_file,
-                on_rename_event_file,
+                on_edit_event: move |file_name: String| {
+                    on_edit_event.call((event_root_edit.clone(), file_name))
+                },
+                on_create_event_file: move |(file_name, contents): (String, String)| {
+                    on_create_event_file.call((event_root_create.clone(), file_name, contents))
+                },
+                on_delete_event_file: move |file_name: String| {
+                    on_delete_event_file.call((event_root_delete.clone(), file_name))
+                },
+                on_rename_event_file: move |(old_name, new_name): (String, String)| {
+                    on_rename_event_file.call((event_root_rename.clone(), old_name, new_name))
+                },
                 focus_request,
-                is_android,
+                on_undo_push,
                 on_nodes_change,
                 on_dirty_change: move |dirty| on_dirty_change.call((dirty_tab_id.clone(), dirty)),
                 pending_icon,
@@ -896,9 +1383,20 @@ pub fn Work() -> Element {
 	let mut event_release_request = use_signal(|| 0_u64);
 	let mut tab_close_prompt = use_signal(|| None::<String>);
 	let loading = use_signal(|| false);
+	// 后端监视线程检测到工作区目录变化（外部修改）时置真，由刷新 effect 消费。
+	let workspace_changed = use_signal(|| false);
 	let load_progress = use_signal(|| None::<LoadProgress>);
+	// APK 操作进度条的文字覆盖（如“512.3 MB / 870.1 MB”），为空时用默认计数。
+	let progress_counter = use_signal(|| None::<String>);
+	// 多个“APK 内容目录”并存时的打包选择对话框选项。
+	let mut pack_choice = use_signal(|| None::<Vec<String>>);
+	// BKS 密钥库密码输入：Some(key_path) 时显示密码对话框。
+	let mut signing_key_prompt = use_signal(|| None::<String>);
+	let mut signing_key_password = use_signal(String::new);
+	let mut signing_key_error = use_signal(String::new);
 	let mut files_open = use_signal(|| true);
 	let mut events_open = use_signal(|| false);
+	let events_root = use_signal(|| None::<String>);
 	let open_event_request = use_signal(|| None::<(String, u64)>);
 	let rename_event_request = use_signal(|| None::<(String, String)>);
 	let mut selected_file = use_signal(|| None::<String>);
@@ -913,11 +1411,215 @@ pub fn Work() -> Element {
 	let mut resizing = use_signal(|| None::<PanelResize>);
 	let load_error = use_signal(String::new);
 	let save_status = use_signal(String::new);
+	// APK 操作（解压/打包并签名）的最近结果提示，显示在底部状态栏。
+	let apk_status = use_signal(String::new);
 	let mut save_request = use_signal(|| 0_u64);
 	let mut directory_name = use_signal(|| "GameCivs".to_string());
 	let android_platform = use_signal(|| false);
 	let all_files_access_granted = use_signal(|| None::<bool>);
 	let permission_error = use_signal(String::new);
+	// 分区撤销/重做：画布、事件编辑、资源管理器各自独立记录操作；
+	// 标题栏按钮与 Ctrl+Z/Y 只作用于“当前焦点所在分区”。
+	// 栈内容放非响应式容器：事件编辑逐键合并时不触发整树重渲染；仅深度用信号驱动按钮状态。
+	let undo_stacks: Rc<RefCell<ZoneUndoStacks>> =
+		use_hook(|| Rc::new(RefCell::new(ZoneUndoStacks::default())));
+	let undo_depths = use_signal(UndoDepths::default);
+	// 当前撤销目标分区：由鼠标/焦点最后落在哪个面板决定（点画布→只撤画布，等等）。
+	let mut active_zone = use_signal(|| UndoZone::Canvas);
+	// 事件面板当前打开的文件（「根/missionsEvents/文件」）：事件分区条目的可用性据此判断。
+	let event_active_scope = use_signal(|| None::<String>);
+
+	// 子组件注册可撤销操作：按 scope 分派到对应分区；连续事件编辑在时间窗内合并为一步。
+	// 注：Rc 非 Copy，每个执行器闭包都先用 clone 捕获自己的句柄。
+	// use_callback 保持稳定身份：Work 重渲染时子组件 props 可整体相等而被记忆化跳过。
+	let on_undo_push = use_callback({
+		let undo_stacks = undo_stacks.clone();
+		move |(scope, undo, redo): UndoRegistration| {
+			let mut undo_depths = undo_depths;
+			let zone = scope.zone();
+			let now = now_ms();
+			let mut depth_changed = true;
+			{
+				let mut stacks = undo_stacks.borrow_mut();
+				// 新操作使该分区的重做栈失效（有内容被清空则需刷新深度）。
+				let redo_stack = stacks.redo_mut(zone);
+				let redo_cleared = !redo_stack.is_empty();
+				redo_stack.clear();
+				let is_event_edit = matches!(&scope, UndoScope::EventFile(_));
+				let undo_stack = stacks.undo_mut(zone);
+				let mergeable = is_event_edit
+					&& undo_stack.last().is_some_and(|last| {
+						last.scope == scope && now - last.timestamp < UNDO_MERGE_WINDOW_MS
+					});
+				if mergeable {
+					if let Some(last) = undo_stack.last_mut() {
+						last.redo = redo;
+						last.timestamp = now;
+					}
+					depth_changed = false;
+				} else {
+					undo_stack.push(UndoEntry {
+						scope,
+						timestamp: now,
+						undo,
+						redo,
+					});
+					if undo_stack.len() > UNDO_LIMIT {
+						undo_stack.remove(0);
+					}
+				}
+				if depth_changed || redo_cleared {
+					// 同值写入不会触发订阅，按钮状态按需更新。
+					let depths = stacks.depths();
+					undo_depths.set(depths);
+				}
+			}
+		}
+	});
+
+	// 撤销 / 重做：只作用于当前焦点分区；跳过当前不可应用的条目（如其它事件文件的操作）。
+	let on_undo = EventHandler::new({
+		let undo_stacks = undo_stacks.clone();
+		move |_: ()| {
+			let mut undo_depths = undo_depths;
+			let mut active_tab_id = active_tab_id;
+			let zone = *active_zone.read();
+			let event_scope = event_active_scope.read().clone();
+			let entry = {
+				let mut stacks = undo_stacks.borrow_mut();
+				pop_applicable(stacks.undo_mut(zone), |entry| match &entry.scope {
+					UndoScope::EventFile(file) => {
+						event_scope.as_deref() == Some(file.as_str())
+					}
+					_ => true,
+				})
+			};
+			let Some(entry) = entry else {
+				return;
+			};
+			// 画布条目：先激活对应标签页再应用，保证用户能看到变化。
+			if let UndoScope::Tab(tab_id) = &entry.scope {
+				active_tab_id.set(Some(tab_id.clone()));
+			}
+			entry.undo.call(());
+			let mut stacks = undo_stacks.borrow_mut();
+			stacks.redo_mut(zone).push(entry);
+			undo_depths.set(stacks.depths());
+		}
+	});
+	let on_redo = EventHandler::new({
+		let undo_stacks = undo_stacks.clone();
+		move |_: ()| {
+			let mut undo_depths = undo_depths;
+			let mut active_tab_id = active_tab_id;
+			let zone = *active_zone.read();
+			let event_scope = event_active_scope.read().clone();
+			let entry = {
+				let mut stacks = undo_stacks.borrow_mut();
+				pop_applicable(stacks.redo_mut(zone), |entry| match &entry.scope {
+					UndoScope::EventFile(file) => {
+						event_scope.as_deref() == Some(file.as_str())
+					}
+					_ => true,
+				})
+			};
+			let Some(entry) = entry else {
+				return;
+			};
+			if let UndoScope::Tab(tab_id) = &entry.scope {
+				active_tab_id.set(Some(tab_id.clone()));
+			}
+			entry.redo.call(());
+			let mut stacks = undo_stacks.borrow_mut();
+			stacks.undo_mut(zone).push(entry);
+			undo_depths.set(stacks.depths());
+		}
+	});
+
+	// 监听 APK 操作进度事件，驱动加载面板的进度条（解压/打包/签名）。
+	use_hook(move || {
+		let mut load_progress = load_progress;
+		let mut progress_counter = progress_counter;
+		listen_apk_progress(move |payload| {
+			let completed = payload.completed.max(0.0) as u64;
+			let total = payload.total.max(0.0) as u64;
+			let counter = if payload.unit == "bytes" {
+				format!("{} / {}", format_size(completed), format_size(total))
+			} else {
+				format!("{completed} / {total} 个文件")
+			};
+			progress_counter.set(Some(counter));
+			load_progress.set(Some(LoadProgress {
+				stage: payload.stage,
+				completed: completed as usize,
+				total: total as usize,
+			}));
+		});
+	});
+
+	// 监听工作区目录变化事件（后端轮询目录签名）：外部修改（如系统文件管理器）后
+	// 自动刷新资源管理器列表。注意：该回调由 JS 事件触发、处于 dioxus 作用域之外，
+	// 只能做不依赖作用域的操作——这里仅置一个信号（与 apk-progress 监听同款做法）；
+	// 在回调里直接 `spawn`/读信号会触发 dioxus 运行时 panic（RefCell already borrowed）。
+	use_hook(move || {
+		let mut workspace_changed = workspace_changed;
+		listen_workspace_changed(move || {
+			workspace_changed.set(true);
+		});
+	});
+
+	// 工作区变化刷新：事件请求且未处于加载中时重载文件列表（在响应式上下文里执行）。
+	// 加载中保留请求直接返回——loading 随后变化会让本 effect 重跑，届时再刷新；
+	// 刷新失败（如目录刚被删除）静默忽略，下一轮轮询会再通知。
+	use_effect(move || {
+		let mut workspace_changed = workspace_changed;
+		if !*workspace_changed.read() {
+			return;
+		}
+		if *loading.read() {
+			return;
+		}
+		let Some(directory) = work_directory.read().clone() else {
+			return;
+		};
+		workspace_changed.set(false);
+		let mut workspace_files = workspace_files;
+		spawn(async move {
+			if let Ok(files) = load_workspace_files(&directory).await {
+				workspace_files.set(files);
+			}
+		});
+	});
+
+	// 工作区监视开关：打开工作区且空闲（真实路径模式）时启动后端轮询；
+	// 加载中/未打开/SAF 模式停止（加载期间的变化由操作自身结束后的刷新覆盖）。
+	use_effect(move || {
+		let directory = work_directory.read().clone();
+		let is_loading = *loading.read();
+		spawn(async move {
+			let watching = matches!(
+				&directory,
+				Some(directory) if !is_loading && directory.folder_id.is_none()
+			);
+			if watching {
+				let root = directory
+					.as_ref()
+					.map(|directory| directory.root_path.clone())
+					.unwrap_or_default();
+				if let Ok(args) = serde_wasm_bindgen::to_value(&WorkDirectoryArgs {
+					work_directory: root,
+				}) {
+					let _ = JsFuture::from(invoke("start_workspace_watch", args)).await;
+				}
+			} else {
+				let _ = JsFuture::from(invoke(
+					"stop_workspace_watch",
+					js_sys::Object::new().into(),
+				))
+				.await;
+			}
+		});
+	});
 
 	use_effect(move || {
 		let mut android_platform = android_platform;
@@ -942,7 +1644,9 @@ pub fn Work() -> Element {
 		});
 	};
 
-	let on_choose_directory = EventHandler::new(move |_: ()| {
+	let on_choose_directory = EventHandler::new({
+		let undo_stacks = undo_stacks.clone();
+		move |_: ()| {
 		let mut work_directory = work_directory;
 		let mut workspace_files = workspace_files;
 		let mut open_tabs = open_tabs;
@@ -954,6 +1658,9 @@ pub fn Work() -> Element {
 		let mut event_release_request = event_release_request;
 		let mut mind_node_names = mind_node_names;
 		let mut mind_node_images = mind_node_images;
+		let mut events_root = events_root;
+		let mut undo_depths = undo_depths;
+		let undo_stacks = undo_stacks.clone();
 		spawn(async move {
 			loading.set(true);
 			load_error.set(String::new());
@@ -974,6 +1681,10 @@ pub fn Work() -> Element {
 							});
 							mind_node_names.set(Vec::new());
 							mind_node_images.set(Vec::new());
+							events_root.set(None);
+							// 切换工作区后旧撤销步骤不再可用。
+							undo_stacks.borrow_mut().clear();
+							undo_depths.set(UndoDepths::default());
 							workspace_files.set(loaded_files);
 							work_directory.set(Some(selected_directory));
 						}
@@ -986,9 +1697,12 @@ pub fn Work() -> Element {
 			loading.set(false);
 			load_progress.set(None);
 		});
+	}
 	});
 
-	let on_create_directory = move |_| {
+	let on_create_directory = EventHandler::new({
+		let undo_stacks = undo_stacks.clone();
+		move |_: ()| {
 		let mut work_directory = work_directory;
 		let mut workspace_files = workspace_files;
 		let mut open_tabs = open_tabs;
@@ -997,9 +1711,12 @@ pub fn Work() -> Element {
 		let mut event_release_request = event_release_request;
 		let mut mind_node_names = mind_node_names;
 		let mut mind_node_images = mind_node_images;
+		let mut events_root = events_root;
 		let mut loading = loading;
 		let mut load_progress = load_progress;
 		let mut load_error = load_error;
+		let mut undo_depths = undo_depths;
+		let undo_stacks = undo_stacks.clone();
 		let directory_name = directory_name.read().trim().to_string();
 		spawn(async move {
 			loading.set(true);
@@ -1058,8 +1775,11 @@ pub fn Work() -> Element {
 						),
 						folder_id: Some(folder_id),
 						root_path,
+						tree_uri: None,
 					}
 				} else {
+					let parent_tree = parent_directory.tree_uri.clone();
+					let child_name = directory_name.clone();
 					let args = serde_wasm_bindgen::to_value(&CreateWorkDirectoryArgs {
 						parent_directory: parent_directory.root_path,
 						directory_name,
@@ -1071,10 +1791,18 @@ pub fn Work() -> Element {
 					let path = value
 						.as_string()
 						.ok_or_else(|| "创建目录命令未返回路径".to_string())?;
+					// Android 真实路径模式：记录新建目录在 SAF 授权树中的文档 URI（「打开文件位置」用）。
+					let tree_uri = match parent_tree {
+						Some(parent_tree) => {
+							resolve_scoped_child_uri(&parent_tree, &child_name).await.ok()
+						}
+						None => None,
+					};
 					WorkDirectory {
 						display_path: path.clone(),
 						folder_id: None,
 						root_path: path,
+						tree_uri,
 					}
 				};
 				Ok(Some(created_directory))
@@ -1093,39 +1821,42 @@ pub fn Work() -> Element {
 							});
 							mind_node_names.set(Vec::new());
 							mind_node_images.set(Vec::new());
+							events_root.set(None);
+							// 切换工作区后旧撤销步骤不再可用。
+							undo_stacks.borrow_mut().clear();
+							undo_depths.set(UndoDepths::default());
+							let default_tree = default_tree_path(
+								loaded_files.iter().map(|file| file.relative_path.as_str()),
+							);
 							workspace_files.set(loaded_files);
 							work_directory.set(Some(created_directory));
-							// 自动打开初始空国策树。
-							load_progress.set(Some(LoadProgress {
-								stage: "正在打开初始国策树...".to_string(),
-								completed: 0,
-								total: 0,
-							}));
-							let starter_directory = work_directory.read().clone();
-							if let Some(starter_directory) = starter_directory {
-								match load_tree_records(
-									&starter_directory,
-									"missions/Missions.json",
-								)
-								.await
-								{
-									Ok(records) => {
-										open_tabs.with_mut(|tabs| {
-											tabs.push(TreeTab {
-												id: "missions/Missions.json".to_string(),
-												title: "Missions".to_string(),
-												json_path: "missions/Missions.json"
-													.to_string(),
-												missions: records,
-												icons: Vec::new(),
-												dirty: false,
-												save_ack: 0,
+							// 自动打开默认国策树（新建工作区为 missions/Missions.json）。
+							if let Some(tree_path) = default_tree {
+								load_progress.set(Some(LoadProgress {
+									stage: "正在打开初始国策树...".to_string(),
+									completed: 0,
+									total: 0,
+								}));
+								let starter_directory = work_directory.read().clone();
+								if let Some(starter_directory) = starter_directory {
+									match load_tree_records(&starter_directory, &tree_path).await {
+										Ok(records) => {
+											let title = tree_tab_title(&tree_path);
+											open_tabs.with_mut(|tabs| {
+												tabs.push(TreeTab {
+													id: tree_path.clone(),
+													title,
+													json_path: tree_path.clone(),
+													missions: Shared::new(records),
+													icons: Shared::new(Vec::new()),
+													dirty: false,
+													save_ack: 0,
+												});
 											});
-										});
-										active_tab_id
-											.set(Some("missions/Missions.json".to_string()));
+											active_tab_id.set(Some(tree_path));
+										}
+										Err(error) => load_error.set(error),
 									}
-									Err(error) => load_error.set(error),
 								}
 							}
 						}
@@ -1138,17 +1869,429 @@ pub fn Work() -> Element {
 			loading.set(false);
 			load_progress.set(None);
 		});
-	};
+	}
+	});
+
+	// 解压 APK 到工作区（Android scoped 模式无法进行，需要真实路径）。
+	let on_extract_apk = EventHandler::new(move |_: ()| {
+		let work_directory = work_directory;
+		let mut workspace_files = workspace_files;
+		let mut loading = loading;
+		let mut load_progress = load_progress;
+		let mut progress_counter = progress_counter;
+		let mut load_error = load_error;
+		let mut apk_status = apk_status;
+		spawn(async move {
+			let Some(directory) = work_directory.read().clone() else {
+				apk_status.set("解压失败：请先打开工作区".to_string());
+				return;
+			};
+			if directory.folder_id.is_some() {
+				apk_status.set(
+					"解压 APK 需要真实路径模式：请在「文件 → 全盘文件访问权限」中授权后重新打开工作区"
+						.to_string(),
+				);
+				return;
+			}
+			match pick_apk_file("选择要解压的 APK").await {
+				Ok(Some(apk)) => {
+					// Android 选择器无法按扩展名强过滤：显示名明确非 .apk 时提示重选。
+					if !apk.name.is_empty() && !apk.name.to_ascii_lowercase().ends_with(".apk") {
+						apk_status.set(format!(
+							"「{}」不是 apk 文件，请重新选择 .apk 安装包",
+							apk.name
+						));
+						return;
+					}
+					loading.set(true);
+					load_error.set(String::new());
+					apk_status.set("正在解压 APK...".to_string());
+					progress_counter.set(None);
+					load_progress.set(Some(LoadProgress {
+						stage: "正在解压 APK 到工作区...".to_string(),
+						completed: 0,
+						total: 0,
+					}));
+					let apk_name = (!apk.name.is_empty()).then_some(apk.name.as_str());
+					match extract_apk_into_workspace(&directory.root_path, &apk.location, apk_name).await {
+						Ok(message) => {
+							apk_status.set(message);
+							// 解压后仅刷新文件列表，不自动打开任何 Missions.json（由用户自行选择）。
+							if let Ok(files) = load_workspace_files(&directory).await {
+								workspace_files.set(files);
+							}
+						}
+						Err(error) => apk_status.set(error),
+					}
+					loading.set(false);
+					load_progress.set(None);
+					progress_counter.set(None);
+				}
+				Ok(None) => {}
+				Err(error) => apk_status.set(error),
+			}
+		});
+	});
+
+	// 「从 apk 中导入」：优先资源管理器高亮的 apk，否则打开文件管理器选择；
+	// 只导入 missions / Earth3-scenarios 版块（目录保留完整路径）。
+	let on_import_apk = EventHandler::new(move |_: ()| {
+		let work_directory = work_directory;
+		let mut workspace_files = workspace_files;
+		let mut loading = loading;
+		let mut load_progress = load_progress;
+		let mut progress_counter = progress_counter;
+		let mut load_error = load_error;
+		let mut apk_status = apk_status;
+		let selected = selected_file.read().clone();
+		spawn(async move {
+			let Some(directory) = work_directory.read().clone() else {
+				apk_status.set("导入失败：请先打开工作区".to_string());
+				return;
+			};
+			if directory.folder_id.is_some() {
+				apk_status.set(
+					"导入 APK 需要真实路径模式：请在「文件 → 全盘文件访问权限」中授权后重新打开工作区"
+						.to_string(),
+				);
+				return;
+			}
+			let (apk_path, apk_name) =
+				match resolve_target_apk(&directory, selected, "选择要导入版块的 APK").await {
+					Ok(Some(target)) => target,
+					Ok(None) => return,
+					Err(error) => {
+						apk_status.set(error);
+						return;
+					}
+				};
+			if let Some(name) = apk_name.as_deref() {
+				if !name.to_ascii_lowercase().ends_with(".apk") {
+					apk_status.set(format!("「{name}」不是 apk 文件，请重新选择 .apk 安装包"));
+					return;
+				}
+			}
+			loading.set(true);
+			load_error.set(String::new());
+			apk_status.set("正在从 APK 导入版块...".to_string());
+			progress_counter.set(None);
+			load_progress.set(Some(LoadProgress {
+				stage: "正在从 APK 导入 missions/scenarios...".to_string(),
+				completed: 0,
+				total: 0,
+			}));
+			match import_apk_sections_into_workspace(
+				&directory.root_path,
+				&apk_path,
+				apk_name.as_deref(),
+			)
+			.await
+			{
+				Ok(message) => {
+					apk_status.set(message);
+					if let Ok(files) = load_workspace_files(&directory).await {
+						workspace_files.set(files);
+					}
+				}
+				Err(error) => apk_status.set(error),
+			}
+			loading.set(false);
+			load_progress.set(None);
+			progress_counter.set(None);
+		});
+	});
+
+	// 「导出到 apk」：优先资源管理器高亮的 apk，否则打开文件管理器选择；
+	// 以更新替换方式把工作区版块写回（APK 中多余条目保留，不清空）。
+	let on_export_apk = EventHandler::new(move |_: ()| {
+		let work_directory = work_directory;
+		let mut workspace_files = workspace_files;
+		let mut loading = loading;
+		let mut load_progress = load_progress;
+		let mut progress_counter = progress_counter;
+		let mut load_error = load_error;
+		let mut apk_status = apk_status;
+		let selected = selected_file.read().clone();
+		spawn(async move {
+			let Some(directory) = work_directory.read().clone() else {
+				apk_status.set("导出失败：请先打开工作区".to_string());
+				return;
+			};
+			let (apk_path, apk_name) =
+				match resolve_target_apk(&directory, selected, "选择要导出到的 APK").await {
+					Ok(Some(target)) => target,
+					Ok(None) => return,
+					Err(error) => {
+						apk_status.set(error);
+						return;
+					}
+				};
+			if let Some(name) = apk_name.as_deref() {
+				if !name.to_ascii_lowercase().ends_with(".apk") {
+					apk_status.set(format!("「{name}」不是 apk 文件，请重新选择 .apk 安装包"));
+					return;
+				}
+			}
+			loading.set(true);
+			load_error.set(String::new());
+			apk_status.set("正在导出到 APK（更新替换）...".to_string());
+			progress_counter.set(None);
+			load_progress.set(Some(LoadProgress {
+				stage: "正在导出到 APK（更新替换）...".to_string(),
+				completed: 0,
+				total: 0,
+			}));
+			match export_apk_sections_to_apk(&directory.root_path, &apk_path, apk_name.as_deref())
+				.await
+			{
+				Ok(message) => {
+					apk_status.set(message);
+					if let Ok(files) = load_workspace_files(&directory).await {
+						workspace_files.set(files);
+					}
+				}
+				Err(error) => apk_status.set(error),
+			}
+			loading.set(false);
+			load_progress.set(None);
+			progress_counter.set(None);
+		});
+	});
+
+	// 实际执行打包并签名（source_directory 为工作区内相对目录，空串表示工作区根）。
+	let run_package_apk = EventHandler::new(move |source_directory: Option<String>| {
+		let work_directory = work_directory;
+		let mut loading = loading;
+		let mut load_progress = load_progress;
+		let mut progress_counter = progress_counter;
+		let mut apk_status = apk_status;
+		spawn(async move {
+			let Some(directory) = work_directory.read().clone() else {
+				apk_status.set("打包失败：请先打开工作区".to_string());
+				return;
+			};
+			if directory.folder_id.is_some() {
+				apk_status.set(
+					"打包 APK 需要真实路径模式：请在「文件 → 全盘文件访问权限」中授权后重新打开工作区"
+						.to_string(),
+				);
+				return;
+			}
+			loading.set(true);
+			apk_status.set("正在打包 APK...".to_string());
+			progress_counter.set(None);
+			load_progress.set(Some(LoadProgress {
+				stage: "正在打包 APK...".to_string(),
+				completed: 0,
+				total: 0,
+			}));
+			let source = source_directory.unwrap_or_default();
+			match package_workspace_apk(&directory.root_path, &source).await {
+				Ok(message) => apk_status.set(message),
+				Err(error) => apk_status.set(error),
+			}
+			loading.set(false);
+			load_progress.set(None);
+			progress_counter.set(None);
+		});
+	});
+
+	// 打包入口：优先选“APK 内容目录”（一级子目录中含 AndroidManifest.xml）；
+	// 仅一个时直接打包，多个时弹窗选择，没有则回退打包工作区根。
+	let on_package_apk = EventHandler::new(move |_: ()| {
+		let mut pack_choice = pack_choice;
+		let candidates = package_candidates(&workspace_files.read());
+		match candidates.len() {
+			0 => run_package_apk.call(None),
+			1 => run_package_apk.call(candidates.into_iter().next()),
+			_ => pack_choice.set(Some(candidates)),
+		}
+	});
+
+	// 实际执行签名（relative_path 为工作区内相对路径，或桌面端选择器返回的绝对路径）。
+	let perform_sign_apk = EventHandler::new(move |relative_path: String| {
+		let work_directory = work_directory;
+		let mut loading = loading;
+		let mut load_progress = load_progress;
+		let mut progress_counter = progress_counter;
+		let mut apk_status = apk_status;
+		spawn(async move {
+			let Some(directory) = work_directory.read().clone() else {
+				apk_status.set("签名失败：请先打开工作区".to_string());
+				return;
+			};
+			if directory.folder_id.is_some() {
+				apk_status.set(
+					"签名 APK 需要真实路径模式：请在「文件 → 全盘文件访问权限」中授权后重新打开工作区"
+						.to_string(),
+				);
+				return;
+			}
+			loading.set(true);
+			apk_status.set(format!("正在签名 {relative_path}（v1+v2+v3）..."));
+			progress_counter.set(None);
+			load_progress.set(Some(LoadProgress {
+				stage: "正在签名 APK...".to_string(),
+				completed: 0,
+				total: 0,
+			}));
+			let result = sign_workspace_apk(&directory.root_path, &relative_path).await;
+			loading.set(false);
+			load_progress.set(None);
+			progress_counter.set(None);
+			match result {
+				Ok(message) => apk_status.set(message),
+				Err(error) => apk_status.set(error),
+			}
+		});
+	});
+
+	// 签名入口（菜单）：资源管理器高亮选中的 apk 优先；未正确选中时打开文件管理器选择。
+	let on_sign_apk = EventHandler::new(move |_: ()| {
+		let work_directory = work_directory;
+		let mut apk_status = apk_status;
+		let selected = selected_file.read().clone();
+		spawn(async move {
+			let Some(directory) = work_directory.read().clone() else {
+				apk_status.set("签名失败：请先打开工作区".to_string());
+				return;
+			};
+			if directory.folder_id.is_some() {
+				apk_status.set(
+					"签名 APK 需要真实路径模式：请在「文件 → 全盘文件访问权限」中授权后重新打开工作区"
+						.to_string(),
+				);
+				return;
+			}
+			if let Some(selected) =
+				selected.filter(|path| path.to_ascii_lowercase().ends_with(".apk"))
+			{
+				perform_sign_apk.call(selected);
+				return;
+			}
+			match pick_apk_file("选择要签名的 APK").await {
+				Ok(Some(apk)) => {
+					// Android 选择器无法按扩展名强过滤：显示名明确非 .apk 时提示重选。
+					if !apk.name.is_empty() && !apk.name.to_ascii_lowercase().ends_with(".apk") {
+						apk_status.set(format!(
+							"「{}」不是 apk 文件，请重新选择 .apk 安装包",
+							apk.name
+						));
+						return;
+					}
+					perform_sign_apk.call(apk.location);
+				}
+				Ok(None) => {}
+				Err(error) => apk_status.set(error),
+			}
+		});
+	});
+
+	// 执行密钥导入（BKS 携带密码）；成功关闭密码框，失败时优先显示在密码框内。
+	let run_import_key = EventHandler::new(move |(key_path, password): (String, Option<String>)| {
+		let work_directory = work_directory;
+		let mut loading = loading;
+		let mut load_progress = load_progress;
+		let mut apk_status = apk_status;
+		let mut signing_key_prompt = signing_key_prompt;
+		let mut signing_key_password = signing_key_password;
+		let mut signing_key_error = signing_key_error;
+		spawn(async move {
+			let Some(directory) = work_directory.read().clone() else {
+				apk_status.set("添加密钥失败：请先打开工作区".to_string());
+				return;
+			};
+			loading.set(true);
+			load_progress.set(Some(LoadProgress {
+				stage: "正在导入签名密钥...".to_string(),
+				completed: 0,
+				total: 0,
+			}));
+			let result =
+				import_signing_key_to_workspace(&directory.root_path, &key_path, password).await;
+			loading.set(false);
+			load_progress.set(None);
+			match result {
+				Ok(message) => {
+					signing_key_prompt.set(None);
+					signing_key_error.set(String::new());
+					apk_status.set(message);
+				}
+				Err(error) => {
+					if signing_key_prompt.read().is_some() {
+						signing_key_error.set(error);
+					} else if error.contains("BKS") {
+						// 未带密码导入 BKS（如 Android 选择器无法按扩展名判断）：自动弹密码框重试。
+						signing_key_password.set(String::new());
+						signing_key_error.set(String::new());
+						signing_key_prompt.set(Some(key_path.clone()));
+					} else {
+						apk_status.set(error);
+					}
+				}
+			}
+		});
+	});
+
+	// 添加默认密钥入口：资源管理器高亮选中的 PEM / BKS 优先；未正确选中时打开文件管理器选择。
+	let on_import_signing_key = EventHandler::new(move |_: ()| {
+		let work_directory = work_directory;
+		let mut apk_status = apk_status;
+		let mut signing_key_prompt = signing_key_prompt;
+		let mut signing_key_password = signing_key_password;
+		let mut signing_key_error = signing_key_error;
+		let selected = selected_file.read().clone();
+		spawn(async move {
+			let Some(directory) = work_directory.read().clone() else {
+				apk_status.set("添加密钥失败：请先打开工作区".to_string());
+				return;
+			};
+			if directory.folder_id.is_some() {
+				apk_status.set(
+					"添加密钥需要真实路径模式：请在「文件 → 全盘文件访问权限」中授权后重新打开工作区"
+						.to_string(),
+				);
+				return;
+			}
+			// 资源管理器已高亮选中密钥文件（.pem/.bks）时直接使用（需要绝对路径）。
+			if let Some(selected) = selected.filter(|path| {
+				let lower = path.to_ascii_lowercase();
+				lower.ends_with(".pem") || lower.ends_with(".bks")
+			}) {
+				let key_path = join_scoped_path(&directory.root_path, &selected);
+				if selected.to_ascii_lowercase().ends_with(".bks") {
+					signing_key_password.set(String::new());
+					signing_key_error.set(String::new());
+					signing_key_prompt.set(Some(key_path));
+				} else {
+					run_import_key.call((key_path, None));
+				}
+				return;
+			}
+			match pick_pem_file("选择签名密钥（PEM / BKS）").await {
+				Ok(Some(key)) => {
+					if key.name.to_ascii_lowercase().ends_with(".bks") {
+						signing_key_password.set(String::new());
+						signing_key_error.set(String::new());
+						signing_key_prompt.set(Some(key.location));
+					} else {
+						run_import_key.call((key.location, None));
+					}
+				}
+				Ok(None) => {}
+				Err(error) => apk_status.set(error),
+			}
+		});
+	});
 
 	// 释放不再被任何标签页引用的事件脚本内存。
 	let release_event_if_unused = EventHandler::new(move |_: ()| {
 		let Some(path) = selected_file.read().clone() else {
 			return;
 		};
-		let name = path
-			.strip_prefix("missions/missionsEvents/")
-			.or_else(|| path.strip_prefix("missionsEvents/"))
-			.unwrap_or(&path);
+		let name = missions_subfile(&path, "missionsEvents")
+			.map(|(_, name)| name)
+			.unwrap_or_else(|| path.clone());
 		let referenced = open_tabs.read().iter().any(|tab| {
 			tab.missions
 				.iter()
@@ -1161,7 +2304,10 @@ pub fn Work() -> Element {
 	});
 
 	// 关闭标签页：从列表移除（对应画布卸载，图标与国策数据随之释放）。
-	let on_close_tab = EventHandler::new(move |tab_id: String| {
+	let on_close_tab = EventHandler::new({
+		let undo_stacks = undo_stacks.clone();
+		move |tab_id: String| {
+		let mut undo_depths = undo_depths;
 		dioxus_logger::tracing::info!("CLOSE-TAB: {tab_id}");
 		// 先快照全部信号值（读守卫随语句结束释放），再统一写入，避免重入借用。
 		let tabs_snapshot: Vec<TreeTab> = open_tabs.read().clone();
@@ -1189,7 +2335,19 @@ pub fn Work() -> Element {
 			mind_node_names.set(Vec::new());
 			mind_node_images.set(Vec::new());
 		}
+		// 丢弃该标签页的画布撤销步骤（画布已卸载，其信号不再有界面）。
+		{
+			let mut stacks = undo_stacks.borrow_mut();
+			stacks
+				.canvas_undo
+				.retain(|entry| entry.scope != UndoScope::Tab(tab_id.clone()));
+			stacks
+				.canvas_redo
+				.retain(|entry| entry.scope != UndoScope::Tab(tab_id.clone()));
+			undo_depths.set(stacks.depths());
+		}
 		release_event_if_unused.call(());
+	}
 	});
 
 	// 点 X 关闭：未保存修改先弹出确认，否则直接关闭。
@@ -1245,24 +2403,20 @@ pub fn Work() -> Element {
 					completed: 0,
 					total: 0,
 				}));
-				let icons = load_tree_icons(&directory, &records, load_progress).await?;
+				let icons = load_tree_icons(&directory, &json_path, &records, load_progress).await?;
 				Ok::<_, String>((records, icons))
 			}
 			.await;
 			match result {
 				Ok((records, icons)) => {
-					let title = json_path
-						.strip_prefix("missions/")
-						.unwrap_or(&json_path)
-						.trim_end_matches(".json")
-						.to_string();
+					let title = tree_tab_title(&json_path);
 					open_tabs.with_mut(|tabs| {
 						tabs.push(TreeTab {
 							id: json_path.clone(),
 							title,
 							json_path: json_path.clone(),
-							missions: records,
-							icons,
+							missions: Shared::new(records),
+							icons: Shared::new(icons),
 							dirty: false,
 							save_ack: 0,
 						});
@@ -1357,58 +2511,60 @@ pub fn Work() -> Element {
 		active_tab_id.set(Some(tab_id));
 	});
 
-	let on_edit_event = move |file_name: String| {
+	let on_edit_event = move |(missions_root, file_name): (String, String)| {
 		let mut events_open = events_open;
+		let mut events_root = events_root;
 		let mut open_event_request = open_event_request;
 		let mut focus_seq = focus_seq;
 		events_open.set(true);
+		events_root.set(Some(missions_root));
 		// 请求携带自增序号：即使重复点击同一脚本也能再次触发打开与重读。
 		let seq = focus_seq.read().wrapping_add(1);
 		focus_seq.set(seq);
 		open_event_request.set(Some((file_name, seq)));
 	};
 
-	let on_create_event_file = move |(file_name, contents): (String, String)| {
-		let Some(directory) = work_directory.read().clone() else {
-			let mut load_error = load_error;
-			load_error.set("创建事件脚本失败：请先打开工作区".to_string());
-			return;
-		};
-		spawn(async move {
-			let mut load_error = load_error;
-			let mut workspace_files = workspace_files;
-			match save_event_text(&directory, &file_name, &contents).await {
-				Ok(()) => {
-					let relative_path = format!("missions/missionsEvents/{file_name}");
-					workspace_files.with_mut(|files| {
-						if !files.iter().any(|file| file.relative_path == relative_path) {
-							files.push(WorkspaceFile {
-								name: file_name.clone(),
-								relative_path,
-								is_directory: false,
-							});
-						}
-					});
-				}
-				Err(error) => load_error.set(format!("创建事件脚本失败：{error}")),
-			}
-		});
-	};
-
-	let on_delete_event_file = move |file_name: String| {
-		let Some(directory) = work_directory.read().clone() else {
-			return;
-		};
-		spawn(async move {
-			let mut load_error = load_error;
-			let mut workspace_files = workspace_files;
-			match delete_event_text(&directory, &file_name).await {
-				Ok(()) => {
-					workspace_files.with_mut(|files| {
-						files.retain(|file| {
-							!(file.name == file_name
-								&& file.relative_path.starts_with("missions/missionsEvents/"))
+	let on_create_event_file =
+		move |(missions_root, file_name, contents): (String, String, String)| {
+			let Some(directory) = work_directory.read().clone() else {
+				let mut load_error = load_error;
+				load_error.set("创建事件脚本失败：请先打开工作区".to_string());
+				return;
+			};
+			spawn(async move {
+				let mut load_error = load_error;
+				let mut workspace_files = workspace_files;
+				match save_event_text(&directory, &missions_root, &file_name, &contents).await {
+					Ok(()) => {
+						let relative_path =
+							format!("{missions_root}/missionsEvents/{file_name}");
+						workspace_files.with_mut(|files| {
+							if !files.iter().any(|file| file.relative_path == relative_path) {
+								files.push(WorkspaceFile {
+									name: file_name.clone(),
+									relative_path,
+									is_directory: false,
+								});
+							}
 						});
+					}
+					Err(error) => load_error.set(format!("创建事件脚本失败：{error}")),
+				}
+			});
+		};
+
+	let on_delete_event_file = move |(missions_root, file_name): (String, String)| {
+		let Some(directory) = work_directory.read().clone() else {
+			return;
+		};
+		spawn(async move {
+			let mut load_error = load_error;
+			let mut workspace_files = workspace_files;
+			match delete_event_text(&directory, &missions_root, &file_name).await {
+				Ok(()) => {
+					let relative_path = format!("{missions_root}/missionsEvents/{file_name}");
+					workspace_files.with_mut(|files| {
+						files.retain(|file| file.relative_path != relative_path);
 					});
 				}
 				Err(error) => load_error.set(format!("删除事件脚本失败：{error}")),
@@ -1416,40 +2572,44 @@ pub fn Work() -> Element {
 		});
 	};
 
-	let on_rename_event_file = move |(old_name, new_name): (String, String)| {
-		if old_name == new_name {
-			return;
-		}
-		let Some(directory) = work_directory.read().clone() else {
-			return;
-		};
-		spawn(async move {
-			let mut load_error = load_error;
-			let mut workspace_files = workspace_files;
-			let mut rename_event_request = rename_event_request;
-			match rename_event_text(&directory, &old_name, &new_name).await {
-				Ok(()) => {
-					workspace_files.with_mut(|files| {
-						let old_relative_path = format!("missions/missionsEvents/{old_name}");
-						for file in files.iter_mut() {
-							if file.relative_path == old_relative_path {
-								file.name = new_name.clone();
-								file.relative_path = format!("missions/missionsEvents/{new_name}");
-							}
-						}
-					});
-					rename_event_request.set(Some((old_name, new_name)));
-				}
-				Err(error) => load_error.set(format!("重命名事件脚本失败：{error}")),
+	let on_rename_event_file =
+		move |(missions_root, old_name, new_name): (String, String, String)| {
+			if old_name == new_name {
+				return;
 			}
-		});
-	};
+			let Some(directory) = work_directory.read().clone() else {
+				return;
+			};
+			spawn(async move {
+				let mut load_error = load_error;
+				let mut workspace_files = workspace_files;
+				let mut rename_event_request = rename_event_request;
+				match rename_event_text(&directory, &missions_root, &old_name, &new_name).await {
+					Ok(()) => {
+						workspace_files.with_mut(|files| {
+							let old_relative_path =
+								format!("{missions_root}/missionsEvents/{old_name}");
+							for file in files.iter_mut() {
+								if file.relative_path == old_relative_path {
+									file.name = new_name.clone();
+									file.relative_path =
+										format!("{missions_root}/missionsEvents/{new_name}");
+								}
+							}
+						});
+						rename_event_request.set(Some((old_name, new_name)));
+					}
+					Err(error) => load_error.set(format!("重命名事件脚本失败：{error}")),
+				}
+			});
+		};
 
 	// 事件面板选中文件变化 → 资源管理器定位并高亮。
-	let on_file_selected = move |path: Option<String>| {
+	// use_callback 保持稳定身份：Work 重渲染时事件面板与资源管理器可记忆化跳过。
+	let on_file_selected = use_callback(move |path: Option<String>| {
 		let mut selected_file = selected_file;
 		selected_file.set(path);
-	};
+	});
 
 	// 思维导图节点变化 → 记录当前使用的标题与图标（删除前占用检查用）。
 	let on_nodes_change = move |(names, images): (Vec<String>, Vec<String>)| {
@@ -1465,23 +2625,25 @@ pub fn Work() -> Element {
 
 	// 资源管理器双击：json → 打开国策树标签页；txt → 打开事件面板并聚焦卡片；
 	// png → 手动载入当前国策树图标库（供创建卡片菜单选用）并聚焦使用该图标的卡片。
-	let on_open_file = move |relative_path: String| {
-		if let Some(name) = relative_path.strip_prefix("missions/") {
-			if name.to_ascii_lowercase().ends_with(".json") && !name.contains('/') {
-				on_open_tree.call(relative_path.clone());
-				return;
-			}
+	// 路径兼容经典工作区与解包 APK 布局（assets/…/missions、assets/…/scenarios/…/missions）。
+	let on_open_file = use_callback(move |relative_path: String| {
+		// 国策树：资源根目录下的直接 .json 子文件。
+		if missions_tree_file(&relative_path).is_some() {
+			on_open_tree.call(relative_path.clone());
+			return;
 		}
-		if let Some(file_name) = relative_path
-			.strip_prefix("missions/missionsEvents/")
-			.or_else(|| relative_path.strip_prefix("missionsEvents/"))
-			.map(|name| name.to_string())
-			.filter(|name| name.to_ascii_lowercase().ends_with(".txt"))
+		// 事件脚本：<资源根>/missionsEvents/*.txt。
+		if let Some((missions_root, file_name)) = missions_subfile(&relative_path, "missionsEvents")
+			.filter(|(_, name)| {
+				!name.contains('/') && name.to_ascii_lowercase().ends_with(".txt")
+			})
 		{
 			let mut events_open = events_open;
+			let mut events_root = events_root;
 			let mut open_event_request = open_event_request;
 			let mut focus_seq = focus_seq;
 			events_open.set(true);
+			events_root.set(Some(missions_root));
 			let seq = focus_seq.read().wrapping_add(1);
 			focus_seq.set(seq);
 			open_event_request.set(Some((file_name.clone(), seq)));
@@ -1491,14 +2653,12 @@ pub fn Work() -> Element {
 			mind_focus_request.set(Some((FocusTarget::Title(title), seq)));
 			return;
 		}
-		if let Some(file_name) = relative_path
-			.strip_prefix("missions/missionsImages/")
-			.or_else(|| relative_path.strip_prefix("missionsImages/"))
-			.map(|name| name.to_string())
-			.filter(|name| name.to_ascii_lowercase().ends_with(".png"))
+		// 图标：<资源根>/missionsImages/…/*.png。
+		if let Some((_, name)) = missions_subfile(&relative_path, "missionsImages")
+			.filter(|(_, name)| name.to_ascii_lowercase().ends_with(".png"))
 		{
 			// 图标在 H/ 子目录下，取末段文件名与卡片 image_name 匹配。
-			let file_name = file_name.rsplit('/').next().unwrap_or(&file_name).to_string();
+			let file_name = name.rsplit('/').next().unwrap_or(&name).to_string();
 			let mut focus_seq = focus_seq;
 			let seq = focus_seq.read().wrapping_add(1);
 			focus_seq.set(seq);
@@ -1533,10 +2693,11 @@ pub fn Work() -> Element {
 				}
 			});
 		}
-	};
+	});
 
 	// 资源管理器右键命令：剪切/复制/粘贴/删除/打开文件位置。
-	let on_explorer_command = move |(command, argument): (ExplorerCommand, String)| {
+	// use_callback 保持稳定身份：Work 重渲染时资源管理器可记忆化跳过。
+	let on_explorer_command = use_callback(move |(command, argument): (ExplorerCommand, String)| {
 		match command {
 			ExplorerCommand::Cut | ExplorerCommand::Copy => {
 				let Some(entry) = workspace_files
@@ -1566,6 +2727,7 @@ pub fn Work() -> Element {
 				let source_path = clipboard.source_path.clone();
 				let source_name = clipboard.source_name.clone();
 				let is_cut = clipboard.is_cut;
+				let is_directory = clipboard.is_directory;
 				spawn(async move {
 					let mut load_error = load_error;
 					let mut workspace_files = workspace_files;
@@ -1610,6 +2772,70 @@ pub fn Work() -> Element {
 									selected_file.set(Some(target_path.clone()));
 								}
 							}
+							// 登记到资源管理器分区的撤销栈：剪切粘贴=移回原处；复制粘贴=删除/重新复制。
+							if target_path != source_path {
+								let undo = EventHandler::new({
+									let directory = directory.clone();
+									let source = source_path.clone();
+									let target = target_path.clone();
+									let mut workspace_files = workspace_files;
+									let mut load_error = load_error;
+									move |_: ()| {
+										let directory = directory.clone();
+										let source = source.clone();
+										let target = target.clone();
+										spawn(async move {
+											let result = if is_cut {
+												move_item(&directory, &target, &source).await
+											} else {
+												delete_item(&directory, &target, is_directory).await
+											};
+											match result {
+												Ok(()) => {
+													if let Ok(files) = reload_file_list(&directory).await {
+														workspace_files.set(files.clone());
+														prune_tabs.call(files);
+													}
+												}
+												Err(error) => {
+													load_error.set(format!("撤销粘贴失败：{error}"))
+												}
+											}
+										});
+									}
+								});
+								let redo = EventHandler::new({
+									let directory = directory.clone();
+									let source = source_path.clone();
+									let target = target_path.clone();
+									let mut workspace_files = workspace_files;
+									let mut load_error = load_error;
+									move |_: ()| {
+										let directory = directory.clone();
+										let source = source.clone();
+										let target = target.clone();
+										spawn(async move {
+											let result = if is_cut {
+												move_item(&directory, &source, &target).await
+											} else {
+												copy_item(&directory, &source, &target).await
+											};
+											match result {
+												Ok(()) => {
+													if let Ok(files) = reload_file_list(&directory).await {
+														workspace_files.set(files.clone());
+														prune_tabs.call(files);
+													}
+												}
+												Err(error) => {
+													load_error.set(format!("重做粘贴失败：{error}"))
+												}
+											}
+										});
+									}
+								});
+								on_undo_push.call((UndoScope::Explorer, undo, redo));
+							}
 							if let Ok(files) = reload_file_list(&directory).await {
 								workspace_files.set(files.clone());
 								prune_tabs.call(files);
@@ -1622,16 +2848,16 @@ pub fn Work() -> Element {
 			ExplorerCommand::Delete => {
 				let name = argument.rsplit('/').next().unwrap_or(&argument).to_string();
 				let stem = name.strip_suffix(".txt").unwrap_or(&name).to_string();
-				let is_events = argument.starts_with("missions/missionsEvents/")
-					|| argument.starts_with("missionsEvents/");
-				let is_image = argument.starts_with("missions/missionsImages/")
-					|| argument.starts_with("missionsImages/");
+				let is_events = missions_subfile(&argument, "missionsEvents").is_some();
+				let is_image = missions_subfile(&argument, "missionsImages").is_some();
 
 				// 占用检查：画布中正在使用的脚本/图标删除前给出警告。
 				let mut warning = String::new();
 				let is_open_tree = argument.to_ascii_lowercase().ends_with(".json")
 					&& open_tabs.read().iter().any(|tab| tab.json_path == argument);
-				if argument == "missions/Missions.json" {
+				let is_canvas_config = missions_tree_file(&argument)
+					.is_some_and(|(_, name)| name == "Missions.json");
+				if is_canvas_config {
 					warning =
 						"Missions.json 是国策树画布配置文件，删除后画布将无法加载。".to_string();
 				} else if is_open_tree {
@@ -1655,16 +2881,51 @@ pub fn Work() -> Element {
 				let Some(directory) = work_directory.read().clone() else {
 					return;
 				};
+				let is_directory = workspace_files
+					.read()
+					.iter()
+					.any(|file| file.relative_path == argument && file.is_directory);
 				spawn(async move {
 					let mut load_error = load_error;
-					if let Err(error) = reveal_item(&directory, &argument).await {
+					if let Err(error) = reveal_item(&directory, &argument, is_directory).await {
 						load_error.set(format!("打开文件位置失败：{error}"));
 					}
 				});
 			}
+			ExplorerCommand::Sign => {
+				perform_sign_apk.call(argument);
+			}
+		}
+	});
+
+	// 标题栏撤销按钮状态：只反映当前焦点分区（事件分区再按“当前打开文件”细化可用性）。
+	let undo_zone = *active_zone.read();
+	let undo_zone_label = undo_zone.label().to_string();
+	let undo_depths_snapshot = *undo_depths.read();
+	let event_scope_snapshot = event_active_scope.read().clone();
+	let (can_undo, can_redo) = match undo_zone {
+		UndoZone::Canvas => (
+			undo_depths_snapshot.canvas_undo > 0,
+			undo_depths_snapshot.canvas_redo > 0,
+		),
+		UndoZone::Explorer => (
+			undo_depths_snapshot.explorer_undo > 0,
+			undo_depths_snapshot.explorer_redo > 0,
+		),
+		UndoZone::Events => {
+			let stacks = undo_stacks.borrow();
+			let applies = |entry: &UndoEntry| match &entry.scope {
+				UndoScope::EventFile(file) => {
+					event_scope_snapshot.as_deref() == Some(file.as_str())
+				}
+				_ => true,
+			};
+			(
+				stacks.events_undo.iter().any(&applies),
+				stacks.events_redo.iter().any(&applies),
+			)
 		}
 	};
-
 	let has_workspace = work_directory.read().is_some();
 	let current_directory = work_directory.read().clone();
 	let workspace_name = current_directory
@@ -1680,7 +2941,7 @@ pub fn Work() -> Element {
 		.unwrap_or("AgeCivModTool")
 		.to_string();
 	let progress_snapshot = load_progress.read().clone();
-	let (loading_stage, loading_percent, loading_counter) = match progress_snapshot {
+	let (loading_stage, loading_percent, default_counter) = match progress_snapshot {
 		Some(progress) if progress.total > 0 => {
 			let percent = (progress.completed as f64 / progress.total as f64 * 100.0)
 				.clamp(0.0, 100.0);
@@ -1693,6 +2954,7 @@ pub fn Work() -> Element {
 		Some(progress) => (progress.stage, None, None),
 		None => ("正在准备...".to_string(), None, None),
 	};
+	let loading_counter = progress_counter.read().clone().or(default_counter);
 	let tab_close_prompt_data = tab_close_prompt.read().clone().map(|tab_id| {
 		let title = open_tabs
 			.read()
@@ -1757,7 +3019,7 @@ pub fn Work() -> Element {
                         "n" => {
                             evt.prevent_default();
                             if !*loading.read() {
-                                on_create_directory(());
+                                on_create_directory.call(());
                             }
                         }
                         "w" => {
@@ -1767,14 +3029,37 @@ pub fn Work() -> Element {
                                 on_close_tab_requested.call(tab_id);
                             }
                         }
+                        "z" => {
+                            // 标记了 data-native-undo 的输入框（搜索框等）交回浏览器原生撤销。
+                            if !focus_wants_native_undo() {
+                                evt.prevent_default();
+                                if modifiers.contains(Modifiers::SHIFT) {
+                                    on_redo.call(());
+                                } else {
+                                    on_undo.call(());
+                                }
+                            }
+                        }
+                        "y" => {
+                            if !focus_wants_native_undo() {
+                                evt.prevent_default();
+                                on_redo.call(());
+                            }
+                        }
                         _ => {}
                     }
                 }
             },
             Frame {
                 on_open: move |_| on_choose_directory.call(()),
-                on_new: move |_| on_create_directory(()),
+                on_new: move |_| on_create_directory.call(()),
                 on_manage_all_files,
+                on_extract_apk,
+                on_import_apk,
+                on_export_apk,
+                on_package_apk,
+                on_sign_apk,
+                on_import_signing_key,
                 on_save: move |_| save_request.with_mut(|request| *request = request.wrapping_add(1)),
                 on_toggle_files: move |_| {
                     let next = !*files_open.read();
@@ -1790,19 +3075,35 @@ pub fn Work() -> Element {
                 is_android: *android_platform.read(),
                 all_files_access_granted: *all_files_access_granted.read(),
                 tabs: open_tabs
-                                                                                                                                                                    .read()
-                                                                                                                                                                    .iter()
-                                                                                                                                                                    .map(|tab| (tab.id.clone(), tab.title.clone()))
-                                                                                                                                                                    .collect(),
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                    .read()
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                    .iter()
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                    .map(|tab| (tab.id.clone(), tab.title.clone()))
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                    .collect(),
                 active_tab_id: active_tab_id.read().clone(),
                 on_select_tab,
                 on_close_tab: on_close_tab_requested,
+                can_undo,
+                can_redo,
+                zone_label: undo_zone_label,
+                on_undo,
+                on_redo,
             }
             div { class: "editor-body",
                 if *files_open.read() {
-                    div { class: "drawer explorer-drawer",
+                    div {
+                        class: "drawer explorer-drawer",
+                        onfocusin: move |_| {
+                            if *active_zone.peek() != UndoZone::Explorer {
+                                active_zone.set(UndoZone::Explorer);
+                            }
+                        },
+                        onpointerdown: move |_| {
+                            if *active_zone.peek() != UndoZone::Explorer {
+                                active_zone.set(UndoZone::Explorer);
+                            }
+                        },
                         Files {
-                            entries: workspace_files.read().clone(),
+                            files: workspace_files,
                             work_directory: current_directory.as_ref().map(|directory| directory.display_path.clone()),
                             width: *explorer_width.read(),
                             selected_path: selected_file,
@@ -1864,7 +3165,18 @@ pub fn Work() -> Element {
                             }
                         }
                     } else if !open_tabs.read().is_empty() {
-                        div { class: "canvas-stage",
+                        div {
+                            class: "canvas-stage",
+                            onfocusin: move |_| {
+                                if *active_zone.peek() != UndoZone::Canvas {
+                                    active_zone.set(UndoZone::Canvas);
+                                }
+                            },
+                            onpointerdown: move |_| {
+                                if *active_zone.peek() != UndoZone::Canvas {
+                                    active_zone.set(UndoZone::Canvas);
+                                }
+                            },
                             for (tab_id , tab) in canvas_tabs {
                                 TreeCanvas {
                                     key: "{tab_id}",
@@ -1874,7 +3186,7 @@ pub fn Work() -> Element {
                                     save_status: save_status.read().clone(),
                                     focus_request: mind_focus_request,
                                     pending_icon,
-                                    is_android: *android_platform.read(),
+                                    on_undo_push,
                                     on_save: on_save_tab,
                                     on_edit_event,
                                     on_create_event_file,
@@ -1891,7 +3203,7 @@ pub fn Work() -> Element {
                             h1 { "国策树工作区" }
                             p {
                                 if work_directory.read().is_some() {
-                                    "在资源管理器中双击 missions 下的 .json 文件打开国策树。"
+                                    "在资源管理器中双击国策资源目录（missions / assets/game/missions / 剧本 missions）下的 .json 文件打开国策树。"
                                 } else {
                                     "从文件菜单打开现有工作区，或创建一个新的工作区。"
                                 }
@@ -1900,6 +3212,7 @@ pub fn Work() -> Element {
                                 span { "新工作区名称" }
                                 input {
                                     value: "{directory_name}",
+                                    "data-native-undo": "true",
                                     oninput: move |event: FormEvent| directory_name.set(event.value()),
                                 }
                             }
@@ -1910,7 +3223,18 @@ pub fn Work() -> Element {
                     }
                 }
                 if *events_open.read() {
-                    div { class: "drawer events-drawer",
+                    div {
+                        class: "drawer events-drawer",
+                        onfocusin: move |_| {
+                            if *active_zone.peek() != UndoZone::Events {
+                                active_zone.set(UndoZone::Events);
+                            }
+                        },
+                        onpointerdown: move |_| {
+                            if *active_zone.peek() != UndoZone::Events {
+                                active_zone.set(UndoZone::Events);
+                            }
+                        },
                         div {
                             class: "resize-handle",
                             role: "separator",
@@ -1939,11 +3263,14 @@ pub fn Work() -> Element {
                         }
                         EventPanel {
                             work_directory: current_directory.clone(),
+                            missions_root: events_root,
                             save_request,
                             open_request: open_event_request,
                             rename_request: rename_event_request,
                             release_request: event_release_request,
                             on_selection_change: on_file_selected,
+                            on_undo_push,
+                            active_scope: event_active_scope,
                             width: *events_width.read(),
                         }
                     }
@@ -1967,6 +3294,14 @@ pub fn Work() -> Element {
                         class: "status-path",
                         title: "{directory.display_path}",
                         "{directory.display_path}"
+                    }
+                }
+                if !apk_status.read().is_empty() {
+                    span {
+                        class: "status-path",
+                        role: "status",
+                        title: "{apk_status.read()}",
+                        "{apk_status.read()}"
                     }
                 }
                 if !permission_error.read().is_empty() {
@@ -2025,6 +3360,109 @@ pub fn Work() -> Element {
                             class: "event-revert",
                             r#type: "button",
                             onclick: move |_| delete_prompt.set(None),
+                            "取消"
+                        }
+                    }
+                }
+            }
+            if let Some(key_path) = signing_key_prompt.read().clone() {
+                div {
+                    class: "menu-dismiss",
+                    style: "z-index: 55;",
+                    aria_hidden: "true",
+                    onclick: move |_| {
+                        signing_key_prompt.set(None);
+                        signing_key_error.set(String::new());
+                    },
+                }
+                div { class: "confirm-dialog", role: "alertdialog",
+                    p { class: "confirm-message", "请输入 BKS 密钥库密码：" }
+                    p {
+                        class: "confirm-message",
+                        style: "font-size: 12px; opacity: 0.75; word-break: break-all;",
+                        "{key_path}"
+                    }
+                    input {
+                        r#type: "password",
+                        value: "{signing_key_password}",
+                        placeholder: "密钥库密码",
+                        "data-native-undo": "true",
+                        style: "width: 100%; box-sizing: border-box; padding: 6px 10px; margin: 8px 0; background: var(--input-bg, #26262e); color: inherit; border: 1px solid #4a4a55; border-radius: 4px;",
+                        oninput: move |evt: FormEvent| signing_key_password.set(evt.value()),
+                        onkeydown: move |evt: Event<KeyboardData>| {
+                            if evt.data().key().to_string() == "Enter" {
+                                evt.prevent_default();
+                                if let Some(key_path) = signing_key_prompt.read().clone() {
+                                    run_import_key
+                                        .call((key_path, Some(signing_key_password.read().clone())));
+                                }
+                            }
+                        },
+                    }
+                    if !signing_key_error.read().is_empty() {
+                        p {
+                            class: "confirm-message",
+                            style: "color: #ff8a8a;",
+                            "{signing_key_error}"
+                        }
+                    }
+                    div { class: "confirm-actions",
+                        button {
+                            class: "event-save",
+                            r#type: "button",
+                            onclick: move |_| {
+                                if let Some(key_path) = signing_key_prompt.read().clone() {
+                                    run_import_key.call((key_path, Some(signing_key_password.read().clone())));
+                                }
+                            },
+                            "确定"
+                        }
+                        button {
+                            class: "event-revert",
+                            r#type: "button",
+                            onclick: move |_| {
+                                signing_key_prompt.set(None);
+                                signing_key_error.set(String::new());
+                            },
+                            "取消"
+                        }
+                    }
+                }
+            }
+            if let Some(directories) = pack_choice.read().clone() {
+                div {
+                    class: "menu-dismiss",
+                    style: "z-index: 55;",
+                    aria_hidden: "true",
+                    onclick: move |_| pack_choice.set(None),
+                }
+                div { class: "confirm-dialog", role: "alertdialog",
+                    p { class: "confirm-message",
+                        "检测到多个 APK 内容目录，请选择要打包的目录："
+                    }
+                    div {
+                        class: "confirm-actions",
+                        style: "flex-wrap: wrap; justify-content: flex-start;",
+                        for directory in directories {
+                            {
+                                let choice = directory.clone();
+                                rsx! {
+                                    button {
+                                        class: "event-save",
+                                        r#type: "button",
+                                        onclick: move |_| {
+                                            pack_choice.set(None);
+                                            run_package_apk.call(Some(choice.clone()));
+                                        },
+                                        "{directory}"
+                                    }
+                                }
+                            }
+                        }
+                        button {
+                            class: "event-revert",
+                            r#type: "button",
+                            onclick: move |_| pack_choice.set(None),
                             "取消"
                         }
                     }

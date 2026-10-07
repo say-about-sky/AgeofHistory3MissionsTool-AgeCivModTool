@@ -6,7 +6,7 @@
   "build": {
     "beforeDevCommand": "dx serve --addr 0.0.0.0 --port 1420 --interactive false",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "dx bundle --release",
+    "beforeBuildCommand": "(if exist dist rmdir /s /q dist) & (if exist target\\dx\\age-civ-mod-tool-ui\\release\\web\\public\\assets rmdir /s /q target\\dx\\age-civ-mod-tool-ui\\release\\web\\public\\assets) & dx bundle --release",
     "frontendDist": "../dist/public"
   },
   "app": {

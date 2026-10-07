@@ -1,3 +1,4 @@
 {
-    "rust-analyzer.checkOnSave": false
+    "rust-analyzer.checkOnSave": false,
+    "java.configuration.updateBuildConfiguration": "interactive"
 }

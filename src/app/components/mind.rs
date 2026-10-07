@@ -1,8 +1,11 @@
 use dioxus::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
+use std::rc::Rc;
 
 use super::event_parser::default_event;
+use super::undo::{UndoRegistration, UndoScope};
 
 const GRID_COLUMN_STEP: f64 = 340.0;
 const GRID_ROW_STEP: f64 = 220.0;
@@ -12,8 +15,6 @@ const CANVAS_WIDTH: f64 = 1200.0;
 const CANVAS_HEIGHT: f64 = 800.0;
 const INITIAL_TREE_COLUMNS: f64 = 12.0;
 const INITIAL_TREE_ROWS: f64 = 12.0;
-/// 撤销历史快照上限。
-const HISTORY_LIMIT: usize = 100;
 
 #[derive(Clone, PartialEq, Deserialize)]
 pub struct FocusIcon {
@@ -73,6 +74,58 @@ pub struct MindNode {
     pub tree_column: u32,
     pub tree_row: u32,
     pub children: Vec<usize>,
+}
+
+/// 共享只读数据句柄：克隆只增加引用计数，相等按指针判断。
+/// 用于标签页数据（missions / icons），避免父级每次重渲染都深拷贝整棵树。
+#[derive(Clone)]
+pub struct Shared<T>(Rc<T>);
+
+impl<T> Shared<T> {
+    pub fn new(value: T) -> Self {
+        Self(Rc::new(value))
+    }
+}
+
+impl<T> std::ops::Deref for Shared<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        self.0.as_ref()
+    }
+}
+
+impl<T> PartialEq for Shared<T> {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+/// 图标数据 URL 的共享句柄：克隆只增加引用计数、相等按指针判断，
+/// 画布平移/缩放帧不再反复深拷贝与深比较较大的 base64 字符串。
+#[derive(Clone)]
+pub struct SharedIconData(Rc<str>);
+
+impl SharedIconData {
+    fn new(data_url: &str) -> Self {
+        Self(Rc::from(data_url))
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Default for SharedIconData {
+    fn default() -> Self {
+        Self(Rc::from(""))
+    }
+}
+
+impl PartialEq for SharedIconData {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
 }
 
 /// 解析卡片实际使用的事件脚本文件名：优先使用 MissionEvent 字段，缺失时回退为「标题.txt」。
@@ -222,11 +275,15 @@ impl MindMapState {
     }
 }
 
-/// 撤销/重做历史：保存 `nodes` 快照。
-#[derive(Clone, PartialEq, Default)]
-struct UndoHistory {
-    undo: Vec<Vec<MindNode>>,
-    redo: Vec<Vec<MindNode>>,
+/// 应用节点快照（供全局撤销/重做执行器调用）。
+fn apply_nodes_snapshot(state: &mut Signal<MindMapState>, nodes: Vec<MindNode>) {
+    state.with_mut(|current| {
+        current.nodes = nodes;
+        current.dragging = None;
+        current.panning_from = None;
+        current.connecting_from = None;
+        current.highlighted = None;
+    });
 }
 
 /// 思维导图聚焦目标：按卡片标题或按图标文件名定位。
@@ -238,8 +295,8 @@ pub enum FocusTarget {
 
 #[component]
 pub fn MindMapCanvas(
-    initial_icons: Vec<FocusIcon>,
-    missions: Vec<MissionRecord>,
+    initial_icons: Shared<Vec<FocusIcon>>,
+    missions: Shared<Vec<MissionRecord>>,
     active_tab_id: Signal<Option<String>>,
     tab_id: String,
     on_save: EventHandler<Vec<MissionRecord>>,
@@ -250,17 +307,32 @@ pub fn MindMapCanvas(
     on_delete_event_file: EventHandler<String>,
     on_rename_event_file: EventHandler<(String, String)>,
     focus_request: Signal<Option<(FocusTarget, u64)>>,
-    is_android: bool,
     on_nodes_change: EventHandler<(Vec<String>, Vec<String>)>,
     on_dirty_change: EventHandler<bool>,
     // 资源管理器双击 .png 手动载入的图标：(目标标签页 id, 图标)。
     pending_icon: Signal<Option<(String, FocusIcon)>>,
     save_ack: u64,
+    // 编辑操作注册到全局撤销栈（由 Work 统一管理栈与快捷键/按钮）。
+    on_undo_push: EventHandler<UndoRegistration>,
 ) -> Element {
     // 每个标签页独立持有本树的图标列表：关闭标签页时随组件一起释放。
-    let icons = use_signal(|| initial_icons);
+    let icons = use_signal(|| (*initial_icons).clone());
+    // 图标数据 URL 的共享句柄表：仅在图标列表变化时重建；
+    // 画布交互帧内每个节点只克隆引用计数（Rc），不再深拷贝 base64 字符串。
+    let icon_sources = use_memo(move || {
+        icons
+            .read()
+            .iter()
+            .map(|icon| SharedIconData::new(&icon.data_url))
+            .collect::<Vec<SharedIconData>>()
+    });
     let tab_id = use_signal(|| tab_id);
-    let mut state = use_signal(|| MindMapState::from_missions(&missions, &icons.read()));
+    let mut state = use_signal(|| {
+        let mission_slice: &[MissionRecord] = &missions;
+        let icon_ref = icons.peek();
+        let icon_slice: &[FocusIcon] = &icon_ref;
+        MindMapState::from_missions(mission_slice, icon_slice)
+    });
     // 与磁盘内容一致的节点快照：脏标记与保存确认都以它为基准。
     let mut initial_nodes = use_signal(|| state.read().nodes.clone());
     let mut context_menu = use_signal(|| None::<(f64, f64, Option<usize>)>);
@@ -272,74 +344,81 @@ pub fn MindMapCanvas(
     let mut new_node_column = use_signal(|| 0_u32);
     let mut new_node_row = use_signal(|| 0_u32);
     let mut last_save_request = use_signal(|| *save_request.read());
-    let history = use_signal(UndoHistory::default);
 
-    // 每次结构变更前记录一次快照（去重 + 上限）。
+    // 待登记的变更前快照：commit_history 只记录「操作前的节点状态」，
+    // 真正的撤销步骤由下面的 effect 在节点确实发生变化后再注册。
+    // 这样第一次修改就能撤销（旧实现用「初始快照」去重，导致第一次修改被跳过），
+    // 且点击卡片（未拖动）等无变化操作不会产生空记录。
+    let mut pending_commit = use_signal(|| None::<Vec<MindNode>>);
+    // 每次结构变更前记录「变更前快照」。
+    // 注：闭包内重绑定为 mut 局部副本，保持闭包整体为 Fn/Copy（可从多个回调中调用）。
     let commit_history = move || {
-        let snapshot = state.read().nodes.clone();
-        let mut history = history;
-        history.with_mut(|history| {
-            if history.undo.last() != Some(&snapshot) {
-                history.undo.push(snapshot);
-                if history.undo.len() > HISTORY_LIMIT {
-                    history.undo.remove(0);
-                }
-            }
-            history.redo.clear();
-        });
+        let mut pending_commit = pending_commit;
+        pending_commit.set(Some(state.read().nodes.clone()));
     };
-
-    // 撤销：当前状态入 redo 栈，恢复上一个快照。
-    let undo = move || {
-        let mut history = history;
-        let mut state = state;
-        history.with_mut(|history| {
-            let Some(previous) = history.undo.pop() else {
-                return;
-            };
-            let current = state.read().nodes.clone();
-            history.redo.push(current);
-            state.with_mut(|current_state| {
-                current_state.nodes = previous;
-                current_state.dragging = None;
-                current_state.panning_from = None;
-                current_state.connecting_from = None;
-                current_state.highlighted = None;
-            });
+    // 节点实际变化时注册一步撤销：无变化不注册。
+    // 撤销/重做应用快照前会清空待登记状态，避免把撤销本身再次登记为新编辑。
+    use_effect(move || {
+        let before = { pending_commit.read().as_ref().cloned() };
+        let Some(before) = before else {
+            return;
+        };
+        if state.read().nodes == before {
+            return;
+        }
+        pending_commit.set(None);
+        // 撤销/重做执行器共享一个槽：撤销时记下「被撤销掉的状态」，重做时恢复它。
+        let slot = Rc::new(RefCell::new(Vec::<MindNode>::new()));
+        let mut state_signal = state;
+        let slot_for_undo = Rc::clone(&slot);
+        let before_for_undo = before;
+        let mut pending_for_undo = pending_commit;
+        let undo = EventHandler::new(move |_: ()| {
+            let current = state_signal.read().nodes.clone();
+            *slot_for_undo.borrow_mut() = current;
+            pending_for_undo.set(None);
+            apply_nodes_snapshot(&mut state_signal, before_for_undo.clone());
         });
-    };
-
-    // 重做：对称操作。
-    let redo = move || {
-        let mut history = history;
-        let mut state = state;
-        history.with_mut(|history| {
-            let Some(next) = history.redo.pop() else {
-                return;
-            };
-            let current = state.read().nodes.clone();
-            history.undo.push(current);
-            state.with_mut(|current_state| {
-                current_state.nodes = next;
-                current_state.dragging = None;
-                current_state.panning_from = None;
-                current_state.connecting_from = None;
-                current_state.highlighted = None;
-            });
+        let slot_for_redo = Rc::clone(&slot);
+        let mut pending_for_redo = pending_commit;
+        let redo = EventHandler::new(move |_: ()| {
+            let target = slot_for_redo.borrow().clone();
+            pending_for_redo.set(None);
+            apply_nodes_snapshot(&mut state_signal, target);
         });
-    };
+        on_undo_push.call((UndoScope::Tab(tab_id.read().clone()), undo, redo));
+    });
 
     // 节点变化时上报（标题列表、图标列表），供资源管理器删除前检查占用。
     // 仅激活中的标签页上报，避免多个挂载中的画布互相覆盖。
-    let mut last_reported_nodes = use_signal(|| None::<(Vec<String>, Vec<String>)>);
+    let last_reported_nodes = use_signal(|| None::<(Vec<String>, Vec<String>)>);
     use_effect(move || {
+        let mut last_reported_nodes = last_reported_nodes;
         let is_active =
             active_tab_id.read().as_deref() == Some(tab_id.read().as_str());
         if !is_active {
-            last_reported_nodes.set(None);
+            if last_reported_nodes.peek().is_some() {
+                last_reported_nodes.set(None);
+            }
             return;
         }
+        // 与上次上报的快照逐项比较（不克隆全量列表）：拖动/平移帧的开销恒定且极小。
         let current = state.read();
+        let reported_matches = last_reported_nodes
+            .read()
+            .as_ref()
+            .is_some_and(|(names, images)| {
+                names.len() == current.nodes.len()
+                    && images.len() == current.nodes.len()
+                    && names.iter().zip(&current.nodes).all(|(name, node)| *name == node.text)
+                    && images
+                        .iter()
+                        .zip(&current.nodes)
+                        .all(|(image, node)| *image == node.image_name)
+            });
+        if reported_matches {
+            return;
+        }
         let names: Vec<String> = current.nodes.iter().map(|node| node.text.clone()).collect();
         let images: Vec<String> = current
             .nodes
@@ -347,9 +426,6 @@ pub fn MindMapCanvas(
             .map(|node| node.image_name.clone())
             .collect();
         let snapshot = (names, images);
-        if *last_reported_nodes.read() == Some(snapshot.clone()) {
-            return;
-        }
         last_reported_nodes.set(Some(snapshot.clone()));
         on_nodes_change.call(snapshot);
     });
@@ -367,7 +443,8 @@ pub fn MindMapCanvas(
     // 节点与基准不一致时向父级上报脏状态（关闭标签页前提示用）。
     let mut last_dirty = use_signal(|| false);
     use_effect(move || {
-        let dirty = state.read().nodes.clone() != initial_nodes.read().clone();
+        // 直接借用比较（不克隆）：拖动/平移帧不再复制两份全部节点。
+        let dirty = state.read().nodes != *initial_nodes.read();
         if dirty == *last_dirty.read() {
             return;
         }
@@ -493,12 +570,44 @@ pub fn MindMapCanvas(
         )
     };
 
+    // 节点拖拽回调：use_callback 保持跨渲染稳定身份，画布重渲染时
+    // NodeView 的 props 可整体比较相等而被记忆化跳过（拖拽只重渲染被拖动的卡片）。
+    let on_node_drag_start = use_callback(
+        move |(node_id, screen_x, screen_y, node_x, node_y): (usize, f64, f64, f64, f64)| {
+            let (world_x, world_y) = screen_to_world(screen_x, screen_y);
+            commit_history();
+            let mut current = state.write();
+            if let Some(source_id) = current.connecting_from {
+                let parent_count = current
+                    .nodes
+                    .iter()
+                    .filter(|node| node.children.contains(&node_id))
+                    .count();
+                if source_id != node_id && parent_count < 2 {
+                    if let Some(source) = current.node_mut(source_id) {
+                        if !source.children.contains(&node_id) {
+                            source.children.push(node_id);
+                        }
+                    }
+                }
+                current.connecting_from = None;
+                current.dragging = None;
+                return;
+            }
+            current.dragging = Some(node_id);
+            current.drag_offset_x = world_x - node_x;
+            current.drag_offset_y = world_y - node_y;
+        },
+    );
+
     let on_pointer_move = move |evt: Event<PointerData>| {
         let position = evt.client_coordinates();
-        let mut current = state.write();
-        if !current.active_pointers.contains_key(&evt.pointer_id()) {
+        // 悬停（指针未按下）直接返回：跳过信号写入，
+        // 避免鼠标/触摸悬停移动就触发整画布重渲染与派生计算。
+        if !state.peek().active_pointers.contains_key(&evt.pointer_id()) {
             return;
         }
+        let mut current = state.write();
         current
             .active_pointers
             .insert(evt.pointer_id(), (position.x, position.y));
@@ -584,7 +693,10 @@ pub fn MindMapCanvas(
         } else if current.dragging.is_none() {
             current.panning_from = Some((position.x, position.y, current.pan_x, current.pan_y));
         }
-        context_menu.set(None);
+        // 菜单未打开时跳过写入，避免每次按下都触发一次多余重渲染。
+        if context_menu.peek().is_some() {
+            context_menu.set(None);
+        }
     };
 
     let on_context_menu = move |evt: Event<MouseData>| {
@@ -602,7 +714,8 @@ pub fn MindMapCanvas(
         context_menu.set(Some((position.x, position.y, None)));
     };
 
-    let on_node_context_menu = move |(node_id, screen_x, screen_y): (usize, f64, f64)| {
+    // 节点右键回调同样用 use_callback 保持稳定身份。
+    let on_node_context_menu = use_callback(move |(node_id, screen_x, screen_y): (usize, f64, f64)| {
         if let Some(node) = state.read().node(node_id) {
             new_node_column.set(node.tree_column);
             new_node_row.set(node.tree_row.saturating_add(1));
@@ -613,7 +726,7 @@ pub fn MindMapCanvas(
         editing_node.set(None);
         confirming_delete.set(None);
         context_menu.set(Some((screen_x, screen_y, Some(node_id))));
-    };
+    });
 
     let on_wheel = move |evt: Event<WheelData>| {
         let position = evt.client_coordinates();
@@ -625,6 +738,8 @@ pub fn MindMapCanvas(
         current.pan_y = (position.y / current.zoom - world_y).min(NODE_HEIGHT / 2.0);
     };
 
+    // 图标句柄表整体借用一次：交互帧内每个节点只克隆引用计数，不再深拷贝 base64 字符串。
+    let icon_sources = icon_sources.read();
     let (pan_x, pan_y, zoom, edges, node_items) = {
         let current = state.read();
         let pan_x = current.pan_x;
@@ -660,7 +775,7 @@ pub fn MindMapCanvas(
             }
         }
         let highlighted_id = current.highlighted;
-        let node_items: Vec<(usize, MindNode, String, bool)> = current
+        let node_items: Vec<(MindNode, bool, SharedIconData)> = current
             .nodes
             .iter()
             .filter_map(|node| {
@@ -670,12 +785,8 @@ pub fn MindMapCanvas(
                     && center_y + NODE_HEIGHT / 2.0 >= min_y
                     && center_y - NODE_HEIGHT / 2.0 <= max_y;
                 is_visible.then(|| {
-                    let icon_source = icons
-                        .read()
-                        .get(node.icon_index)
-                        .map(|icon| icon.data_url.clone())
-                        .unwrap_or_default();
-                    (node.id, node.clone(), icon_source, highlighted_id == Some(node.id))
+                    let icon = icon_sources.get(node.icon_index).cloned().unwrap_or_default();
+                    (node.clone(), highlighted_id == Some(node.id), icon)
                 })
             })
             .collect();
@@ -727,8 +838,7 @@ pub fn MindMapCanvas(
     };
     let menu_vertical_offset = menu_max_height + 16;
     let is_connecting = state.read().connecting_from.is_some();
-    let can_undo = !history.read().undo.is_empty();
-    let can_redo = !history.read().redo.is_empty();
+    // 本组件不再自管撤销历史：所有编辑操作已注册到 Work 的全局撤销栈。
 
     let grid_x = -pan_x - GRID_COLUMN_STEP;
     let grid_y = -pan_y - GRID_ROW_STEP;
@@ -739,27 +849,8 @@ pub fn MindMapCanvas(
         div {
             style: "position: relative; width: 100%; height: 100%; min-width: 0; min-height: 0; overflow: hidden;",
             tabindex: "0",
-            onkeydown: move |evt: Event<KeyboardData>| {
-                let data = evt.data();
-                let key = data.key().to_string();
-                let modifiers = data.modifiers();
-                if modifiers.contains(Modifiers::CONTROL) || modifiers.contains(Modifiers::META)
-                {
-                    match key.to_ascii_lowercase().as_str() {
-                        "z" => {
-                            evt.prevent_default();
-                            evt.stop_propagation();
-                            undo();
-                        }
-                        "y" => {
-                            evt.prevent_default();
-                            evt.stop_propagation();
-                            redo();
-                        }
-                        _ => {}
-                    }
-                }
-            },
+            // Ctrl+Z / Ctrl+Y 由 Work 的全局键盘处理（统一撤销整个编辑器的操作）。
+            // 卡片其它交互（拖动/连线等）不受影响。
             svg {
                 width: "100%",
                 height: "100%",
@@ -800,36 +891,12 @@ pub fn MindMapCanvas(
                         EdgeView { from, to }
                     }
 
-                    for (node_id , node , icon_source , highlighted) in node_items {
+                    for (node , highlighted , icon) in node_items {
                         NodeView {
                             node,
-                            icon_source,
+                            icon,
                             highlighted,
-                            on_drag_start: move |(screen_x, screen_y, node_x, node_y): (f64, f64, f64, f64)| {
-                                let (world_x, world_y) = screen_to_world(screen_x, screen_y);
-                                commit_history();
-                                let mut current = state.write();
-                                if let Some(source_id) = current.connecting_from {
-                                    let parent_count = current
-                                        .nodes
-                                        .iter()
-                                        .filter(|node| node.children.contains(&node_id))
-                                        .count();
-                                    if source_id != node_id && parent_count < 2 {
-                                        if let Some(source) = current.node_mut(source_id) {
-                                            if !source.children.contains(&node_id) {
-                                                source.children.push(node_id);
-                                            }
-                                        }
-                                    }
-                                    current.connecting_from = None;
-                                    current.dragging = None;
-                                    return;
-                                }
-                                current.dragging = Some(node_id);
-                                current.drag_offset_x = world_x - node_x;
-                                current.drag_offset_y = world_y - node_y;
-                            },
+                            on_drag_start: on_node_drag_start,
                             on_context_menu: on_node_context_menu,
                         }
                     }
@@ -857,29 +924,7 @@ pub fn MindMapCanvas(
                 }
             }
 
-            if is_android {
-                div { class: "mind-history-buttons",
-                    button {
-                        r#type: "button",
-                        class: "mind-history-button",
-                        disabled: !can_undo,
-                        title: "上一步",
-                        aria_label: "上一步",
-                        onclick: move |_| undo(),
-                        "↶"
-                    }
-                    button {
-                        r#type: "button",
-                        class: "mind-history-button",
-                        disabled: !can_redo,
-                        title: "下一步",
-                        aria_label: "下一步",
-                        onclick: move |_| redo(),
-                        "↷"
-                    }
-                }
-            }
-
+            // 上一步 / 下一步按钮已迁移到主窗口标题栏（Frame）。
             if let Some((client_x, client_y, target_node)) = menu_position {
                 div {
                     role: "menu",
@@ -1192,9 +1237,9 @@ fn EdgeView(from: (f64, f64), to: (f64, f64)) -> Element {
 #[component]
 fn NodeView(
     node: MindNode,
-    icon_source: String,
+    icon: SharedIconData,
     highlighted: bool,
-    on_drag_start: EventHandler<(f64, f64, f64, f64)>,
+    on_drag_start: EventHandler<(usize, f64, f64, f64, f64)>,
     on_context_menu: EventHandler<(usize, f64, f64)>,
 ) -> Element {
     let (center_x, center_y) = grid_to_world(node.tree_column, node.tree_row);
@@ -1205,16 +1250,17 @@ fn NodeView(
     } else {
         node.text.clone()
     };
+    let node_id = node.id;
 
     let on_pointer_down = move |evt: Event<PointerData>| {
         let client = evt.client_coordinates();
-        on_drag_start.call((client.x, client.y, center_x, center_y));
+        on_drag_start.call((node_id, client.x, client.y, center_x, center_y));
     };
     let on_right_click = move |evt: Event<MouseData>| {
         evt.prevent_default();
         evt.stop_propagation();
         let client = evt.client_coordinates();
-        on_context_menu.call((node.id, client.x, client.y));
+        on_context_menu.call((node_id, client.x, client.y));
     };
 
     rsx! {
@@ -1235,7 +1281,7 @@ fn NodeView(
                 }
             }
             image {
-                href: "{icon_source}",
+                href: "{icon.as_str()}",
                 x: "{x}",
                 y: "{y}",
                 width: "{NODE_WIDTH}",

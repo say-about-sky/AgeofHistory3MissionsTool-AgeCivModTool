@@ -24,13 +24,39 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 base64 = "*"
 rayon = "1"
-tauri = { version = "2", features = [] }
-tauri-plugin-opener = "2"
-tauri-plugin-dialog = "2"
-tauri-plugin-scoped-storage = "1.5.1"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# 解压热路径：openat + 父目录句柄缓存（减少安卓 FUSE 上逐级路径解析的内核往返）
+libc = "*"
+tauri = { version = "*", features = [] }
+tauri-plugin-opener = "*"
+tauri-plugin-dialog = "*"
+# Android 文件系统插件（SAF 文件/目录选择、content:// URI 读写；其他平台为桩实现）。
+#
+# ⚠ 重要约束（曾导致真机全盘不可用，勿踩）：
+# 插件的目录类操作（readDir / createDirAll / resolve* 等）**强制要求 FsUri 同时携带
+# `documentTopTreeUri`**（目录树 URI `…/tree/<treeId>`）。目录选择器返回的是文档 URI
+# （`…/tree/<id>/document/<id>`），跨命令/持久化传递的 `folder_id` 必须经
+# `android_fs_bridge::root_uri` 单点还原为完整 FsUri（勿直接 `FsUri::from_uri`）；
+# 文件 FD 操作（openFile/openFileReadable）不受影响，只需 uri。
+# 缺失该字段时的表现：插件内部空引用；release（build.gradle.kts 的
+# `optimization { enable = true }`）下 R8 会把 Kotlin `!!` 改写为 getClass() 调用，
+# 报错形如 “Attempt to invoke virtual method 'java.lang.Class java.lang.Object.getClass()
+# on a null object reference”（debug 下为无消息 NPE）——再见到此报错先查这条。
+# 回归测试见 `android_fs_bridge.rs` 的 derives_tree_uri_from_document_uri 等 3 个用例。
+tauri-plugin-android-fs = "29"
+serde = { version = "*", features = ["derive"] }
+serde_json = "*"
 json5 = "*"
+# 只用 Stored/Deflated 两种压缩；关闭默认特性避免 Android 编译 lzma/zstd/bzip2 等 C 依赖
+zip = { version = "*", default-features = false, features = ["deflate"] }
+rsa = "0.9"
+sha2 = { version = "*", features = ["oid"] }
+# 解压热路径：zlib-rs 后端（纯 Rust 的 zlib-ng 移植）吞吐显著高于默认 miniz_oxide
+flate2 = { version = "*", features = ["zlib-rs"] }
+crc32fast = "*"
+des = "0.9.0"
+cbc = "0.2.1"
+sha1 = "0.11.0"
+hmac = "0.13.0"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

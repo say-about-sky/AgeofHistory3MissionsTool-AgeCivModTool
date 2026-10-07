@@ -9,7 +9,7 @@ use rayon::prelude::*;
 use serde::Deserialize;
 
 use crate::models::FocusIcon;
-use crate::paths::{missions_directory, validate_work_directory_name};
+use crate::paths::{missions_root_path, validate_work_directory_name};
 
 /// 把单个图标字节编码为 data URL。
 #[tauri::command]
@@ -39,14 +39,18 @@ pub fn encode_mission_icons(icons: Vec<IconPayload>) -> Vec<FocusIcon> {
         .collect()
 }
 
-/// 按名称加载 missionsImages/H 下的指定图标（缺失的图标静默跳过）。
+/// 按名称加载 `<国策资源根>/missionsImages/H` 下的指定图标（缺失的图标静默跳过）。
+/// `missions_root` 为工作区内的国策资源根目录相对路径。
 /// 使用 rayon 并行读取并 base64 编码，多核设备上批量图标载入显著加速。
 #[tauri::command]
 pub fn load_mission_icons(
     work_directory: String,
+    missions_root: String,
     names: Vec<String>,
 ) -> Result<Vec<FocusIcon>, String> {
-    let icon_directory = missions_directory(&work_directory)?.join("missionsImages").join("H");
+    let icon_directory = missions_root_path(&work_directory, &missions_root)?
+        .join("missionsImages")
+        .join("H");
     let icons = names
         .into_par_iter()
         .filter_map(|name| {
@@ -64,10 +68,15 @@ pub fn load_mission_icons(
     Ok(icons)
 }
 
-/// 列出 missionsImages/H 下的全部图标。
+/// 列出 `<国策资源根>/missionsImages/H` 下的全部图标。
 #[tauri::command]
-pub fn list_mission_icons(work_directory: String) -> Result<Vec<FocusIcon>, String> {
-    let icon_directory = missions_directory(&work_directory)?.join("missionsImages").join("H");
+pub fn list_mission_icons(
+    work_directory: String,
+    missions_root: String,
+) -> Result<Vec<FocusIcon>, String> {
+    let icon_directory = missions_root_path(&work_directory, &missions_root)?
+        .join("missionsImages")
+        .join("H");
     let mut paths = fs::read_dir(&icon_directory)
         .map_err(|error| error.to_string())?
         .map(|entry| entry.map(|entry| entry.path()))

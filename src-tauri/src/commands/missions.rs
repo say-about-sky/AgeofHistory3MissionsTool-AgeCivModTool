@@ -7,7 +7,7 @@ use serde::Serialize;
 
 use crate::mission_format::{parse_mission_file_with_correction, serialize_mission_file};
 use crate::models::MissionRecord;
-use crate::paths::{missions_directory, validate_work_directory_name};
+use crate::paths::{missions_directory, missions_root_path, validate_work_directory_name};
 
 /// `parse_missions` 的返回：解析出的国策记录；语法被自动纠正时附带规范化后的完整内容，
 /// 由前端（Android scoped 通道）负责写回原文件。
@@ -72,27 +72,34 @@ pub fn save_missions(work_directory: String, missions: Vec<MissionRecord>) -> Re
         .map_err(|error| error.to_string())
 }
 
-/// 按文件名读取 missions 目录下的单个国策树配置（多国策树工作区）。
+/// 按文件名读取指定国策资源目录（`missions_root`）下的单个国策树配置（多国策树工作区）。
+/// `missions_root` 为工作区相对路径，如 `missions`、`assets/game/missions` 或
+/// `assets/map/<地图>/scenarios/<剧本>/missions`。
 /// 若文件使用宽松语法（缺逗号/裸文本值等），打开时自动纠正为规范格式并写回原文件。
 #[tauri::command]
 pub fn load_missions_file(
     work_directory: String,
+    missions_root: String,
     file_name: String,
 ) -> Result<Vec<MissionRecord>, String> {
     validate_work_directory_name(&file_name)?;
-    let path = missions_directory(&work_directory)?.join(&file_name);
+    let path = missions_root_path(&work_directory, &missions_root)?.join(&file_name);
     read_missions_file_with_autofix(&path)
 }
 
-/// 按文件名保存单个国策树配置到 missions 目录下。
+/// 按文件名保存单个国策树配置到指定的国策资源目录下。
 #[tauri::command]
 pub fn save_missions_file(
     work_directory: String,
+    missions_root: String,
     file_name: String,
     missions: Vec<MissionRecord>,
 ) -> Result<(), String> {
     validate_work_directory_name(&file_name)?;
     let content = serialize_missions(missions)?;
-    fs::write(missions_directory(&work_directory)?.join(&file_name), content)
-        .map_err(|error| error.to_string())
+    fs::write(
+        missions_root_path(&work_directory, &missions_root)?.join(&file_name),
+        content,
+    )
+    .map_err(|error| error.to_string())
 }

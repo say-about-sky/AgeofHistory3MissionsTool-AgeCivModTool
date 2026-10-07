@@ -54,3 +54,53 @@ pub fn missions_directory(work_directory: &str) -> Result<PathBuf, String> {
         ))
     }
 }
+
+/// 把工作区内的国策资源根目录（末段必须是 `missions`，如 `missions`、
+/// `assets/game/missions`、`assets/map/<地图>/scenarios/<剧本>/missions`）
+/// 解析为绝对路径，校验合法且目录存在。
+pub fn missions_root_path(work_directory: &str, missions_root: &str) -> Result<PathBuf, String> {
+    validate_relative_path(missions_root)?;
+    let is_missions_dir = Path::new(missions_root)
+        .file_name()
+        .is_some_and(|name| name == "missions");
+    if !is_missions_dir {
+        return Err(format!("不是有效的国策资源目录：{missions_root}"));
+    }
+    let root = PathBuf::from(work_directory);
+    if !root.is_dir() {
+        return Err(format!("工作目录不存在：{}", root.display()));
+    }
+    let directory = root.join(missions_root);
+    if !directory.is_dir() {
+        return Err(format!(
+            "所选目录下未找到国策资源目录：{}",
+            directory.display()
+        ));
+    }
+    Ok(directory)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missions_root_path_accepts_nested_and_rejects_escapes() {
+        let dir = std::env::temp_dir().join(format!("ageciv-paths-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("assets/game/missions")).unwrap();
+        let work = dir.to_string_lossy().into_owned();
+
+        assert!(missions_root_path(&work, "assets/game/missions").is_ok());
+        // 目录不存在
+        assert!(missions_root_path(&work, "missions").is_err());
+        // 不允许逃逸工作区
+        assert!(missions_root_path(&work, "../outside").is_err());
+        // 末段必须是 missions
+        assert!(missions_root_path(&work, "assets/game").is_err());
+        // 不允许绝对路径
+        assert!(missions_root_path(&work, "C:/absolute").is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

@@ -149,28 +149,51 @@ pub fn delete_workspace_item(work_directory: String, target: String) -> Result<(
     }
 }
 
-/// 在系统文件管理器中定位文件（仅 Windows 支持）。
+/// 打开文件位置：桌面端在系统文件管理器中选中条目（Windows 经 SHOpenFolderAndSelectItems，
+/// 带空格/中文的路径也能正确高亮）；Android 端通过目录树 URI 解析出条目的 content:// URI，
+/// 再弹出「用哪个应用打开」选择器（文件用 VIEW、目录用目录视图）。
+/// `tree_uri` 为 Android 工作目录（或其父目录）的 SAF 授权 URI；桌面端忽略。
 #[tauri::command]
-pub fn reveal_workspace_item(work_directory: String, target: String) -> Result<(), String> {
-    let path = workspace_abs_path(&work_directory, &target)?;
-    if !path.exists() {
-        return Err(format!("目标不存在：{}", path.display()));
-    }
-    #[cfg(target_os = "windows")]
+pub async fn reveal_workspace_item<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    work_directory: String,
+    target: String,
+    tree_uri: Option<String>,
+    is_directory: bool,
+) -> Result<(), String> {
+    #[cfg(not(target_os = "android"))]
     {
-        // explorer 的 /select 参数需要完整引号包裹，经 cmd 转发最可靠，
-        // 否则带空格/中文的路径只会打开资源管理器而不选中文件。
-        let quoted = format!("explorer.exe /select,\"{}\"", path.display());
-        std::process::Command::new("cmd")
-            .arg("/C")
-            .arg(&quoted)
-            .spawn()
-            .map(|_| ())
-            .map_err(|error| format!("打开文件位置失败：{error}"))
+        let _ = (tree_uri, is_directory);
+        let path = workspace_abs_path(&work_directory, &target)?;
+        if !path.exists() {
+            return Err(format!("目标不存在：{}", path.display()));
+        }
+        use tauri_plugin_opener::OpenerExt;
+        app.opener()
+            .reveal_item_in_dir(&path)
+            .map_err(|error| format!("无法定位该条目：{error}"))
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "android")]
     {
-        let _ = path;
-        Err("当前系统暂不支持打开文件位置".to_string())
+        let _ = work_directory;
+        use tauri_plugin_android_fs::AndroidFsExt;
+        let tree = tree_uri
+            .filter(|tree| !tree.is_empty())
+            .ok_or_else(|| "缺少目录访问授权：请通过「打开工作区」重新选择该目录后再试".to_string())?;
+        let api = app.android_fs_async();
+        let dir = crate::android_fs_bridge::root_uri(&tree);
+        let uri = if is_directory {
+            api.resolve_dir_uri(&dir, &target).await
+        } else {
+            api.resolve_file_uri(&dir, &target).await
+        }
+        .map_err(|error| format!("无法定位所选条目（可能已被移动或删除）：{error}"))?;
+        let opener = api.opener();
+        let result = if is_directory {
+            opener.open_dir(&uri).await
+        } else {
+            opener.open_file(&uri).await
+        };
+        result.map_err(|error| format!("系统无法打开该条目：{error}"))
     }
 }

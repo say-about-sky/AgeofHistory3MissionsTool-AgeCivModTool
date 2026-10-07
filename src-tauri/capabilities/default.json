@@ -6,7 +6,6 @@
   "permissions": [
     "core:default",
     "opener:default",
-    "dialog:allow-open",
-    "scoped-storage:default"
+    "dialog:allow-open"
   ]
 }

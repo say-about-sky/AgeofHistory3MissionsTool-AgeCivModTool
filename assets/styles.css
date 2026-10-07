@@ -153,10 +153,13 @@ body {
   box-shadow: 0 2px 7px var(--shadow);
 }
 
+/* 标题行内容整体靠下对齐（而非垂直居中）：适配 Android edge-to-edge 下
+   系统状态栏遮挡窗口顶部的场景，让文字/按钮尽量露出。
+   注：下方菜单行（文件/资源管理器/国策事件）保持居中显示。 */
 .editor-titlebar {
   display: flex;
   height: 39px;
-  align-items: center;
+  align-items: flex-end;
   gap: 10px;
   padding: 0 14px;
   border-bottom: 1px solid #f3d5e0;
@@ -184,6 +187,39 @@ body {
 .app-title {
   font-size: 13px;
   font-weight: 650;
+}
+
+/* 标题栏全局撤销/重做（国策画布 + 事件编辑等整个编辑器的操作）。 */
+.titlebar-history {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 6px;
+}
+
+.titlebar-history-button {
+  display: grid;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  place-items: center;
+  border: 1px solid #e3b7c7;
+  border-radius: 6px;
+  box-shadow: none;
+  color: #7d5567;
+  background: #fff8fb;
+  font-size: 14px;
+  line-height: 1;
+}
+
+.titlebar-history-button:hover:not(:disabled) {
+  color: #5d3c4b;
+  background: #ffe9f2;
+}
+
+.titlebar-history-button:disabled {
+  opacity: 0.45;
+  cursor: default;
 }
 
 .title-divider {
@@ -303,6 +339,31 @@ body {
   margin-left: auto;
   color: var(--muted);
   font-size: 10px;
+}
+
+.menu-separator {
+  height: 1px;
+  margin: 4px 6px;
+  background: var(--line);
+}
+
+.menu-caret {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.menu-submenu {
+  display: flex;
+  flex-direction: column;
+  margin: 2px 0 2px 10px;
+  padding-left: 8px;
+  border-left: 2px solid var(--surface-blue);
+}
+
+.menu-submenu .menu-item {
+  min-height: 30px;
+  font-size: 12px;
 }
 
 .context-menu {
@@ -667,6 +728,16 @@ body {
 .file-list {
   overflow: auto;
   padding: 5px 0;
+  /* 虚拟滚动关键：禁用浏览器滚动锚定。
+     窗口行与占位块频繁增删时，锚定机制会"自作主张"修正 scrollTop，
+     造成滚动速度失控 / 滚动过多 / 停止后仍在滚动的正反馈现象。 */
+  overflow-anchor: none;
+  /* 滚到列表尽头时不把滚动链传给外层容器/页面。 */
+  overscroll-behavior: contain;
+}
+
+.file-list>* {
+  overflow-anchor: none;
 }
 
 .file-row {
@@ -675,7 +746,7 @@ body {
   max-width: 100%;
   box-sizing: border-box;
   min-width: 0;
-  min-height: 27px;
+  height: 27px;
   align-items: center;
   gap: 6px;
   padding: 2px 8px 2px calc(8px + var(--depth) * 14px);

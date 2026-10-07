@@ -1,8 +1,8 @@
 use dioxus::prelude::*;
 use serde::Serialize;
-use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 
+use super::undo::{UndoRegistration, UndoScope};
 use super::{event_grid::EventGrid, event_parser::{diagnostics, MissionEvent}, WorkDirectory};
 use crate::app::tauri_bridge::invoke;
 
@@ -27,6 +27,7 @@ struct ScopedWriteTextInDir {
 #[serde(rename_all = "camelCase")]
 struct EventFileArgs {
 	work_directory: String,
+	missions_root: String,
 	file_name: String,
 }
 
@@ -34,6 +35,7 @@ struct EventFileArgs {
 #[serde(rename_all = "camelCase")]
 struct EventFileWriteArgs {
 	work_directory: String,
+	missions_root: String,
 	file_name: String,
 	contents: String,
 }
@@ -47,9 +49,10 @@ struct ScopedRemoveFile {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ScopedRename {
-	folder_id: String,
+struct ScopedMove {
+	from_folder_id: String,
 	from_path: String,
+	to_folder_id: String,
 	to_path: String,
 }
 
@@ -57,44 +60,36 @@ struct ScopedRename {
 #[serde(rename_all = "camelCase")]
 struct EventRenameArgs {
 	work_directory: String,
+	missions_root: String,
 	old_file_name: String,
 	new_file_name: String,
 }
 
-async fn scoped_request<T: Serialize>(command: &str, request: &T) -> Result<JsValue, String> {
-	let request = serde_wasm_bindgen::to_value(request).map_err(|error| error.to_string())?;
-	let args = js_sys::Object::new();
-	js_sys::Reflect::set(&args, &JsValue::from_str("req"), &request)
-		.map_err(|error| format!("准备事件文件请求失败：{error:?}"))?;
-	JsFuture::from(invoke(
-		&format!("plugin:scoped-storage|{command}"),
-		args.into(),
-	))
-	.await
-	.map_err(|error| format!("访问 Android 事件文件失败：{error:?}"))
-}
-
-fn event_file_path(root_path: &str, file_name: &str) -> String {
+fn event_file_path(root_path: &str, missions_root: &str, file_name: &str) -> String {
 	if root_path.is_empty() {
-		format!("missions/missionsEvents/{file_name}")
+		format!("{missions_root}/missionsEvents/{file_name}")
 	} else {
-		format!("{root_path}/missions/missionsEvents/{file_name}")
+		format!("{root_path}/{missions_root}/missionsEvents/{file_name}")
 	}
 }
 
-fn event_dir_path(root_path: &str) -> String {
+fn event_dir_path(root_path: &str, missions_root: &str) -> String {
 	if root_path.is_empty() {
-		"missions/missionsEvents".to_string()
+		format!("{missions_root}/missionsEvents")
 	} else {
-		format!("{root_path}/missions/missionsEvents")
+		format!("{root_path}/{missions_root}/missionsEvents")
 	}
 }
 
-async fn load_event_text(directory: &WorkDirectory, file_name: &str) -> Result<String, String> {
+async fn load_event_text(
+	directory: &WorkDirectory,
+	missions_root: &str,
+	file_name: &str,
+) -> Result<String, String> {
 	if let Some(folder_id) = &directory.folder_id {
 		let args = serde_wasm_bindgen::to_value(&ScopedReadTextInDir {
 			folder_id: folder_id.clone(),
-			dir_path: event_dir_path(&directory.root_path),
+			dir_path: event_dir_path(&directory.root_path, missions_root),
 			file_name: file_name.to_string(),
 		})
 		.map_err(|error| error.to_string())?;
@@ -107,6 +102,7 @@ async fn load_event_text(directory: &WorkDirectory, file_name: &str) -> Result<S
 	} else {
 		let args = serde_wasm_bindgen::to_value(&EventFileArgs {
 			work_directory: directory.root_path.clone(),
+			missions_root: missions_root.to_string(),
 			file_name: file_name.to_string(),
 		})
 		.map_err(|error| error.to_string())?;
@@ -121,13 +117,14 @@ async fn load_event_text(directory: &WorkDirectory, file_name: &str) -> Result<S
 
 pub(crate) async fn save_event_text(
 	directory: &WorkDirectory,
+	missions_root: &str,
 	file_name: &str,
 	contents: &str,
 ) -> Result<(), String> {
 	if let Some(folder_id) = &directory.folder_id {
 		let args = serde_wasm_bindgen::to_value(&ScopedWriteTextInDir {
 			folder_id: folder_id.clone(),
-			dir_path: event_dir_path(&directory.root_path),
+			dir_path: event_dir_path(&directory.root_path, missions_root),
 			file_name: file_name.to_string(),
 			contents: contents.to_string(),
 		})
@@ -139,6 +136,7 @@ pub(crate) async fn save_event_text(
 	} else {
 		let args = serde_wasm_bindgen::to_value(&EventFileWriteArgs {
 			work_directory: directory.root_path.clone(),
+			missions_root: missions_root.to_string(),
 			file_name: file_name.to_string(),
 			contents: contents.to_string(),
 		})
@@ -152,22 +150,24 @@ pub(crate) async fn save_event_text(
 
 pub(crate) async fn delete_event_text(
 	directory: &WorkDirectory,
+	missions_root: &str,
 	file_name: &str,
 ) -> Result<(), String> {
 	if let Some(folder_id) = &directory.folder_id {
-		let path = event_file_path(&directory.root_path, file_name);
-		scoped_request(
-			"remove_file",
-			&ScopedRemoveFile {
-				folder_id: folder_id.clone(),
-				path,
-			},
-		)
-		.await?;
+		let path = event_file_path(&directory.root_path, missions_root, file_name);
+		let args = serde_wasm_bindgen::to_value(&ScopedRemoveFile {
+			folder_id: folder_id.clone(),
+			path,
+		})
+		.map_err(|error| error.to_string())?;
+		JsFuture::from(invoke("remove_scoped_file", args))
+			.await
+			.map_err(|error| format!("删除事件文件失败：{error:?}"))?;
 		Ok(())
 	} else {
 		let args = serde_wasm_bindgen::to_value(&EventFileArgs {
 			work_directory: directory.root_path.clone(),
+			missions_root: missions_root.to_string(),
 			file_name: file_name.to_string(),
 		})
 		.map_err(|error| error.to_string())?;
@@ -180,25 +180,28 @@ pub(crate) async fn delete_event_text(
 
 pub(crate) async fn rename_event_text(
 	directory: &WorkDirectory,
+	missions_root: &str,
 	old_file_name: &str,
 	new_file_name: &str,
 ) -> Result<(), String> {
 	if let Some(folder_id) = &directory.folder_id {
-		let from_path = event_file_path(&directory.root_path, old_file_name);
-		let to_path = event_file_path(&directory.root_path, new_file_name);
-		scoped_request(
-			"rename",
-			&ScopedRename {
-				folder_id: folder_id.clone(),
-				from_path,
-				to_path,
-			},
-		)
-		.await?;
+		let from_path = event_file_path(&directory.root_path, missions_root, old_file_name);
+		let to_path = event_file_path(&directory.root_path, missions_root, new_file_name);
+		let args = serde_wasm_bindgen::to_value(&ScopedMove {
+			from_folder_id: folder_id.clone(),
+			from_path,
+			to_folder_id: folder_id.clone(),
+			to_path,
+		})
+		.map_err(|error| error.to_string())?;
+		JsFuture::from(invoke("move_scoped_item", args))
+			.await
+			.map_err(|error| format!("重命名事件文件失败：{error:?}"))?;
 		Ok(())
 	} else {
 		let args = serde_wasm_bindgen::to_value(&EventRenameArgs {
 			work_directory: directory.root_path.clone(),
+			missions_root: missions_root.to_string(),
 			old_file_name: old_file_name.to_string(),
 			new_file_name: new_file_name.to_string(),
 		})
@@ -214,12 +217,17 @@ pub(crate) async fn rename_event_text(
 #[component]
 pub fn EventPanel(
 	work_directory: Option<WorkDirectory>,
+	missions_root: Signal<Option<String>>,
 	save_request: Signal<u64>,
 	open_request: Signal<Option<(String, u64)>>,
 	rename_request: Signal<Option<(String, String)>>,
 	release_request: Signal<u64>,
 	on_selection_change: EventHandler<Option<String>>,
 	width: f64,
+	/// 编辑操作注册到分区撤销栈（由 Work 统一管理）。
+	on_undo_push: EventHandler<UndoRegistration>,
+	/// 事件面板当前打开文件的标识（「根/missionsEvents/文件」）：供 Work 判断事件分区的撤销可用性。
+	active_scope: Signal<Option<String>>,
 ) -> Element {
 	let mut selected = use_signal(|| None::<String>);
 	let mut event = use_signal(|| None::<MissionEvent>);
@@ -227,6 +235,63 @@ pub fn EventPanel(
 	let mut status = use_signal(String::new);
 	let busy = use_signal(|| false);
 	let mut last_save_request = use_signal(|| *save_request.read());
+
+	// —— 全局撤销集成 ——
+	// 待应用的撤销/重做快照：由注册的执行器写入，effect 统一落地（避免直接 set 触发追踪误注册）。
+	let mut pending_apply = use_signal(|| None::<MissionEvent>);
+	// 内容追踪基线：与当前内容出现差异时即产生一次可撤销操作。
+	let mut last_recorded = use_signal(|| None::<MissionEvent>);
+	use_effect(move || {
+		let Some(target) = pending_apply.read().clone() else {
+			return;
+		};
+		last_recorded.set(Some(target.clone()));
+		event.set(Some(target));
+		pending_apply.set(None);
+	});
+	use_effect(move || {
+		let current = event.read().clone();
+		let previous = last_recorded.read().clone();
+		if current == previous {
+			return;
+		}
+		// 载入 / 释放边界（None ↔ Some）只更新基线，不产生撤销步骤。
+		let (Some(before), Some(after)) = (previous, current.clone()) else {
+			last_recorded.set(current);
+			return;
+		};
+		last_recorded.set(current);
+		let Some(file) = selected.read().clone() else {
+			return;
+		};
+		let root = missions_root
+			.read()
+			.clone()
+			.unwrap_or_else(|| "missions".to_string());
+		let scope_key = format!("{root}/missionsEvents/{file}");
+		let scope = UndoScope::EventFile(scope_key.clone());
+		// 执行器只在仍打开同一文件时应用快照（避免把内容串写到其它文件）；
+		// Work 层还会按「当前打开文件」过滤，这里为双保险。
+		let mut pending_for_undo = pending_apply;
+		let active_scope_for_undo = active_scope;
+		let key_for_undo = scope_key.clone();
+		let before_for_undo = before.clone();
+		let undo = EventHandler::new(move |_: ()| {
+			if active_scope_for_undo.read().as_deref() == Some(key_for_undo.as_str()) {
+				pending_for_undo.set(Some(before_for_undo.clone()));
+			}
+		});
+		let mut pending_for_redo = pending_apply;
+		let active_scope_for_redo = active_scope;
+		let key_for_redo = scope_key;
+		let after_for_redo = after;
+		let redo = EventHandler::new(move |_: ()| {
+			if active_scope_for_redo.read().as_deref() == Some(key_for_redo.as_str()) {
+				pending_for_redo.set(Some(after_for_redo.clone()));
+			}
+		});
+		on_undo_push.call((scope, undo, redo));
+	});
 
 	let directory_for_open = work_directory.clone();
 	let open_event = use_callback(move |file_name: String| {
@@ -238,6 +303,10 @@ pub fn EventPanel(
 			status.set("请先打开工作区".to_string());
 			return;
 		};
+		let missions_root = missions_root
+			.read()
+			.clone()
+			.unwrap_or_else(|| "missions".to_string());
 		let mut busy = busy;
 		let mut selected = selected;
 		let mut event = event;
@@ -247,14 +316,17 @@ pub fn EventPanel(
 			busy.set(true);
 			status.set("正在读取...".to_string());
 			event.set(None);
-			match load_event_text(&directory, &file_name).await {
+			match load_event_text(&directory, &missions_root, &file_name).await {
 				Ok(text) => {
 					selected.set(Some(file_name.clone()));
 					original.set(text.clone());
 					event.set(Some(MissionEvent::parse(&text)));
 					status.set(String::new());
+					// 供 Work 判断事件分区的撤销可用性。
+					active_scope
+						.set(Some(format!("{missions_root}/missionsEvents/{file_name}")));
 					on_selection_change
-						.call(Some(format!("missions/missionsEvents/{file_name}")));
+						.call(Some(format!("{missions_root}/missionsEvents/{file_name}")));
 				}
 				Err(error) => status.set(error),
 			}
@@ -273,6 +345,10 @@ pub fn EventPanel(
 		let Some(directory) = directory_for_save.clone() else {
 			return;
 		};
+		let missions_root = missions_root
+			.read()
+			.clone()
+			.unwrap_or_else(|| "missions".to_string());
 		let Some(file_name) = selected.read().clone() else {
 			return;
 		};
@@ -287,7 +363,7 @@ pub fn EventPanel(
 		let mut status = status;
 		spawn(async move {
 			status.set("正在保存...".to_string());
-			match save_event_text(&directory, &file_name, &text).await {
+			match save_event_text(&directory, &missions_root, &file_name, &text).await {
 				Ok(()) => {
 					original.set(text);
 					status.set("已保存".to_string());
@@ -308,6 +384,7 @@ pub fn EventPanel(
 		event.set(None);
 		original.set(String::new());
 		status.set("已关闭".to_string());
+		active_scope.set(None);
 		on_selection_change.call(None);
 	});
 
