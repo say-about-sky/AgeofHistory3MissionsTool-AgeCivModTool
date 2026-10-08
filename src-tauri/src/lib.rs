@@ -92,6 +92,8 @@ pub fn run() {
             commands::workspace_watch::stop_workspace_watch,
             commands::missions_db::load_event_lookup,
             commands::missions_db::load_event_lookup_scoped,
+            commands::missions_db::set_lookup_source_apk,
+            commands::missions_db::set_lookup_source_apk_scoped,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

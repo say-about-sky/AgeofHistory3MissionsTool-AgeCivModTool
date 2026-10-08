@@ -404,6 +404,9 @@ body {
 }
 
 .context-event-list button {
+  /* flex: none：列表超高时交给滚动条，禁止把按钮压缩到看不清文字
+     （按钮 overflow:hidden 使自动最小尺寸为 0，默认 flex-shrink 会全部挤扁）。 */
+  flex: none;
   overflow: hidden;
   text-align: left;
   text-overflow: ellipsis;
@@ -931,14 +934,22 @@ body {
 
 .event-section-title {
   display: flex;
+  /* 窄面板下允许把块控件整体挤到标题下一行（标题独占一行，不再逐字纵向换行）。 */
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
+  row-gap: 6px;
   padding: 6px 8px;
   color: #eef4ff;
   background: #274a78;
   font-size: 11px;
   font-weight: 700;
+}
+
+/* 标题文本不参与压缩：空间不足时换行的是控件（否则标题会一个字一行）。 */
+.event-section-title > span:first-child {
+  flex: 0 0 auto;
 }
 
 .event-title-add {
@@ -961,8 +972,11 @@ body {
 
 .event-block-controls {
   display: flex;
+  /* 控件自身也可换行（块类型 / 连接 / 删除可拆成多行平铺）。 */
+  flex-wrap: wrap;
   align-items: center;
   gap: 6px;
+  row-gap: 6px;
 }
 
 .event-block-controls label {
@@ -979,6 +993,42 @@ body {
   color: #eef4ff;
   background: #16304f;
   font-size: 10px;
+}
+
+/* 触发块标题：删除按钮固定右上角（绝对定位，不参与换行），
+   避免窄面板下「×」被单独挤到一行；右侧预留按钮位置。 */
+.event-section-title-block {
+  position: relative;
+  padding-right: 34px;
+}
+
+.event-section-title-block .event-block-del {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+}
+
+/* 触发块控件：标签与控件成组（换行时以组为单位，不拆散）。 */
+.event-block-controls .event-block-pair {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+/* 触发块控件里的自绘下拉沿用原生 select 的小尺寸（见 event_grid::SuggestInput）。 */
+.event-block-controls .suggest-wrap {
+  width: 104px;
+}
+
+.event-block-controls .suggest-wrap .event-cell-input {
+  height: 24px;
+  padding: 0 4px;
+  font-size: 10px;
+}
+
+.event-block-controls .suggest-list {
+  min-width: 150px;
 }
 
 .event-grid-head {
@@ -1232,6 +1282,110 @@ body {
   font-size: 10px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* 补全数据提示（工作区缺游戏数据文件且未找到源 APK 时显示，含设置入口说明）。 */
+.event-lookup-hint {
+  flex: none;
+  padding: 4px 6px;
+  border: 1px solid #5a6f96;
+  border-radius: 3px;
+  color: #cfe0f7;
+  background: #2c3d5c;
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+/* ===== 自绘候选下拉（安卓端替代原生 datalist；见 event_grid::SuggestInput） =====
+   原生 datalist 弹层按屏幕坐标定位，页面滚动 / 软键盘弹出后会上/下错位，
+   这里改为页面内绝对定位，位置始终跟随输入框。 */
+.suggest-wrap {
+  position: relative;
+  min-width: 0;
+}
+
+/* 展开中的输入框需要盖在全屏遮罩之上（其余输入框保持在遮罩之下）。 */
+.suggest-wrap-open {
+  z-index: 26;
+}
+
+.suggest-wrap .event-cell-input {
+  position: relative;
+  z-index: 25;
+}
+
+/* 半透明遮罩：点按空白处关闭下拉（移动端点选器通用模式），同时避免手势误触下层界面。 */
+.suggest-backdrop {
+  position: fixed;
+  z-index: 24;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  background: rgba(8, 16, 30, 0.18);
+}
+
+.event-value-parts .suggest-wrap {
+  flex: 1 1 0;
+}
+
+/* 自绘下拉需要越过分区圆角裁剪（仅自绘模式启用，不影响桌面端原生模式）。 */
+.event-grid.suggest-overlay .event-section {
+  overflow: visible;
+}
+
+.suggest-list {
+  position: absolute;
+  z-index: 30;
+  top: calc(100% + 2px);
+  left: 0;
+  display: flex;
+  max-width: min(340px, 76vw);
+  max-height: 208px;
+  min-width: 100%;
+  flex-direction: column;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  /* 垂直拖动明确交给列表滚动（配合松手位移判定，避免轻触即选）。 */
+  touch-action: pan-y;
+  padding: 2px;
+  border: 1px solid #4a6a9c;
+  border-radius: 4px;
+  background: #10294a;
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.5);
+}
+
+/* 下方空间不足时向上展开（方向与限高由 SuggestInput 实测后控制）。 */
+.suggest-list-up {
+  top: auto;
+  bottom: calc(100% + 2px);
+}
+
+.suggest-item {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 5px 6px;
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+.suggest-item:hover,
+.suggest-item:active {
+  background: #274a78;
+}
+
+.suggest-item-value {
+  color: #eef4ff;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.suggest-item-label {
+  color: #9fb4d6;
+  font-size: 10px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
 }
 
 .editor-main {

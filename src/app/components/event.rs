@@ -229,6 +229,11 @@ pub fn EventPanel(
 	on_undo_push: EventHandler<UndoRegistration>,
 	/// 事件面板当前打开文件的标识（「根/missionsEvents/文件」）：供 Work 判断事件分区的撤销可用性。
 	active_scope: Signal<Option<String>>,
+	/// 补全数据刷新纪元（「指定补全数据 APK」等操作后 +1，强制重新加载对照表）。
+	lookup_epoch: Signal<u64>,
+	/// 是否使用浏览器原生 `<datalist>` 补全（桌面端）；安卓端为 false，
+	/// 改用页面内自绘下拉（原生弹层在滚动 / 软键盘弹出后上/下都会错位）。
+	native_autocomplete: bool,
 ) -> Element {
 	let mut selected = use_signal(|| None::<String>);
 	let mut event = use_signal(|| None::<MissionEvent>);
@@ -245,6 +250,9 @@ pub fn EventPanel(
 	let mut lookup = use_signal(|| Shared::new(EventLookup::default()));
 	let mut lookup_loaded_key = use_signal(|| None::<String>);
 	let mut lookup_generation = use_signal(|| 0_u64);
+	// 补全数据加载状态：加载失败的信息与「已尝试加载」标记（用于空表提示）。
+	let mut lookup_error = use_signal(String::new);
+	let mut lookup_ready = use_signal(|| false);
 	let directory_for_lookup = work_directory.clone();
 	use_effect(move || {
 		let root = missions_root
@@ -256,17 +264,21 @@ pub fn EventPanel(
 		};
 		// 缓存键包含剧本地图上下文：同一地图的不同剧本共享数据，切换不重读；
 		// 全局根（无地图上下文）与剧本根数据源不同（合并全部地图 / 单地图），分别缓存。
+		// 末尾的纪元位用于「指定补全数据 APK」等操作后强制重新加载。
 		let key = format!(
-			"{}|{}|{}|{}",
+			"{}|{}|{}|{}|{}",
 			directory.root_path,
 			directory.folder_id.clone().unwrap_or_default(),
 			game_dir_key(&root),
-			scenario_map_key(&root)
+			scenario_map_key(&root),
+			*lookup_epoch.read(),
 		);
 		if lookup_loaded_key.peek().as_deref() == Some(key.as_str()) {
 			return;
 		}
 		lookup_loaded_key.set(Some(key));
+		lookup_ready.set(false);
+		lookup_error.set(String::new());
 		let generation = lookup_generation.with_mut(|value| {
 			*value = value.wrapping_add(1);
 			*value
@@ -277,9 +289,16 @@ pub fn EventPanel(
 			if *lookup_generation.peek() != generation {
 				return;
 			}
+			lookup_ready.set(true);
 			match loaded {
-				Ok(loaded) => lookup.set(Shared::new(loaded)),
-				Err(_) => lookup.set(Shared::new(EventLookup::default())),
+				Ok(loaded) => {
+					lookup_error.set(String::new());
+					lookup.set(Shared::new(loaded));
+				}
+				Err(error) => {
+					lookup_error.set(error);
+					lookup.set(Shared::new(EventLookup::default()));
+				}
 			}
 		});
 	});
@@ -478,6 +497,10 @@ pub fn EventPanel(
 	let is_dirty = selected_name.is_some() && current_text.as_deref() != Some(original_text.as_str());
 	let status_text = status.read().clone();
 	let busy_now = *busy.read();
+	// 补全数据状态：加载失败 / 空表（工作区缺游戏数据文件且未找到源 APK）时给出提示。
+	let lookup_ready_now = *lookup_ready.read();
+	let lookup_error_text = lookup_error.read().clone();
+	let lookup_empty = lookup.read().is_empty();
 	let (invalid_count, unknown_count, typo_count) = event
 		.read()
 		.as_ref()
@@ -499,11 +522,24 @@ pub fn EventPanel(
                 div { class: "event-editor",
                     label { "missionsEvents / {file_name}" }
                     if event.read().is_some() {
-                        EventGrid { event, lookup: lookup.read().clone() }
+                        EventGrid {
+                            event,
+                            lookup: lookup.read().clone(),
+                            native_autocomplete,
+                        }
                     } else if busy_now {
                         div { class: "event-grid-empty", "正在读取..." }
                     } else {
                         div { class: "event-grid-empty", "脚本尚未载入" }
+                    }
+                    if lookup_ready_now && !lookup_error_text.is_empty() {
+                        div { class: "event-lookup-hint", role: "status",
+                            "补全数据加载失败：{lookup_error_text}"
+                        }
+                    } else if lookup_ready_now && lookup_empty {
+                        div { class: "event-lookup-hint", role: "status",
+                            "未找到补全数据（文明 / 政体 / 省份等）：工作区没有游戏数据文件，也未找到源 APK。可把游戏 APK 放到工作区顶层，或用「文件 → 导入-导出 → 指定补全数据 APK」设置一次。"
+                        }
                     }
                     div { class: "event-actions",
                         button {

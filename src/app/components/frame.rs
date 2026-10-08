@@ -11,6 +11,8 @@ pub fn Frame(
 	on_extract_apk: EventHandler<()>,
 	on_import_apk: EventHandler<()>,
 	on_export_apk: EventHandler<()>,
+	/// 「指定补全数据 APK」：写入工作区根标记，供事件编辑器补全读取。
+	on_set_lookup_apk: EventHandler<()>,
 	on_package_apk: EventHandler<()>,
 	on_sign_apk: EventHandler<()>,
 	on_import_signing_key: EventHandler<()>,
@@ -257,6 +259,19 @@ pub fn Frame(
                                         },
                                         span { class: "menu-symbol", "⇱" }
                                         span { "导出到 apk" }
+                                    }
+                                    button {
+                                        class: "menu-item",
+                                        r#type: "button",
+                                        disabled: !has_workspace || is_loading,
+                                        title: "选择游戏 APK 作为补全数据源（工作区缺少游戏数据文件时使用）",
+                                        onclick: move |_| {
+                                            file_menu_open.set(false);
+                                            io_menu_open.set(false);
+                                            on_set_lookup_apk.call(());
+                                        },
+                                        span { class: "menu-symbol", "⌖" }
+                                        span { "指定补全数据 APK" }
                                     }
                                 }
                             }

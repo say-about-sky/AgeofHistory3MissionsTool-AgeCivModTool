@@ -98,6 +98,22 @@ struct PackageApkArgs {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct LookupSourceArgs {
+	work_directory: String,
+	/// 作为补全数据源的 APK 位置（绝对路径或 content:// URI）。
+	apk_path: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LookupSourceScopedArgs {
+	folder_id: String,
+	/// 作为补全数据源的 APK 位置（content:// URI、绝对路径或工作区内相对路径）。
+	apk_path: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct SignApkArgs {
 	work_directory: String,
 	/// 要签名的 APK（工作区内相对路径）。
@@ -907,6 +923,36 @@ async fn export_apk_sections_to_apk(
 	Ok(summary.message)
 }
 
+/// 「指定补全数据 APK」：把 APK 位置写入工作区根标记（事件编辑器补全用）。
+/// 真实路径模式走 `set_lookup_source_apk`，SAF 模式走 `set_lookup_source_apk_scoped`。
+async fn set_lookup_source_apk(
+	directory: &WorkDirectory,
+	apk_path: &str,
+) -> Result<String, String> {
+	let value = match &directory.folder_id {
+		Some(folder_id) => {
+			let args = serde_wasm_bindgen::to_value(&LookupSourceScopedArgs {
+				folder_id: folder_id.clone(),
+				apk_path: apk_path.to_string(),
+			})
+			.map_err(|error| error.to_string())?;
+			JsFuture::from(invoke("set_lookup_source_apk_scoped", args)).await
+		}
+		None => {
+			let args = serde_wasm_bindgen::to_value(&LookupSourceArgs {
+				work_directory: directory.root_path.clone(),
+				apk_path: apk_path.to_string(),
+			})
+			.map_err(|error| error.to_string())?;
+			JsFuture::from(invoke("set_lookup_source_apk", args)).await
+		}
+	}
+	.map_err(|error| format!("设置补全数据源失败：{}", describe_picker_error(&error)))?;
+	value
+		.as_string()
+		.ok_or_else(|| "设置结果格式错误".to_string())
+}
+
 /// 打包工作区内的目录为 APK（产物位于源目录同级，不签名）。
 async fn package_workspace_apk(
 	work_directory: &str,
@@ -1300,40 +1346,40 @@ fn TreeCanvas(
 	let event_root_rename = tab_missions_root.clone();
 	let is_active = active_tab_id.read().as_deref() == Some(tab.id.as_str());
 	rsx! {
-		div {
-			class: "tab-canvas",
-			style: if is_active { "display: flex;" } else { "display: none;" },
-			MindMapCanvas {
-				initial_icons: tab.icons.clone(),
-				missions: tab.missions.clone(),
-				missions_root: tab_missions_root.clone(),
-				event_files: event_files.clone(),
-				active_tab_id,
-				tab_id: canvas_tab_id,
-				on_save: move |records| on_save.call((save_tab_id.clone(), records)),
-				save_request,
-				save_status,
-				on_edit_event: move |file_name: String| {
-				    on_edit_event.call((event_root_edit.clone(), file_name))
-				},
-				on_create_event_file: move |(file_name, contents): (String, String)| {
-				    on_create_event_file.call((event_root_create.clone(), file_name, contents))
-				},
-				on_delete_event_file: move |file_name: String| {
-				    on_delete_event_file.call((event_root_delete.clone(), file_name))
-				},
-				on_rename_event_file: move |(old_name, new_name): (String, String)| {
-				    on_rename_event_file.call((event_root_rename.clone(), old_name, new_name))
-				},
-				focus_request,
-				on_undo_push,
-				on_nodes_change,
-				on_dirty_change: move |dirty| on_dirty_change.call((dirty_tab_id.clone(), dirty)),
-				pending_icon,
-				save_ack: tab.save_ack,
-			}
-		}
-	}
+        div {
+            class: "tab-canvas",
+            style: if is_active { "display: flex;" } else { "display: none;" },
+            MindMapCanvas {
+                initial_icons: tab.icons.clone(),
+                missions: tab.missions.clone(),
+                missions_root: tab_missions_root.clone(),
+                event_files: event_files.clone(),
+                active_tab_id,
+                tab_id: canvas_tab_id,
+                on_save: move |records| on_save.call((save_tab_id.clone(), records)),
+                save_request,
+                save_status,
+                on_edit_event: move |file_name: String| {
+                    on_edit_event.call((event_root_edit.clone(), file_name))
+                },
+                on_create_event_file: move |(file_name, contents): (String, String)| {
+                    on_create_event_file.call((event_root_create.clone(), file_name, contents))
+                },
+                on_delete_event_file: move |file_name: String| {
+                    on_delete_event_file.call((event_root_delete.clone(), file_name))
+                },
+                on_rename_event_file: move |(old_name, new_name): (String, String)| {
+                    on_rename_event_file.call((event_root_rename.clone(), old_name, new_name))
+                },
+                focus_request,
+                on_undo_push,
+                on_nodes_change,
+                on_dirty_change: move |dirty| on_dirty_change.call((dirty_tab_id.clone(), dirty)),
+                pending_icon,
+                save_ack: tab.save_ack,
+            }
+        }
+    }
 }
 
 /// 可拖拽调整宽度的侧边面板。
@@ -1409,6 +1455,8 @@ pub fn Work() -> Element {
 	let save_status = use_signal(String::new);
 	// APK 操作（解压/打包并签名）的最近结果提示，显示在底部状态栏。
 	let apk_status = use_signal(String::new);
+	// 补全数据刷新纪元：设置「补全数据源 APK」后 +1，事件编辑器据此重新加载对照表。
+	let lookup_epoch = use_signal(|| 0_u64);
 	let mut save_request = use_signal(|| 0_u64);
 	let mut directory_name = use_signal(|| "GameCivs".to_string());
 	let android_platform = use_signal(|| false);
@@ -2054,7 +2102,50 @@ pub fn Work() -> Element {
 		});
 	});
 
-	// 实际执行打包并签名（source_directory 为工作区内相对目录，空串表示工作区根）。
+	// 「指定补全数据 APK」：把游戏 APK 位置记入工作区根标记；事件编辑器在缺少游戏数据文件
+	// （如只有 missions / scenarios 版块的工作区）时直接从该 APK 读取补全数据。
+	let on_set_lookup_apk = EventHandler::new(move |_: ()| {
+		let work_directory = work_directory;
+		let mut apk_status = apk_status;
+		let mut lookup_epoch = lookup_epoch;
+		let selected = selected_file.read().clone();
+		spawn(async move {
+			let Some(directory) = work_directory.read().clone() else {
+				apk_status.set("设置失败：请先打开工作区".to_string());
+				return;
+			};
+			let (apk_path, apk_name) = match resolve_target_apk(
+				&directory,
+				selected,
+				"选择作为补全数据源的 APK",
+			)
+			.await
+			{
+				Ok(Some(target)) => target,
+				Ok(None) => return,
+				Err(error) => {
+					apk_status.set(error);
+					return;
+				}
+			};
+			if let Some(name) = apk_name.as_deref() {
+				if !name.to_ascii_lowercase().ends_with(".apk") {
+					apk_status.set(format!("「{name}」不是 apk 文件，请重新选择 .apk 安装包"));
+					return;
+				}
+			}
+			apk_status.set("正在设置补全数据源...".to_string());
+			match set_lookup_source_apk(&directory, &apk_path).await {
+				Ok(message) => {
+					apk_status.set(message);
+					// 事件编辑器按（工作区 | 资源根）缓存对照表：纪元 +1 强制重新加载。
+					lookup_epoch.with_mut(|value| *value = value.wrapping_add(1));
+				}
+				Err(error) => apk_status.set(error),
+			}
+		});
+	});
+
 	let run_package_apk = EventHandler::new(move |source_directory: Option<String>| {
 		let work_directory = work_directory;
 		let mut loading = loading;
@@ -2986,534 +3077,536 @@ pub fn Work() -> Element {
 		.map(|tab| (tab.id.clone(), tab))
 		.collect();
 	rsx! {
-		div {
-			class: if resizing.read().is_some() { "editor-shell resizing" } else { "editor-shell" },
-			tabindex: "0",
-			autofocus: true,
-			onpointermove: move |evt: Event<PointerData>| {
-			    let Some(state) = *resizing.read() else {
-			        return;
-			    };
-			    let delta = evt.client_coordinates().x - state.start_x;
-			    match state.side {
-			        ResizeSide::Explorer => {
-			            explorer_width
-			                .set(
-			                    (state.start_width + delta)
-			                        .clamp(EXPLORER_MIN_WIDTH, EXPLORER_MAX_WIDTH),
-			                );
-			        }
-			        ResizeSide::Events => {
-			            events_width
-			                .set(
-			                    (state.start_width - delta)
-			                        .clamp(EVENTS_MIN_WIDTH, EVENTS_MAX_WIDTH),
-			                );
-			        }
-			    }
-			},
-			onpointerup: move |_| resizing.set(None),
-			onpointercancel: move |_| resizing.set(None),
-			onkeydown: move |evt: Event<KeyboardData>| {
-			    let data = evt.data();
-			    let key = data.key().to_string();
-			    let modifiers = data.modifiers();
-			    if modifiers.contains(Modifiers::CONTROL) || modifiers.contains(Modifiers::META)
-			    {
-			        match key.to_ascii_lowercase().as_str() {
-			            "s" => {
-			                evt.prevent_default();
-			                save_request.with_mut(|request| *request = request.wrapping_add(1));
-			            }
-			            "o" => {
-			                evt.prevent_default();
-			                if !*loading.read() {
-			                    on_choose_directory.call(());
-			                }
-			            }
-			            "n" => {
-			                evt.prevent_default();
-			                if !*loading.read() {
-			                    on_create_directory.call(());
-			                }
-			            }
-			            "w" => {
-			                evt.prevent_default();
-			                let active_tab = active_tab_id.read().clone();
-			                if let Some(tab_id) = active_tab {
-			                    on_close_tab_requested.call(tab_id);
-			                }
-			            }
-			            "z" => {
-			                // 标记了 data-native-undo 的输入框（搜索框等）交回浏览器原生撤销。
-			                if !focus_wants_native_undo() {
-			                    evt.prevent_default();
-			                    if modifiers.contains(Modifiers::SHIFT) {
-			                        on_redo.call(());
-			                    } else {
-			                        on_undo.call(());
-			                    }
-			                }
-			            }
-			            "y" => {
-			                if !focus_wants_native_undo() {
-			                    evt.prevent_default();
-			                    on_redo.call(());
-			                }
-			            }
-			            _ => {}
-			        }
-			    }
-			},
-			Frame {
-				on_open: move |_| on_choose_directory.call(()),
-				on_new: move |_| on_create_directory.call(()),
-				on_manage_all_files,
-				on_extract_apk,
-				on_import_apk,
-				on_export_apk,
-				on_package_apk,
-				on_sign_apk,
-				on_import_signing_key,
-				on_save: move |_| save_request.with_mut(|request| *request = request.wrapping_add(1)),
-				on_toggle_files: move |_| {
-				    let next = !*files_open.read();
-				    files_open.set(next);
-				},
-				on_toggle_events: move |_| {
-				    let next = !*events_open.read();
-				    events_open.set(next);
-				},
-				has_workspace,
-				workspace_name,
-				is_loading: *loading.read(),
-				is_android: *android_platform.read(),
-				all_files_access_granted: *all_files_access_granted.read(),
-				tabs: open_tabs
-				                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    .read()
-				                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    .iter()
-				                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    .map(|tab| (tab.id.clone(), tab.title.clone()))
-				                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    .collect(),
-				active_tab_id: active_tab_id.read().clone(),
-				on_select_tab,
-				on_close_tab: on_close_tab_requested,
-				can_undo,
-				can_redo,
-				zone_label: undo_zone_label,
-				on_undo,
-				on_redo,
-			}
-			div { class: "editor-body",
-				if *files_open.read() {
-					div {
-						class: "drawer explorer-drawer",
-						onfocusin: move |_| {
-						    if *active_zone.peek() != UndoZone::Explorer {
-						        active_zone.set(UndoZone::Explorer);
-						    }
-						},
-						onpointerdown: move |_| {
-						    if *active_zone.peek() != UndoZone::Explorer {
-						        active_zone.set(UndoZone::Explorer);
-						    }
-						},
-						Files {
-							files: workspace_files,
-							work_directory: current_directory.as_ref().map(|directory| directory.display_path.clone()),
-							width: *explorer_width.read(),
-							selected_path: selected_file,
-							clipboard: explorer_clipboard,
-							on_open_file,
-							on_command: on_explorer_command,
-						}
-						div {
-							class: "resize-handle",
-							role: "separator",
-							aria_orientation: "vertical",
-							aria_hidden: "true",
-							id: "resize-explorer",
-							onpointerdown: move |evt: Event<PointerData>| {
-							    resizing
-							        .set(
-							            Some(PanelResize {
-							                side: ResizeSide::Explorer,
-							                start_x: evt.client_coordinates().x,
-							                start_width: *explorer_width.read(),
-							            }),
-							        );
-							    let pointer_id = evt.data().pointer_id();
-							    spawn(async move {
-							        let _ = dioxus::document::eval(
-							                &format!(
-							                    "document.getElementById('resize-explorer')?.setPointerCapture({pointer_id})",
-							                ),
-							            )
-							            .await;
-							    });
-							},
-						}
-					}
-				}
-				main { class: "editor-main",
-					if *loading.read() {
-						div { class: "loading-panel", role: "status",
-							div { class: "loading-stage", "{loading_stage}" }
-							if let Some(percent) = loading_percent {
-								div {
-									class: "loading-progress",
-									role: "progressbar",
-									aria_valuemin: "0",
-									aria_valuemax: "100",
-									aria_valuenow: "{percent:.0}",
-									div {
-										class: "loading-progress-fill",
-										style: "width: {percent}%;",
-									}
-								}
-							} else {
-								div { class: "loading-progress indeterminate",
-									div { class: "loading-progress-fill" }
-								}
-							}
-							if let Some(counter) = loading_counter {
-								div { class: "loading-progress-text", "{counter}" }
-							}
-						}
-					} else if !open_tabs.read().is_empty() {
-						div {
-							class: "canvas-stage",
-							onfocusin: move |_| {
-							    if *active_zone.peek() != UndoZone::Canvas {
-							        active_zone.set(UndoZone::Canvas);
-							    }
-							},
-							onpointerdown: move |_| {
-							    if *active_zone.peek() != UndoZone::Canvas {
-							        active_zone.set(UndoZone::Canvas);
-							    }
-							},
-							for (tab_id , tab) in canvas_tabs {
-								TreeCanvas {
-									key: "{tab_id}",
-									tab,
-									event_files: event_files_snapshot.clone(),
-									active_tab_id,
-									save_request,
-									save_status: save_status.read().clone(),
-									focus_request: mind_focus_request,
-									pending_icon,
-									on_undo_push,
-									on_save: on_save_tab,
-									on_edit_event,
-									on_create_event_file,
-									on_delete_event_file,
-									on_rename_event_file,
-									on_nodes_change,
-									on_dirty_change,
-								}
-							}
-						}
-					} else {
-						div { class: "welcome-panel",
-							div { class: "welcome-mark", "A" }
-							h1 { "国策树工作区" }
-							p {
-								if work_directory.read().is_some() {
-									"在资源管理器中双击国策资源目录（missions / assets/game/missions / 剧本 missions）下的 .json 文件打开国策树。"
-								} else {
-									"从文件菜单打开现有工作区，或创建一个新的工作区。"
-								}
-							}
-							label { class: "workspace-name",
-								span { "新工作区名称" }
-								input {
-									value: "{directory_name}",
-									"data-native-undo": "true",
-									oninput: move |event: FormEvent| directory_name.set(event.value()),
-								}
-							}
-							if !load_error.read().is_empty() {
-								p { class: "workspace-error", role: "alert", "{load_error.read()}" }
-							}
-						}
-					}
-				}
-				if *events_open.read() {
-					div {
-						class: "drawer events-drawer",
-						onfocusin: move |_| {
-						    if *active_zone.peek() != UndoZone::Events {
-						        active_zone.set(UndoZone::Events);
-						    }
-						},
-						onpointerdown: move |_| {
-						    if *active_zone.peek() != UndoZone::Events {
-						        active_zone.set(UndoZone::Events);
-						    }
-						},
-						div {
-							class: "resize-handle",
-							role: "separator",
-							aria_orientation: "vertical",
-							aria_hidden: "true",
-							id: "resize-events",
-							onpointerdown: move |evt: Event<PointerData>| {
-							    resizing
-							        .set(
-							            Some(PanelResize {
-							                side: ResizeSide::Events,
-							                start_x: evt.client_coordinates().x,
-							                start_width: *events_width.read(),
-							            }),
-							        );
-							    let pointer_id = evt.data().pointer_id();
-							    spawn(async move {
-							        let _ = dioxus::document::eval(
-							                &format!(
-							                    "document.getElementById('resize-events')?.setPointerCapture({pointer_id})",
-							                ),
-							            )
-							            .await;
-							    });
-							},
-						}
-						EventPanel {
-							work_directory: current_directory.clone(),
-							missions_root: events_root,
-							save_request,
-							open_request: open_event_request,
-							rename_request: rename_event_request,
-							release_request: event_release_request,
-							on_selection_change: on_file_selected,
-							on_undo_push,
-							active_scope: event_active_scope,
-							width: *events_width.read(),
-						}
-					}
-				}
-			}
-			footer { class: "editor-statusbar",
-				span {
-					if has_workspace {
-						"工作区已载入"
-					} else {
-						"未打开工作区"
-					}
-				}
-				if let Some(tab_id) = active_tab_id.read().clone() {
-					if let Some(tab) = open_tabs.read().iter().find(|tab| tab.id == tab_id) {
-						span { class: "status-path", "国策树：{tab.title}" }
-					}
-				}
-				if let Some(directory) = current_directory {
-					span {
-						class: "status-path",
-						title: "{directory.display_path}",
-						"{directory.display_path}"
-					}
-				}
-				if !apk_status.read().is_empty() {
-					span {
-						class: "status-path",
-						role: "status",
-						title: "{apk_status.read()}",
-						"{apk_status.read()}"
-					}
-				}
-				if !permission_error.read().is_empty() {
-					span {
-						class: "status-error",
-						role: "alert",
-						title: "{permission_error.read()}",
-						"{permission_error.read()}"
-					}
-				}
-			}
-			if let Some((path, message)) = delete_prompt.read().clone() {
-				div {
-					class: "menu-dismiss",
-					style: "z-index: 55;",
-					aria_hidden: "true",
-					onclick: move |_| delete_prompt.set(None),
-				}
-				div { class: "confirm-dialog", role: "alertdialog",
-					p { class: "confirm-message", "{message}" }
-					div { class: "confirm-actions",
-						button {
-							class: "event-save",
-							r#type: "button",
-							onclick: move |_| {
-							    let directory = work_directory.read().clone();
-							    let is_directory = workspace_files
-							        .read()
-							        .iter()
-							        .find(|file| file.relative_path == path)
-							        .map(|file| file.is_directory)
-							        .unwrap_or(false);
-							    delete_prompt.set(None);
-							    if let Some(directory) = directory {
-							        let path = path.clone();
-							        spawn(async move {
-							            let mut load_error = load_error;
-							            let mut workspace_files = workspace_files;
-							            match delete_item(&directory, &path, is_directory).await {
-							                Ok(()) => {
-							                    if let Ok(files) = reload_file_list(&directory).await
-							                    {
-							                        workspace_files.set(files.clone());
-							                        prune_tabs.call(files);
-							                    }
-							                }
-							                Err(error) => load_error.set(format!("删除失败：{error}")),
-							            }
-							        }
-							        );
-							    }
-							},
-							"确认删除"
-						}
-						button {
-							class: "event-revert",
-							r#type: "button",
-							onclick: move |_| delete_prompt.set(None),
-							"取消"
-						}
-					}
-				}
-			}
-			if let Some(key_path) = signing_key_prompt.read().clone() {
-				div {
-					class: "menu-dismiss",
-					style: "z-index: 55;",
-					aria_hidden: "true",
-					onclick: move |_| {
-					    signing_key_prompt.set(None);
-					    signing_key_error.set(String::new());
-					},
-				}
-				div { class: "confirm-dialog", role: "alertdialog",
-					p { class: "confirm-message", "请输入 BKS 密钥库密码：" }
-					p {
-						class: "confirm-message",
-						style: "font-size: 12px; opacity: 0.75; word-break: break-all;",
-						"{key_path}"
-					}
-					input {
-						r#type: "password",
-						value: "{signing_key_password}",
-						placeholder: "密钥库密码",
-						"data-native-undo": "true",
-						style: "width: 100%; box-sizing: border-box; padding: 6px 10px; margin: 8px 0; background: var(--input-bg, #26262e); color: inherit; border: 1px solid #4a4a55; border-radius: 4px;",
-						oninput: move |evt: FormEvent| signing_key_password.set(evt.value()),
-						onkeydown: move |evt: Event<KeyboardData>| {
-						    if evt.data().key().to_string() == "Enter" {
-						        evt.prevent_default();
-						        if let Some(key_path) = signing_key_prompt.read().clone() {
-						            run_import_key
-						                .call((key_path, Some(signing_key_password.read().clone())));
-						        }
-						    }
-						},
-					}
-					if !signing_key_error.read().is_empty() {
-						p {
-							class: "confirm-message",
-							style: "color: #ff8a8a;",
-							"{signing_key_error}"
-						}
-					}
-					div { class: "confirm-actions",
-						button {
-							class: "event-save",
-							r#type: "button",
-							onclick: move |_| {
-							    if let Some(key_path) = signing_key_prompt.read().clone() {
-							        run_import_key.call((key_path, Some(signing_key_password.read().clone())));
-							    }
-							},
-							"确定"
-						}
-						button {
-							class: "event-revert",
-							r#type: "button",
-							onclick: move |_| {
-							    signing_key_prompt.set(None);
-							    signing_key_error.set(String::new());
-							},
-							"取消"
-						}
-					}
-				}
-			}
-			if let Some(directories) = pack_choice.read().clone() {
-				div {
-					class: "menu-dismiss",
-					style: "z-index: 55;",
-					aria_hidden: "true",
-					onclick: move |_| pack_choice.set(None),
-				}
-				div { class: "confirm-dialog", role: "alertdialog",
-					p { class: "confirm-message",
-						"检测到多个 APK 内容目录，请选择要打包的目录："
-					}
-					div {
-						class: "confirm-actions",
-						style: "flex-wrap: wrap; justify-content: flex-start;",
-						for directory in directories {
-							{
-							    let choice = directory.clone();
-							    rsx! {
-								button {
-									class: "event-save",
-									r#type: "button",
-									onclick: move |_| {
-									    pack_choice.set(None);
-									    run_package_apk.call(Some(choice.clone()));
-									},
-									"{directory}"
-								}
-							}
-							}
-						}
-						button {
-							class: "event-revert",
-							r#type: "button",
-							onclick: move |_| pack_choice.set(None),
-							"取消"
-						}
-					}
-				}
-			}
-			if let Some((tab_id, tab_title)) = tab_close_prompt_data {
-				div {
-					class: "menu-dismiss",
-					style: "z-index: 55;",
-					aria_hidden: "true",
-					onclick: move |_| tab_close_prompt.set(None),
-				}
-				div { class: "confirm-dialog", role: "alertdialog",
-					p { class: "confirm-message",
-						"国策树「{tab_title}」有未保存的修改，关闭标签页将丢失这些修改。"
-					}
-					div { class: "confirm-actions",
-						button {
-							class: "event-save",
-							r#type: "button",
-							onclick: move |_| {
-							    tab_close_prompt.set(None);
-							    on_close_tab.call(tab_id.clone());
-							},
-							"关闭标签页"
-						}
-						button {
-							class: "event-revert",
-							r#type: "button",
-							onclick: move |_| tab_close_prompt.set(None),
-							"取消"
-						}
-					}
-				}
-			}
-		}
-	}
+        div {
+            class: if resizing.read().is_some() { "editor-shell resizing" } else { "editor-shell" },
+            tabindex: "0",
+            autofocus: true,
+            onpointermove: move |evt: Event<PointerData>| {
+                let Some(state) = *resizing.read() else {
+                    return;
+                };
+                let delta = evt.client_coordinates().x - state.start_x;
+                match state.side {
+                    ResizeSide::Explorer => {
+                        explorer_width
+                            .set(
+                                (state.start_width + delta)
+                                    .clamp(EXPLORER_MIN_WIDTH, EXPLORER_MAX_WIDTH),
+                            );
+                    }
+                    ResizeSide::Events => {
+                        events_width
+                            .set(
+                                (state.start_width - delta)
+                                    .clamp(EVENTS_MIN_WIDTH, EVENTS_MAX_WIDTH),
+                            );
+                    }
+                }
+            },
+            onpointerup: move |_| resizing.set(None),
+            onpointercancel: move |_| resizing.set(None),
+            onkeydown: move |evt: Event<KeyboardData>| {
+                let data = evt.data();
+                let key = data.key().to_string();
+                let modifiers = data.modifiers();
+                if modifiers.contains(Modifiers::CONTROL) || modifiers.contains(Modifiers::META)
+                {
+                    match key.to_ascii_lowercase().as_str() {
+                        "s" => {
+                            evt.prevent_default();
+                            save_request.with_mut(|request| *request = request.wrapping_add(1));
+                        }
+                        "o" => {
+                            evt.prevent_default();
+                            if !*loading.read() {
+                                on_choose_directory.call(());
+                            }
+                        }
+                        "n" => {
+                            evt.prevent_default();
+                            if !*loading.read() {
+                                on_create_directory.call(());
+                            }
+                        }
+                        "w" => {
+                            evt.prevent_default();
+                            let active_tab = active_tab_id.read().clone();
+                            if let Some(tab_id) = active_tab {
+                                on_close_tab_requested.call(tab_id);
+                            }
+                        }
+                        "z" => {
+                            // 标记了 data-native-undo 的输入框（搜索框等）交回浏览器原生撤销。
+                            if !focus_wants_native_undo() {
+                                evt.prevent_default();
+                                if modifiers.contains(Modifiers::SHIFT) {
+                                    on_redo.call(());
+                                } else {
+                                    on_undo.call(());
+                                }
+                            }
+                        }
+                        "y" => {
+                            if !focus_wants_native_undo() {
+                                evt.prevent_default();
+                                on_redo.call(());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            },
+            Frame {
+                on_open: move |_| on_choose_directory.call(()),
+                on_new: move |_| on_create_directory.call(()),
+                on_manage_all_files,
+                on_extract_apk,
+                on_import_apk,
+                on_export_apk,
+                on_set_lookup_apk,
+                on_package_apk,
+                on_sign_apk,
+                on_import_signing_key,
+                on_save: move |_| save_request.with_mut(|request| *request = request.wrapping_add(1)),
+                on_toggle_files: move |_| {
+                    let next = !*files_open.read();
+                    files_open.set(next);
+                },
+                on_toggle_events: move |_| {
+                    let next = !*events_open.read();
+                    events_open.set(next);
+                },
+                has_workspace,
+                workspace_name,
+                is_loading: *loading.read(),
+                is_android: *android_platform.read(),
+                all_files_access_granted: *all_files_access_granted.read(),
+                tabs: open_tabs
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        .read()
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        .iter()
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        .map(|tab| (tab.id.clone(), tab.title.clone()))
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        .collect(),
+                active_tab_id: active_tab_id.read().clone(),
+                on_select_tab,
+                on_close_tab: on_close_tab_requested,
+                can_undo,
+                can_redo,
+                zone_label: undo_zone_label,
+                on_undo,
+                on_redo,
+            }
+            div { class: "editor-body",
+                if *files_open.read() {
+                    div {
+                        class: "drawer explorer-drawer",
+                        onfocusin: move |_| {
+                            if *active_zone.peek() != UndoZone::Explorer {
+                                active_zone.set(UndoZone::Explorer);
+                            }
+                        },
+                        onpointerdown: move |_| {
+                            if *active_zone.peek() != UndoZone::Explorer {
+                                active_zone.set(UndoZone::Explorer);
+                            }
+                        },
+                        Files {
+                            files: workspace_files,
+                            work_directory: current_directory.as_ref().map(|directory| directory.display_path.clone()),
+                            width: *explorer_width.read(),
+                            selected_path: selected_file,
+                            clipboard: explorer_clipboard,
+                            on_open_file,
+                            on_command: on_explorer_command,
+                        }
+                        div {
+                            class: "resize-handle",
+                            role: "separator",
+                            aria_orientation: "vertical",
+                            aria_hidden: "true",
+                            id: "resize-explorer",
+                            onpointerdown: move |evt: Event<PointerData>| {
+                                resizing
+                                    .set(
+                                        Some(PanelResize {
+                                            side: ResizeSide::Explorer,
+                                            start_x: evt.client_coordinates().x,
+                                            start_width: *explorer_width.read(),
+                                        }),
+                                    );
+                                let pointer_id = evt.data().pointer_id();
+                                spawn(async move {
+                                    let _ = dioxus::document::eval(
+                                            &format!(
+                                                "document.getElementById('resize-explorer')?.setPointerCapture({pointer_id})",
+                                            ),
+                                        )
+                                        .await;
+                                });
+                            },
+                        }
+                    }
+                }
+                main { class: "editor-main",
+                    if *loading.read() {
+                        div { class: "loading-panel", role: "status",
+                            div { class: "loading-stage", "{loading_stage}" }
+                            if let Some(percent) = loading_percent {
+                                div {
+                                    class: "loading-progress",
+                                    role: "progressbar",
+                                    aria_valuemin: "0",
+                                    aria_valuemax: "100",
+                                    aria_valuenow: "{percent:.0}",
+                                    div {
+                                        class: "loading-progress-fill",
+                                        style: "width: {percent}%;",
+                                    }
+                                }
+                            } else {
+                                div { class: "loading-progress indeterminate",
+                                    div { class: "loading-progress-fill" }
+                                }
+                            }
+                            if let Some(counter) = loading_counter {
+                                div { class: "loading-progress-text", "{counter}" }
+                            }
+                        }
+                    } else if !open_tabs.read().is_empty() {
+                        div {
+                            class: "canvas-stage",
+                            onfocusin: move |_| {
+                                if *active_zone.peek() != UndoZone::Canvas {
+                                    active_zone.set(UndoZone::Canvas);
+                                }
+                            },
+                            onpointerdown: move |_| {
+                                if *active_zone.peek() != UndoZone::Canvas {
+                                    active_zone.set(UndoZone::Canvas);
+                                }
+                            },
+                            for (tab_id , tab) in canvas_tabs {
+                                TreeCanvas {
+                                    key: "{tab_id}",
+                                    tab,
+                                    event_files: event_files_snapshot.clone(),
+                                    active_tab_id,
+                                    save_request,
+                                    save_status: save_status.read().clone(),
+                                    focus_request: mind_focus_request,
+                                    pending_icon,
+                                    on_undo_push,
+                                    on_save: on_save_tab,
+                                    on_edit_event,
+                                    on_create_event_file,
+                                    on_delete_event_file,
+                                    on_rename_event_file,
+                                    on_nodes_change,
+                                    on_dirty_change,
+                                }
+                            }
+                        }
+                    } else {
+                        div { class: "welcome-panel",
+                            div { class: "welcome-mark", "A" }
+                            h1 { "国策树工作区" }
+                            p {
+                                if work_directory.read().is_some() {
+                                    "在资源管理器中双击国策资源目录（missions / assets/game/missions / 剧本 missions）下的 .json 文件打开国策树。"
+                                } else {
+                                    "从文件菜单打开现有工作区，或创建一个新的工作区。"
+                                }
+                            }
+                            label { class: "workspace-name",
+                                span { "新工作区名称" }
+                                input {
+                                    value: "{directory_name}",
+                                    "data-native-undo": "true",
+                                    oninput: move |event: FormEvent| directory_name.set(event.value()),
+                                }
+                            }
+                            if !load_error.read().is_empty() {
+                                p { class: "workspace-error", role: "alert", "{load_error.read()}" }
+                            }
+                        }
+                    }
+                }
+                if *events_open.read() {
+                    div {
+                        class: "drawer events-drawer",
+                        onfocusin: move |_| {
+                            if *active_zone.peek() != UndoZone::Events {
+                                active_zone.set(UndoZone::Events);
+                            }
+                        },
+                        onpointerdown: move |_| {
+                            if *active_zone.peek() != UndoZone::Events {
+                                active_zone.set(UndoZone::Events);
+                            }
+                        },
+                        div {
+                            class: "resize-handle",
+                            role: "separator",
+                            aria_orientation: "vertical",
+                            aria_hidden: "true",
+                            id: "resize-events",
+                            onpointerdown: move |evt: Event<PointerData>| {
+                                resizing
+                                    .set(
+                                        Some(PanelResize {
+                                            side: ResizeSide::Events,
+                                            start_x: evt.client_coordinates().x,
+                                            start_width: *events_width.read(),
+                                        }),
+                                    );
+                                let pointer_id = evt.data().pointer_id();
+                                spawn(async move {
+                                    let _ = dioxus::document::eval(
+                                            &format!(
+                                                "document.getElementById('resize-events')?.setPointerCapture({pointer_id})",
+                                            ),
+                                        )
+                                        .await;
+                                });
+                            },
+                        }
+                        EventPanel {
+                            work_directory: current_directory.clone(),
+                            missions_root: events_root,
+                            save_request,
+                            open_request: open_event_request,
+                            rename_request: rename_event_request,
+                            release_request: event_release_request,
+                            on_selection_change: on_file_selected,
+                            on_undo_push,
+                            active_scope: event_active_scope,
+                            lookup_epoch,
+                            // 安卓端禁用原生 datalist（弹层定位不可靠）：改页面内自绘下拉。
+                            native_autocomplete: !*android_platform.read(),
+                            width: *events_width.read(),
+                        }
+                    }
+                }
+            }
+            footer { class: "editor-statusbar",
+                span {
+                    if has_workspace {
+                        "工作区已载入"
+                    } else {
+                        "未打开工作区"
+                    }
+                }
+                if let Some(tab_id) = active_tab_id.read().clone() {
+                    if let Some(tab) = open_tabs.read().iter().find(|tab| tab.id == tab_id) {
+                        span { class: "status-path", "国策树：{tab.title}" }
+                    }
+                }
+                if let Some(directory) = current_directory {
+                    span {
+                        class: "status-path",
+                        title: "{directory.display_path}",
+                        "{directory.display_path}"
+                    }
+                }
+                if !apk_status.read().is_empty() {
+                    span {
+                        class: "status-path",
+                        role: "status",
+                        title: "{apk_status.read()}",
+                        "{apk_status.read()}"
+                    }
+                }
+                if !permission_error.read().is_empty() {
+                    span {
+                        class: "status-error",
+                        role: "alert",
+                        title: "{permission_error.read()}",
+                        "{permission_error.read()}"
+                    }
+                }
+            }
+            if let Some((path, message)) = delete_prompt.read().clone() {
+                div {
+                    class: "menu-dismiss",
+                    style: "z-index: 55;",
+                    aria_hidden: "true",
+                    onclick: move |_| delete_prompt.set(None),
+                }
+                div { class: "confirm-dialog", role: "alertdialog",
+                    p { class: "confirm-message", "{message}" }
+                    div { class: "confirm-actions",
+                        button {
+                            class: "event-save",
+                            r#type: "button",
+                            onclick: move |_| {
+                                let directory = work_directory.read().clone();
+                                let is_directory = workspace_files
+                                    .read()
+                                    .iter()
+                                    .find(|file| file.relative_path == path)
+                                    .map(|file| file.is_directory)
+                                    .unwrap_or(false);
+                                delete_prompt.set(None);
+                                if let Some(directory) = directory {
+                                    let path = path.clone();
+                                    spawn(async move {
+                                        let mut load_error = load_error;
+                                        let mut workspace_files = workspace_files;
+                                        match delete_item(&directory, &path, is_directory).await {
+                                            Ok(()) => {
+                                                if let Ok(files) = reload_file_list(&directory).await {
+                                                    workspace_files.set(files.clone());
+                                                    prune_tabs.call(files);
+                                                }
+                                            }
+                                            Err(error) => load_error.set(format!("删除失败：{error}")),
+                                        }
+                                    });
+                                }
+                            },
+                            "确认删除"
+                        }
+                        button {
+                            class: "event-revert",
+                            r#type: "button",
+                            onclick: move |_| delete_prompt.set(None),
+                            "取消"
+                        }
+                    }
+                }
+            }
+            if let Some(key_path) = signing_key_prompt.read().clone() {
+                div {
+                    class: "menu-dismiss",
+                    style: "z-index: 55;",
+                    aria_hidden: "true",
+                    onclick: move |_| {
+                        signing_key_prompt.set(None);
+                        signing_key_error.set(String::new());
+                    },
+                }
+                div { class: "confirm-dialog", role: "alertdialog",
+                    p { class: "confirm-message", "请输入 BKS 密钥库密码：" }
+                    p {
+                        class: "confirm-message",
+                        style: "font-size: 12px; opacity: 0.75; word-break: break-all;",
+                        "{key_path}"
+                    }
+                    input {
+                        r#type: "password",
+                        value: "{signing_key_password}",
+                        placeholder: "密钥库密码",
+                        "data-native-undo": "true",
+                        style: "width: 100%; box-sizing: border-box; padding: 6px 10px; margin: 8px 0; background: var(--input-bg, #26262e); color: inherit; border: 1px solid #4a4a55; border-radius: 4px;",
+                        oninput: move |evt: FormEvent| signing_key_password.set(evt.value()),
+                        onkeydown: move |evt: Event<KeyboardData>| {
+                            if evt.data().key().to_string() == "Enter" {
+                                evt.prevent_default();
+                                if let Some(key_path) = signing_key_prompt.read().clone() {
+                                    run_import_key
+                                        .call((key_path, Some(signing_key_password.read().clone())));
+                                }
+                            }
+                        },
+                    }
+                    if !signing_key_error.read().is_empty() {
+                        p {
+                            class: "confirm-message",
+                            style: "color: #ff8a8a;",
+                            "{signing_key_error}"
+                        }
+                    }
+                    div { class: "confirm-actions",
+                        button {
+                            class: "event-save",
+                            r#type: "button",
+                            onclick: move |_| {
+                                if let Some(key_path) = signing_key_prompt.read().clone() {
+                                    run_import_key.call((key_path, Some(signing_key_password.read().clone())));
+                                }
+                            },
+                            "确定"
+                        }
+                        button {
+                            class: "event-revert",
+                            r#type: "button",
+                            onclick: move |_| {
+                                signing_key_prompt.set(None);
+                                signing_key_error.set(String::new());
+                            },
+                            "取消"
+                        }
+                    }
+                }
+            }
+            if let Some(directories) = pack_choice.read().clone() {
+                div {
+                    class: "menu-dismiss",
+                    style: "z-index: 55;",
+                    aria_hidden: "true",
+                    onclick: move |_| pack_choice.set(None),
+                }
+                div { class: "confirm-dialog", role: "alertdialog",
+                    p { class: "confirm-message",
+                        "检测到多个 APK 内容目录，请选择要打包的目录："
+                    }
+                    div {
+                        class: "confirm-actions",
+                        style: "flex-wrap: wrap; justify-content: flex-start;",
+                        for directory in directories {
+                            {
+                                let choice = directory.clone();
+                                rsx! {
+                                    button {
+                                        class: "event-save",
+                                        r#type: "button",
+                                        onclick: move |_| {
+                                            pack_choice.set(None);
+                                            run_package_apk.call(Some(choice.clone()));
+                                        },
+                                        "{directory}"
+                                    }
+                                }
+                            }
+                        }
+                        button {
+                            class: "event-revert",
+                            r#type: "button",
+                            onclick: move |_| pack_choice.set(None),
+                            "取消"
+                        }
+                    }
+                }
+            }
+            if let Some((tab_id, tab_title)) = tab_close_prompt_data {
+                div {
+                    class: "menu-dismiss",
+                    style: "z-index: 55;",
+                    aria_hidden: "true",
+                    onclick: move |_| tab_close_prompt.set(None),
+                }
+                div { class: "confirm-dialog", role: "alertdialog",
+                    p { class: "confirm-message",
+                        "国策树「{tab_title}」有未保存的修改，关闭标签页将丢失这些修改。"
+                    }
+                    div { class: "confirm-actions",
+                        button {
+                            class: "event-save",
+                            r#type: "button",
+                            onclick: move |_| {
+                                tab_close_prompt.set(None);
+                                on_close_tab.call(tab_id.clone());
+                            },
+                            "关闭标签页"
+                        }
+                        button {
+                            class: "event-revert",
+                            r#type: "button",
+                            onclick: move |_| tab_close_prompt.set(None),
+                            "取消"
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

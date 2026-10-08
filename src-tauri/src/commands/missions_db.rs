@@ -1451,6 +1451,12 @@ pub async fn load_event_lookup<R: tauri::Runtime>(
         {
             use tauri_plugin_android_fs::{AndroidFsExt, FsUri};
             let open_apk = |location: &str| {
+                // 真实路径（全盘访问权限下）直接交给 std 打开；URI 走 android-fs 插件。
+                if !location.contains("://") {
+                    if let Ok(file) = File::open(location) {
+                        return Some(file);
+                    }
+                }
                 let uri = if location.contains("://") {
                     FsUri::from_uri(location.to_string())
                 } else {
@@ -1470,10 +1476,137 @@ pub async fn load_event_lookup<R: tauri::Runtime>(
     .map_err(|error| format!("加载文明对照表失败：{error}"))?
 }
 
+/// SAF：按「APK 位置」打开源 APK（`content://` URI / 绝对路径 / 工作区内相对路径）。
+/// 打不开或不是有效 zip 时返回 `None`（编辑器保持无补全状态，不报错）。
+async fn open_scoped_apk_location<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    folder_id: &str,
+    location: &str,
+) -> Option<ApkArchive> {
+    use tauri_plugin_android_fs::{AndroidFsExt, FsUri};
+
+    let api = app.android_fs_async();
+    let file = if location.contains("://") {
+        api.open_file_readable(&FsUri::from_uri(location.to_string()))
+            .await
+    } else if location.starts_with('/') {
+        // 绝对路径（真实路径模式导入时写入的标记）：需要「全盘文件访问权限」。
+        api.open_file_readable(&FsUri::from_path(Path::new(location)))
+            .await
+    } else {
+        // 工作区内相对路径（顶层 `*.apk` 名称 / 资源管理器内选中的 apk）。
+        match api
+            .resolve_file_uri(&bridge::root_uri(folder_id), location)
+            .await
+        {
+            Ok(uri) => api.open_file_readable(&uri).await,
+            Err(_) => return None,
+        }
+    };
+    ApkArchive::open(file.ok()?).ok()
+}
+
+/// SAF：打开「源 APK」——优先进口时写入的标记文件（`<包目录>/.ageciv-source`
+/// 或工作区根），其次搜索工作区顶层的 `*.apk`（优先与解包目录同名）。
+async fn open_scoped_source_apk<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    folder_id: &str,
+    missions_root: &str,
+) -> Option<ApkArchive> {
+    let top = missions_root.split('/').find(|segment| !segment.is_empty());
+
+    let mut markers = Vec::new();
+    if let Some(top) = top {
+        markers.push(join_rel(top, SOURCE_APK_MARKER));
+    }
+    markers.push(SOURCE_APK_MARKER.to_string());
+    for marker in markers {
+        let Ok(text) = bridge::read_text_file(app, folder_id, &marker).await else {
+            continue;
+        };
+        let location = text.trim();
+        if location.is_empty() {
+            continue;
+        }
+        if let Some(archive) = open_scoped_apk_location(app, folder_id, location).await {
+            return Some(archive);
+        }
+    }
+
+    let entries = bridge::list_dir(app, folder_id, None).await.ok()?;
+    let mut apks: Vec<String> = entries
+        .iter()
+        .filter(|entry| !entry.is_dir && entry.name.to_ascii_lowercase().ends_with(".apk"))
+        .map(|entry| entry.name.clone())
+        .collect();
+    apks.sort();
+    if let Some(top) = top {
+        if let Some(position) = apks
+            .iter()
+            .position(|name| name[..name.len() - 4].eq_ignore_ascii_case(top))
+        {
+            let preferred = apks.remove(position);
+            apks.insert(0, preferred);
+        }
+    }
+    for name in apks {
+        if let Some(archive) = open_scoped_apk_location(app, folder_id, &name).await {
+            return Some(archive);
+        }
+    }
+    None
+}
+
+/// 写入「补全数据源 APK」标记（内容为 APK 路径或 `content://` URI）。
+fn write_source_apk_marker(root: &Path, location: &str) -> Result<(), String> {
+    fs::write(root.join(SOURCE_APK_MARKER), location.as_bytes())
+        .map_err(|error| format!("写入标记文件失败：{error}"))
+}
+
+/// 设置「补全数据源 APK」（真实路径模式）：标记写入工作区根。
+/// 事件编辑器在缺少游戏数据文件（如只有 missions / scenarios 版块的工作区）时，
+/// 据此直接从该 APK 读取文明 / 政体 / 省份等对照数据。
+#[tauri::command]
+pub async fn set_lookup_source_apk(
+    work_directory: String,
+    apk_path: String,
+) -> Result<String, String> {
+    let location = apk_path.trim();
+    if location.is_empty() {
+        return Err("未选择 APK 文件".to_string());
+    }
+    let root = PathBuf::from(&work_directory);
+    if !root.is_dir() {
+        return Err(format!("工作目录不存在：{}", root.display()));
+    }
+    write_source_apk_marker(&root, location)?;
+    Ok("已设置补全数据源 APK：事件编辑器将从该 APK 读取文明 / 省份等数据".to_string())
+}
+
+/// 设置「补全数据源 APK」（Android SAF / scoped 模式）：标记写在工作区根。
+#[tauri::command]
+pub async fn set_lookup_source_apk_scoped<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    folder_id: String,
+    apk_path: String,
+) -> Result<String, String> {
+    let location = apk_path.trim();
+    if location.is_empty() {
+        return Err("未选择 APK 文件".to_string());
+    }
+    if folder_id.trim().is_empty() {
+        return Err("缺少 scoped 目录授权".to_string());
+    }
+    bridge::write_text_file(&app, &folder_id, SOURCE_APK_MARKER, location, false).await?;
+    Ok("已设置补全数据源 APK：事件编辑器将从该 APK 读取文明 / 省份等数据".to_string())
+}
+
 /// 加载事件编辑器「文明 / 政体对照表」（Android SAF/scoped 模式）。
 ///
 /// 与真实路径模式的区别：文明 json 与人物 json 均为按目录批量读取（缺失项跳过），
 /// 其余文本文件读取失败同样按缺失处理；省份等地图数据按候选 assets 前缀定位。
+/// 工作区只有 missions / scenarios 版块（「从 apk 中导入」的结果）时，
+/// 与真实路径模式一样回退到源 APK（标记文件 → 工作区顶层 `*.apk`）。
 #[tauri::command]
 pub async fn load_event_lookup_scoped<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
@@ -1582,6 +1715,28 @@ pub async fn load_event_lookup_scoped<R: tauri::Runtime>(
             buildings,
             diseases,
         ));
+    }
+
+    // 工作区只剩 missions / scenarios 版块（「从 apk 中导入」的结果）：
+    // 其余游戏数据直接从源 APK 读取（标记文件 → 工作区顶层 `*.apk`）。
+    if let Some(archive) = open_scoped_source_apk(&app, &folder_id, &missions_root).await {
+        for candidate in game_dir_candidates(&missions_root) {
+            let Some(base) = apk_base_of_candidate(&candidate) else {
+                continue;
+            };
+            let game_source = ApkSource::new(&archive, &base);
+            if !game_source.has_file(CIV_TAGS_FILE) && !game_source.has_file(GOV_FILE) {
+                continue;
+            }
+            // 候选形如 `…/assets/game` → APK 内 assets 数据根为 `…/assets`。
+            let assets_base = base.strip_suffix("/game").unwrap_or(&base);
+            let assets_source = ApkSource::new(&archive, assets_base);
+            return Ok(load_lookup_from_sources(
+                &game_source,
+                Some(&assets_source),
+                &missions_root,
+            ));
+        }
     }
 
     Ok(EventLookup::default())
@@ -2155,6 +2310,41 @@ mod tests {
         assert_synthetic_lookup(&lookup);
 
         let _ = fs::remove_dir_all(&import_dir);
+        let _ = fs::remove_file(&apk);
+    }
+
+    /// 「指定补全数据 APK」写入工作区根的标记（`set_lookup_source_apk` 的写法）
+    /// 与导入写入的包目录标记一样生效。
+    #[test]
+    fn root_marker_apk_is_used() {
+        let workspace = temp_dir("apk-root-marker");
+        let apk = std::env::temp_dir().join(format!(
+            "ageciv-missions-db-root-{}.apk",
+            std::process::id()
+        ));
+        write_synthetic_source_apk(&apk);
+        let package_dir = workspace.join("测试包");
+        fs::create_dir_all(package_dir.join("assets/game/missions/missionsEvents")).unwrap();
+        // 与命令相同的写法（内容允许带换行）。
+        write_source_apk_marker(&workspace, &format!("{}\n", apk.display())).unwrap();
+
+        let lookup = load_event_lookup_blocking(
+            workspace.to_str().unwrap(),
+            "测试包/assets/game/missions",
+        )
+        .expect("工作区根标记读取失败");
+        assert_synthetic_lookup(&lookup);
+
+        // 标记内容为空 → 不采用（与命令校验一致）。
+        write_source_apk_marker(&workspace, "  \n").unwrap();
+        let empty = load_event_lookup_blocking(
+            workspace.to_str().unwrap(),
+            "测试包/assets/game/missions",
+        )
+        .expect("空标记不应导致报错");
+        assert!(empty.civs.is_empty() && empty.governments.is_empty());
+
+        let _ = fs::remove_dir_all(&workspace);
         let _ = fs::remove_file(&apk);
     }
 }

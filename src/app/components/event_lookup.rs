@@ -9,7 +9,8 @@
 //! - 建筑 / 疾病：定义数组顺序即 ID（疾病名称经根语言表翻译）；
 //! - 人物：`characters/**.json` 的 `Name` 与文件名（供 add_general 系列补全）。
 //!
-//! 供 `event_grid` 为对应值单元格提供 datalist 自动补全与「值 → 名称」对照提示。
+//! 供 `event_grid` 为对应值单元格提供候选补全与「值 → 名称」对照提示：
+//! 桌面端走原生 `<datalist>`，安卓端走 `event_grid::SuggestInput` 页面内自绘下拉（同一套数据）。
 
 use serde::{Deserialize, Serialize};
 use wasm_bindgen_futures::JsFuture;
@@ -179,10 +180,13 @@ pub fn value_parts(key: &str) -> Option<&'static [ValuePart]> {
 		"change_ideology" => &[Gov],
 		"change_ideology_civ" => &[Civ, Gov],
 		"set_civ_tag" | "set_civ_tag_reset" | "player_set_civ" | "annex_civ" | "annexed_by_civ"
-		| "white_peace" | "declare_war" | "white_peace2" | "alliance" | "non_aggression_pact"
-		| "military_access" | "vassalize" => &[Civ],
-		"set_civ_tag2" | "make_puppet" | "declare_war2" | "add_defensive_pact"
-		| "add_guarantee" | "add_truce" => &[Civ, Civ],
+		| "declare_war" | "alliance" | "non_aggression_pact" | "military_access" | "vassalize" => {
+			&[Civ]
+		}
+		// 「文明A=文明B」两段（实测 missionsEvents：declare_war2 3181 处、white_peace 3017 处
+		// 写作 `==` 即两段皆空，其余为 `tagA=tagB`；空段表示按上下文取默认方）。
+		"set_civ_tag2" | "make_puppet" | "declare_war2" | "white_peace" | "white_peace2"
+		| "add_defensive_pact" | "add_guarantee" | "add_truce" => &[Civ, Civ],
 		"annex_by_civ_from_civ" => &[Civ, Civ, Civ],
 		"relation_change" | "relation_set" | "change_religion_civ" | "add_variable_civ"
 		| "remove_variable_civ" | "annex_provinces_from_civ" => &[Civ, Plain],
@@ -272,6 +276,173 @@ pub fn name_hint(lookup: &EventLookup, parts: &[ValuePart], value: &str) -> Stri
 		}
 	}
 	pieces.join(" · ")
+}
+
+// ===== 自绘下拉候选（安卓端替代原生列表弹层；见 event_grid::SuggestInput） =====
+
+/// 候选项匹配排名：0=值前缀，1=值包含，2=说明包含；不匹配返回 `None`。
+fn rank_of(value: &str, label: &str, query: &str) -> Option<u8> {
+	if ci_starts_with(value, query) {
+		return Some(0);
+	}
+	if ci_contains(value, query) {
+		return Some(1);
+	}
+	if !label.is_empty() && ci_contains(label, query) {
+		return Some(2);
+	}
+	None
+}
+
+/// ASCII 不区分大小写前缀判断（非 ASCII 退回 `to_lowercase` 比较）。
+fn ci_starts_with(value: &str, query: &str) -> bool {
+	if value.is_ascii() && query.is_ascii() {
+		value.len() >= query.len()
+			&& value.as_bytes()[..query.len()].eq_ignore_ascii_case(query.as_bytes())
+	} else {
+		value.to_lowercase().starts_with(&query.to_lowercase())
+	}
+}
+
+/// ASCII 不区分大小写包含判断（非 ASCII 退回 `to_lowercase` 比较）。
+fn ci_contains(value: &str, query: &str) -> bool {
+	if value.is_ascii() && query.is_ascii() {
+		query.len() <= value.len()
+			&& value
+				.as_bytes()
+				.windows(query.len())
+				.any(|window| window.eq_ignore_ascii_case(query.as_bytes()))
+	} else {
+		value.to_lowercase().contains(&query.to_lowercase())
+	}
+}
+
+/// 字符串候选过滤（保持原顺序，按「前缀 > 包含 > 说明包含」稳定排序后截断）。
+fn str_rank_filter<'a>(
+	items: impl Iterator<Item = (&'a str, &'a str)>,
+	query: &str,
+	limit: usize,
+) -> Vec<(String, String)> {
+	if query.is_empty() {
+		return items
+			.take(limit)
+			.map(|(value, label)| (value.to_string(), label.to_string()))
+			.collect();
+	}
+	let mut scored: Vec<(u8, String, String)> = Vec::new();
+	for (value, label) in items {
+		if let Some(rank) = rank_of(value, label, query) {
+			scored.push((rank, value.to_string(), label.to_string()));
+		}
+	}
+	scored.sort_by_key(|(rank, _, _)| *rank);
+	scored.truncate(limit);
+	scored
+		.into_iter()
+		.map(|(_, value, label)| (value, label))
+		.collect()
+}
+
+/// 数值 ID 候选过滤（ID 先转字符串再匹配，避免全表预先分配）。
+fn numbered_rank_filter<'a>(
+	items: impl Iterator<Item = (u32, &'a str)>,
+	query: &str,
+	limit: usize,
+) -> Vec<(String, String)> {
+	use std::fmt::Write as _;
+
+	if query.is_empty() {
+		return items
+			.take(limit)
+			.map(|(id, label)| (id.to_string(), label.to_string()))
+			.collect();
+	}
+	let mut scored: Vec<(u8, String, String)> = Vec::new();
+	let mut buffer = String::new();
+	for (id, label) in items {
+		buffer.clear();
+		let _ = write!(&mut buffer, "{id}");
+		if let Some(rank) = rank_of(&buffer, label, query) {
+			scored.push((rank, buffer.clone(), label.to_string()));
+		}
+	}
+	scored.sort_by_key(|(rank, _, _)| *rank);
+	scored.truncate(limit);
+	scored
+		.into_iter()
+		.map(|(_, value, label)| (value, label))
+		.collect()
+}
+
+/// 键候选过滤（选项为「键, 说明」，与说明列同源）。
+pub fn filter_suggestions(
+	options: &[(String, String)],
+	query: &str,
+	limit: usize,
+) -> Vec<(String, String)> {
+	str_rank_filter(
+		options.iter().map(|(value, label)| (value.as_str(), label.as_str())),
+		query,
+		limit,
+	)
+}
+
+/// 对照表候选：按字段类型生成「值, 说明」并过滤（支持按名称/地名搜索，
+/// 如输入「奥」可命中 `atr=奥地利`，输入「上海」可命中对应省份 ID）。
+pub fn matching_lookup(
+	lookup: &EventLookup,
+	kind: ValuePart,
+	query: &str,
+	limit: usize,
+) -> Vec<(String, String)> {
+	match kind {
+		ValuePart::Civ => str_rank_filter(
+			lookup
+				.civs
+				.iter()
+				.map(|item| (item.tag.as_str(), item.name.as_str())),
+			query,
+			limit,
+		),
+		ValuePart::Gov => numbered_rank_filter(
+			lookup
+				.governments
+				.iter()
+				.map(|item| (item.index, item.name.as_str())),
+			query,
+			limit,
+		),
+		ValuePart::Province | ValuePart::ProvinceSemi => numbered_rank_filter(
+			lookup
+				.provinces
+				.iter()
+				.map(|item| (item.id, item.name.as_str())),
+			query,
+			limit,
+		),
+		ValuePart::Building => numbered_rank_filter(
+			lookup
+				.buildings
+				.iter()
+				.map(|item| (item.id, item.name.as_str())),
+			query,
+			limit,
+		),
+		ValuePart::Disease => numbered_rank_filter(
+			lookup
+				.diseases
+				.iter()
+				.map(|item| (item.id, item.name.as_str())),
+			query,
+			limit,
+		),
+		ValuePart::Character => str_rank_filter(
+			lookup.characters.iter().map(|name| (name.as_str(), "")),
+			query,
+			limit,
+		),
+		ValuePart::Plain => Vec::new(),
+	}
 }
 
 /// 对照表缓存键：同一游戏数据目录（全局与各剧本资源根共享 `assets/game`）只需加载一次。
@@ -427,6 +598,11 @@ mod tests {
 		assert_eq!(value_parts("civ_is_vassal_of_civ"), Some(civ_pair));
 		assert_eq!(value_parts("change_ideology"), Some(gov));
 		assert_eq!(value_parts("change_ideology_civ"), Some(civ_gov));
+		// 白和平 / 宣战2：实测 missionsEvents 为「文明A=文明B」（如 `bul=tur_n`、`atr=ita`；
+		// 多数写作 `==` 两空段），因此按两段文明渲染。
+		assert_eq!(value_parts("white_peace"), Some(civ_pair));
+		assert_eq!(value_parts("white_peace2"), Some(civ_pair));
+		assert_eq!(value_parts("declare_war2"), Some(civ_pair));
 		// 与文明/政体无关的键不参与。
 		assert_eq!(value_parts("gold"), None);
 		assert_eq!(value_parts("legacy"), None);
@@ -541,5 +717,65 @@ mod tests {
 		// 全局根 / 经典根：无地图上下文。
 		assert_eq!(scenario_map_key("包名/assets/game/missions"), "");
 		assert_eq!(scenario_map_key("missions"), "");
+	}
+
+	#[test]
+	fn lookup_filter_ranks_prefix_then_contains_then_label() {
+		let lookup = sample_lookup();
+		// 值前缀优先；「fra」前缀命中 fra，其余（含说明/名称包含）排后。
+		let matched = matching_lookup(&lookup, ValuePart::Civ, "fra", 10);
+		assert_eq!(matched[0], ("fra".to_string(), "法兰西".to_string()));
+		// 名称包含：输入中文命中对应 tag。
+		let matched = matching_lookup(&lookup, ValuePart::Civ, "奥", 10);
+		assert_eq!(matched, vec![("atr".to_string(), "奥地利".to_string())]);
+		// 大小写不敏感。
+		let matched = matching_lookup(&lookup, ValuePart::Civ, "AT", 10);
+		assert_eq!(matched[0], ("atr".to_string(), "奥地利".to_string()));
+		// 无匹配时为空。
+		assert!(matching_lookup(&lookup, ValuePart::Civ, "zzz", 10).is_empty());
+	}
+
+	#[test]
+	fn lookup_filter_handles_ids_names_and_limits() {
+		let lookup = sample_lookup();
+		// 省份：数字前缀。
+		let matched = matching_lookup(&lookup, ValuePart::Province, "347", 10);
+		assert_eq!(matched[0], ("3475".to_string(), "北平".to_string()));
+		// 省份：地名包含（空名称条目仍可命中 ID）。
+		let matched = matching_lookup(&lookup, ValuePart::Province, "12049", 10);
+		assert_eq!(matched, vec![("12049".to_string(), String::new())]);
+		// 政体 / 建筑 / 疾病 / 人物。
+		let matched = matching_lookup(&lookup, ValuePart::Gov, "专制", 10);
+		assert_eq!(matched, vec![("10".to_string(), "专制主义".to_string())]);
+		let matched = matching_lookup(&lookup, ValuePart::Building, "要塞", 10);
+		assert_eq!(matched, vec![("6".to_string(), "要塞".to_string())]);
+		let matched = matching_lookup(&lookup, ValuePart::Disease, "0", 10);
+		assert_eq!(matched[0], ("0".to_string(), "黑死病".to_string()));
+		let matched = matching_lookup(&lookup, ValuePart::Character, "霞", 10);
+		assert_eq!(matched, vec![("约瑟夫·霞飞".to_string(), String::new())]);
+		// 空查询取前 limit 条；Plain 无候选。
+		let matched = matching_lookup(&lookup, ValuePart::Civ, "", 2);
+		assert_eq!(matched.len(), 2);
+		assert!(matching_lookup(&lookup, ValuePart::Plain, "atr", 10).is_empty());
+	}
+
+	#[test]
+	fn key_suggestion_filter_matches_value_and_note() {
+		let options = vec![
+			("id".to_string(), "事件唯一标识".to_string()),
+			("image".to_string(), "国策显示照片".to_string()),
+			("mission_image".to_string(), "国策完成照片".to_string()),
+		];
+		// 值前缀优先于值包含。
+		let matched = filter_suggestions(&options, "image", 10);
+		assert_eq!(matched[0].0, "image");
+		assert_eq!(matched[1].0, "mission_image");
+		// 说明包含。
+		let matched = filter_suggestions(&options, "完成", 10);
+		assert_eq!(matched, vec![("mission_image".to_string(), "国策完成照片".to_string())]);
+		// 空查询取前 limit 条（保持原顺序）。
+		let matched = filter_suggestions(&options, "", 2);
+		assert_eq!(matched.len(), 2);
+		assert_eq!(matched[0].0, "id");
 	}
 }

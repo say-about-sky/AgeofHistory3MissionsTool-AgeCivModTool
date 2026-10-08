@@ -6,8 +6,12 @@
 //! - 收益选项块（可增删选项，选项内可增删效果行）。
 //!
 //! 表格列为：键 | 值 | 说明 | 删除。
-//! 键输入提供 Schema 自动补全，值按类型渲染（bool 为下拉框，其余文本），
+//! 键输入提供 Schema 自动补全（候选标签即「说明」，选择时可直接看到各键含义），
+//! 值按类型渲染（bool 为下拉框，其余文本），
 //! 与 Schema 类型不符的单元格红框提示，保存时仍会原样写入。
+//!
+//! 候选 UI 双轨：桌面端用原生 `datalist` / `select`（`native_autocomplete = true`）；
+//! 安卓端统一改用页面内自绘下拉（原生弹层定位不可靠），见 [`SuggestInput`] 的行为契约注释。
 //! 文明ID / tag / civ 与政体整数字段：值按 `=` 分段渲染，各段挂 datalist 候选，
 //! 并在下方显示「值 → 名称」对照提示（数据来自 `event_lookup` 对照表）。
 
@@ -71,8 +75,18 @@ fn push_used_keys<'a>(entries: impl Iterator<Item = &'a EntryLine>, keys: &mut V
 	}
 }
 
-/// 头部三组的自动补全候选（必填+可填 Schema 键，加当前使用的未知键）。
-fn header_suggestions(event: &MissionEvent) -> Vec<String> {
+/// 给候选键附加「说明」标签（与表格说明列同一来源；未知键为「未识别键」提示）。
+fn with_notes(keys: Vec<String>) -> Vec<(String, String)> {
+	keys.into_iter()
+		.map(|key| {
+			let note = note_for(&key);
+			(key, note)
+		})
+	.collect()
+}
+
+/// 头部三组的自动补全候选（必填+可填 Schema 键，加当前使用的未知键），带说明标签。
+fn header_suggestions(event: &MissionEvent) -> Vec<(String, String)> {
 	let mut keys: Vec<String> = event_schema::all_specs()
 		.filter(|spec| {
 			matches!(
@@ -83,10 +97,10 @@ fn header_suggestions(event: &MissionEvent) -> Vec<String> {
 		.map(|spec| spec.key.to_string())
 		.collect();
 	push_used_keys(event.header.iter(), &mut keys);
-	keys
+	with_notes(keys)
 }
 
-fn trigger_suggestions(event: &MissionEvent) -> Vec<String> {
+fn trigger_suggestions(event: &MissionEvent) -> Vec<(String, String)> {
 	let mut keys: Vec<String> = event_schema::all_specs()
 		.filter(|spec| spec.category == FieldCategory::Trigger)
 		.map(|spec| spec.key.to_string())
@@ -94,10 +108,10 @@ fn trigger_suggestions(event: &MissionEvent) -> Vec<String> {
 	for block in &event.triggers {
 		push_used_keys(block.conditions.iter(), &mut keys);
 	}
-	keys
+	with_notes(keys)
 }
 
-fn effect_suggestions(event: &MissionEvent) -> Vec<String> {
+fn effect_suggestions(event: &MissionEvent) -> Vec<(String, String)> {
 	let mut keys: Vec<String> = event_schema::all_specs()
 		.filter(|spec| spec.category == FieldCategory::Effect)
 		.map(|spec| spec.key.to_string())
@@ -105,42 +119,318 @@ fn effect_suggestions(event: &MissionEvent) -> Vec<String> {
 	for block in &event.options {
 		push_used_keys(block.effects.iter(), &mut keys);
 	}
-	keys
+	with_notes(keys)
 }
 
 /// 值单元格中的一个分段输入框（文明/政体/省份等字段按 `=` 拆分后各占一段，
-/// 分别挂对应的 datalist 提供自动补全；`suffix` 为拼接时自动附加的固定后缀）。
+/// 分别挂对应的候选列表提供自动补全；`suffix` 为拼接时自动附加的固定后缀）。
+/// 桌面端用原生 `datalist`（`kind` 决定候选表）；安卓端原生弹层定位不可靠
+/// （页面滚动 / 软键盘弹出后上/下都会错位，旧 WebView 还不支持 datalist），
+/// 改用页面内自绘下拉（见 [`SuggestInput`]）。
 #[component]
 fn ValuePartInput(
 	text: String,
-	list_id: &'static str,
+	kind: ValuePart,
 	suffix: &'static str,
 	invalid: bool,
 	segment_index: usize,
 	full_value: String,
+	native_autocomplete: bool,
+	lookup: Shared<EventLookup>,
 	on_value: EventHandler<String>,
 ) -> Element {
+	let on_text = EventHandler::new(move |new_text: String| {
+		on_value.call(event_lookup::replace_value_part(
+			&full_value,
+			segment_index,
+			suffix,
+			&new_text,
+		));
+	});
+	let list_id = datalist_id(kind);
 	rsx! {
-        input {
-            class: if invalid { "event-cell-input invalid" } else { "event-cell-input" },
-            value: "{text}",
-            list: "{list_id}",
-            spellcheck: "false",
-            oninput: move |evt: FormEvent| {
-                let joined = event_lookup::replace_value_part(
-                    &full_value,
-                    segment_index,
-                    suffix,
-                    &evt.value(),
-                );
-                on_value.call(joined);
-            },
+        if native_autocomplete {
+            input {
+                class: if invalid { "event-cell-input invalid" } else { "event-cell-input" },
+                value: "{text}",
+                list: "{list_id}",
+                spellcheck: "false",
+                oninput: move |evt: FormEvent| on_text.call(evt.value()),
+            }
+        } else {
+            SuggestInput {
+                text,
+                options: SuggestOptions::Lookup(lookup, kind),
+                invalid,
+                on_value: on_text,
+                on_focus: move |_| {},
+                on_blur: move |_| {},
+            }
         }
     }
 }
 
-/// 文明 / 政体候选列表（独立组件：对照表不变时按 `Shared` 指针判定跳过重渲染，
-/// 避免数千条候选在每次输入时反复 diff）。
+// ===== 自绘候选下拉（安卓端替代原生列表弹层） =====
+//
+// 为什么：安卓 WebView 的原生列表弹层（`<datalist>` 候选、`<select>` 选项）是浏览器 /
+// 系统原生窗口，按屏幕坐标 + 锚点定位，页面滚动或软键盘弹出（WebView 尺寸变化）后
+// 上/下都会错位；旧版 WebView 还不支持 `<datalist>`。自绘下拉是页面内 DOM，
+// 位置始终跟随输入框，且触屏交互可控。
+//
+// 【新增一处自绘下拉】
+//   1. 选候选来源：静态枚举用 [`SuggestOptions::Fixed`]；表格键候选用 [`SuggestOptions::Keys`]；
+//      对照表（文明/省份等）候选用 [`SuggestOptions::Lookup`]。需要新来源时在
+//      `SuggestOptions` 加变体，并在 `SuggestInput` 内 `suggestions` 计算处加分支
+//      （输出「值, 说明」二元组；过滤复用 `event_lookup::filter_suggestions` /
+//      `matching_lookup`，空值项会以「仅标签」形式展示，用于「（留空）」这类选项）。
+//   2. 渲染 `SuggestInput { text, options, invalid, on_value, on_focus, on_blur }`：
+//      `text` 为受控显示文本；`on_value` 回传所选/输入的文本，由调用方写回模型；
+//      `on_focus` / `on_blur` 供调用方额外记账（如键行的冻结分组），无需求传 `move |_| {}`。
+//   3. 桌面端保留原生控件时用 `native_autocomplete` 开关分支（见 `GridRow` 与触发块控件）。
+//
+// 【层级与裁剪】`.suggest-wrap`（展开时 z26）内含：遮罩 z24 / 输入框 z25 / 列表 z30；
+//   分区的 `overflow` 裁剪切由 `.event-grid.suggest-overlay` 解除；展开方向与限高由
+//   实测空间控制（`.suggest-list-up` 向上展开）。
+//
+// 【交互契约】修改前先读 [`SuggestInput`] 的文档注释，避免破坏触屏行为。
+
+/// 自绘下拉的候选来源。
+#[derive(Clone, PartialEq)]
+enum SuggestOptions {
+	/// 固定候选（静态枚举，如 true/false、触发块类型、连接方式）。
+	Fixed(&'static [(&'static str, &'static str)]),
+	/// 键候选（键, 说明）——由表格分区提供。
+	Keys(Shared<Vec<(String, String)>>),
+	/// 对照表候选——按字段类型实时过滤（值, 名称）。
+	Lookup(Shared<EventLookup>, ValuePart),
+}
+
+/// 布尔值候选（空值项的「（留空）」选项以仅标签形式展示，选择后清空输入框）。
+const BOOL_OPTIONS: &[(&str, &str)] = &[("", "（留空）"), ("true", ""), ("false", "")];
+
+/// 触发块类型候选（自绘模式显示短名；写回文件时仍用 `trigger_*` 全名）。
+const TRIGGER_KIND_OPTIONS: &[(&str, &str)] = &[
+	("and", "与条件块"),
+	("or", "或条件块"),
+	("and_not", "与非条件块"),
+];
+
+/// 块首连接操作符候选（空值项 = 不写连接行）。
+const TRIGGER_JOIN_OPTIONS: &[(&str, &str)] = &[
+	("next_and", "与（默认）"),
+	("next_or", "或"),
+	("next_and_not", "与非"),
+	("", "（不写）"),
+];
+
+/// 触发块类型短名（自绘下拉的显示文本；与旧原生 select 的显示标签一致）。
+fn trigger_kind_short(kind: TriggerKind) -> &'static str {
+	match kind {
+		TriggerKind::And => "and",
+		TriggerKind::Or => "or",
+		TriggerKind::AndNot => "and_not",
+	}
+}
+
+/// 短名或全名 → 触发块类型（未知按 `And` 兜底，与 `TriggerKind::from_open_token` 一致；
+/// 比较不区分大小写，容手输）。
+fn trigger_kind_from_text(text: &str) -> TriggerKind {
+	match text.trim().to_ascii_lowercase().as_str() {
+		"trigger_or" | "or" => TriggerKind::Or,
+		"trigger_and_not" | "and_not" => TriggerKind::AndNot,
+		_ => TriggerKind::And,
+	}
+}
+
+/// 测量展开方向的空间脚本（在 dioxus 包装的 async 函数内执行，支持顶层 await）：
+/// 先即时测一次；`__DELAY__` 毫秒后复测（等软键盘弹出引起的视口变化稳定）。
+/// 返回 `[下方可用高度, 上方可用高度]`（相对 `.event-grid` 滚动视口；测量失败返回充足值）。
+const DROP_SPACE_SCRIPT: &str = r#"
+const el = document.activeElement;
+if (!el || el.tagName !== 'INPUT') return [9999, 0];
+await new Promise((resolve) => setTimeout(resolve, __DELAY__));
+if (document.activeElement !== el) return [9999, 0];
+const rect = el.getBoundingClientRect();
+const pane = el.closest('.event-grid') || document.documentElement;
+const bounds = pane.getBoundingClientRect();
+return [bounds.bottom - rect.bottom, rect.top - bounds.top];
+"#;
+
+/// 返回（下方、上方）可用高度；脚本执行失败返回 `None`（保持当前方向）。
+async fn measure_drop_space(delay_ms: u32) -> Option<(f64, f64)> {
+    let script = DROP_SPACE_SCRIPT.replace("__DELAY__", &delay_ms.to_string());
+    dioxus::document::eval(&script).join::<(f64, f64)>().await.ok()
+}
+
+/// 点选判定阈值（px）：松手位移超过即视为拖动 / 滚动，不提交选中。
+const TAP_SLOP: f64 = 12.0;
+
+/// 自绘候选下拉输入框（安卓端替代原生 `<datalist>` / `<select>` 弹层）。
+///
+/// 安卓 WebView 的原生弹层是浏览器原生窗口，按屏幕坐标 + 锚点定位，页面滚动 /
+/// 软键盘弹出（WebView 尺寸变化）后会按错误偏移量放置（向上/向下都会偏）；
+/// 改为页面内绝对定位的下拉后，位置始终跟随输入框。
+///
+/// # 行为契约（修改前必读，均为触屏实测后的选择）
+///
+/// 1. **松手提交**：`pointerdown` 只记录起点，`pointerup` 位移 ≤ `TAP_SLOP` 才选中；
+///    拖动超阈值或 `pointercancel`（浏览器判定为滚动）不选中，列表保持打开可继续滚。
+///    触摸的 `pointerdown` 不能 `preventDefault`（否则滚动失效）；鼠标 / 触控笔则相反，
+///    要在按下时 `preventDefault`（它们按下瞬间就夺焦，键行会中途重新分组致下拉卸载）。
+/// 2. **失焦不关闭**：滚动列表 / 点按候选都会让输入框失焦；关闭只由遮罩点击、选中、Esc 触发。
+///    若改回「失焦即关」，触摸滚动点选将丢失（松手前列表已被卸载）。
+/// 3. **遮罩模式**：展开时铺全屏 `.suggest-backdrop`（点按关闭）。展开的 wrap 提升层级
+///    （`.suggest-wrap-open`），保证输入框（z25）与列表（z30）在遮罩（z24）之上。
+///    因此列表是「模态候选」：先点空白关闭、再点其他控件（移动端点选器惯例）。
+/// 4. **触摸点选抑制兼容鼠标事件**（item `touchend` preventDefault）：防止松手后列表
+///    卸载时「幽灵点击」落到下层元素（如行尾删除按钮）；滚动手势走 pointercancel 不受影响。
+/// 5. **展开方向自适应**：聚焦时 [`measure_drop_space`] 即刻实测 + 320ms 复测（等软键盘 /
+///    视口稳定），`below < 214 && above > below + 24` 时向上展开（`.suggest-list-up`），
+///    并按所向空间内联 `max-height`；`measure_generation` 纪元用于丢弃过期结果。
+/// 6. **按需过滤**：候选项仅在展开时计算（同一时刻只有一个输入框展开，避免大对照表反复扫描）。
+#[component]
+fn SuggestInput(
+	text: String,
+	options: SuggestOptions,
+	invalid: bool,
+	on_value: EventHandler<String>,
+	on_focus: EventHandler<()>,
+	on_blur: EventHandler<()>,
+) -> Element {
+	let mut open = use_signal(|| false);
+	// 按压起点（逻辑坐标）：用于区分「点选」（松手位移很小）与「拖动滚动」。
+	let mut press_start = use_signal(|| None::<(f64, f64)>);
+	// 展开方向与限高（实测值；测量失败时保持 208/向下）。
+	let drop_up = use_signal(|| false);
+	let drop_height = use_signal(|| 208.0_f64);
+	// 测量纪元：重新聚焦时旧的后继复测结果作废。
+	let mut measure_generation = use_signal(|| 0_u64);
+	let suggestions: Vec<(String, String)> = if *open.read() {
+		match &options {
+			SuggestOptions::Fixed(items) => {
+				let items: Vec<(String, String)> = items
+					.iter()
+					.map(|(value, label)| (value.to_string(), label.to_string()))
+					.collect();
+				event_lookup::filter_suggestions(&items, &text, 60)
+			}
+			SuggestOptions::Keys(list) => event_lookup::filter_suggestions(list, &text, 60),
+			SuggestOptions::Lookup(lookup, kind) => {
+				event_lookup::matching_lookup(lookup, *kind, &text, 60)
+			}
+		}
+	} else {
+		Vec::new()
+	};
+	let drop_height_value = *drop_height.read();
+	rsx! {
+        div { class: if *open.read() { "suggest-wrap suggest-wrap-open" } else { "suggest-wrap" },
+            input {
+                class: if invalid { "event-cell-input invalid" } else { "event-cell-input" },
+                value: "{text}",
+                spellcheck: "false",
+                autocomplete: "off",
+                autocapitalize: "none",
+                oninput: move |evt: FormEvent| on_value.call(evt.value()),
+                onfocus: move |_| {
+                    open.set(true);
+                    on_focus.call(());
+                    // 即时测一次 + 延迟复测（等软键盘弹出后的视口稳定）。
+                    let generation = measure_generation
+                        .with_mut(|value| {
+                            *value = value.wrapping_add(1);
+                            *value
+                        });
+                    let open = open;
+                    let mut drop_up = drop_up; // 已关闭或已重新聚焦（新一轮测量）：丢弃本次结果。
+                    let mut drop_height = drop_height;
+                    spawn(async move {
+                        for delay in [0_u32, 320] {
+                            let Some((below, above)) = measure_drop_space(delay).await else {
+                                continue;
+                            };
+                            if *measure_generation.peek() != generation || !*open.peek() {
+                                return;
+                            }
+                            let flip = below < 214.0 && above > below + 24.0;
+                            drop_up.set(flip);
+                            let room = if flip { above } else { below };
+                            drop_height.set((room - 6.0).clamp(96.0, 208.0));
+                        }
+                    });
+                },
+                // 失焦不关闭：滚动或点按列表都会使输入框失焦，关闭交给遮罩 / 选择 / Esc。
+                onblur: move |_| on_blur.call(()),
+                onkeydown: move |evt: Event<KeyboardData>| {
+                    if evt.key() == Key::Escape {
+                        open.set(false);
+                    }
+                },
+            }
+            if *open.read() {
+                // 全屏遮罩：点按空白处关闭下拉（移动端通用模式），并避免手势误触下层界面。
+                div {
+                    class: "suggest-backdrop",
+                    onpointerdown: move |_| open.set(false),
+                }
+            }
+            if *open.read() && !suggestions.is_empty() {
+                div {
+                    class: if *drop_up.read() { "suggest-list suggest-list-up" } else { "suggest-list" },
+                    style: "max-height: {drop_height_value:.0}px;",
+                    for (item_value , item_label) in suggestions {
+                        div {
+                            class: "suggest-item",
+                            // 记录按压起点；不在 pointerdown 选中：轻触即选会让滚动无从下手。
+                            onpointerdown: move |evt: Event<PointerData>| {
+                                // 鼠标 / 触控笔的焦点变化发生在按下瞬间 → 阻止默认以免中途
+                                // 失焦重排（如键行重新分组导致下拉被卸载）；触摸不阻止，
+                                // 保证列表可以滚动（触摸焦点变化在松手之后，不影响点选）。
+                                let pointer = evt.data().pointer_type();
+                                if pointer == "mouse" || pointer == "pen" {
+                                    evt.prevent_default();
+                                }
+                                let point = evt.client_coordinates();
+                                press_start.set(Some((point.x, point.y)));
+                            },
+                            onpointerup: move |evt: Event<PointerData>| {
+                                let start = *press_start.peek();
+                                press_start.set(None);
+                                let point = evt.client_coordinates();
+                                let tapped = start
+                                    .is_some_and(|(x, y)| {
+                                        ((point.x - x).powi(2) + (point.y - y).powi(2)).sqrt() <= TAP_SLOP
+                                    });
+                                if tapped {
+                                    on_value.call(item_value.clone());
+                                    open.set(false);
+                                }
+                            },
+                            // 浏览器把触摸判定为滚动时触发：本次手势不算点选。
+                            onpointercancel: move |_| press_start.set(None),
+                            // 触摸点选不生成兼容鼠标事件（click 等）：避免松手后列表卸载时
+                            //「幽灵点击」落到下层元素（如行尾的删除按钮），同时输入框不失焦、
+                            // 键盘不收起；滚动手势走 pointercancel 路径，不受影响。
+                            ontouchend: move |evt: Event<TouchData>| evt.prevent_default(),
+                            // 空值项（如「（留空）」「（不写）」）只显示标签，选中即清空。
+                            if item_value.is_empty() {
+                                span { class: "suggest-item-value", "{item_label}" }
+                            } else {
+                                span { class: "suggest-item-value", "{item_value}" }
+                                if !item_label.is_empty() {
+                                    span { class: "suggest-item-label", "{item_label}" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 文明 / 政体候选列表（桌面端原生 `datalist`；独立组件：对照表不变时按 `Shared`
+/// 指针判定跳过重渲染，避免数千条候选在每次输入时反复 diff）。
 #[component]
 fn LookupDatalists(lookup: Shared<EventLookup>) -> Element {
 	rsx! {
@@ -190,6 +480,8 @@ fn GridRow(
 	invalid: bool,
 	note: String,
 	datalist: &'static str,
+	options: Shared<Vec<(String, String)>>,
+	native_autocomplete: bool,
 	lookup: Shared<EventLookup>,
 	show_delete: bool,
 	key_readonly: bool,
@@ -214,9 +506,9 @@ fn GridRow(
 	let hint = parts
 		.map(|parts| name_hint(&lookup, parts, &value))
 		.unwrap_or_default();
-	// 分段渲染数据：（段索引、显示文本、候选列表、固定后缀）。
+	// 分段渲染数据：（段索引、显示文本、语义类型、固定后缀）。
 	// 固定后缀（如 province_add_building 的 `;`）只在拼接时写出，显示时隐藏。
-	let segment_render: Vec<(usize, String, &'static str, &'static str)> = (0..segment_count)
+	let segment_render: Vec<(usize, String, ValuePart, &'static str)> = (0..segment_count)
 		.map(|index| {
 			let kind = parts
 				.map(|parts| parts.get(index).copied().unwrap_or(ValuePart::Plain))
@@ -228,47 +520,81 @@ fn GridRow(
 			} else {
 				raw.strip_suffix(suffix).unwrap_or(&raw).to_string()
 			};
-			(index, text, datalist_id(kind), suffix)
+			(index, text, kind, suffix)
 		})
 		.collect();
 	rsx! {
         div { class: "event-grid-row",
             div { class: "event-cell event-cell-key",
-                input {
-                    class: "event-cell-input",
-                    list: "{datalist}",
-                    value: "{field_key}",
-                    spellcheck: "false",
-                    readonly: key_readonly,
-                    title: "{key_title}",
-                    oninput: move |evt: FormEvent| on_key.call(evt.value()),
-                    onfocus: move |_| on_key_focus.call(()),
-                    onblur: move |_| on_key_blur.call(()),
+                if native_autocomplete {
+                    input {
+                        class: "event-cell-input",
+                        list: "{datalist}",
+                        value: "{field_key}",
+                        spellcheck: "false",
+                        readonly: key_readonly,
+                        title: "{key_title}",
+                        oninput: move |evt: FormEvent| on_key.call(evt.value()),
+                        onfocus: move |_| on_key_focus.call(()),
+                        onblur: move |_| on_key_blur.call(()),
+                    }
+                } else if key_readonly {
+                    input {
+                        class: "event-cell-input",
+                        value: "{field_key}",
+                        spellcheck: "false",
+                        readonly: true,
+                        title: "{key_title}",
+                    }
+                } else {
+                    SuggestInput {
+                        text: field_key.clone(),
+                        options: SuggestOptions::Keys(options.clone()),
+                        invalid: false,
+                        on_value: move |new_key: String| on_key.call(new_key),
+                        on_focus: move |_| on_key_focus.call(()),
+                        on_blur: move |_| on_key_blur.call(()),
+                    }
                 }
             }
             div { class: "event-cell event-cell-value",
+                // Bool 值：桌面端用原生 select；安卓端也走自绘（统一内联体验，
+                // 并保留「（留空）」空值项——空值项以仅标签形式展示，选中即清空）。
                 if input_kind == CellInput::Bool {
-                    select {
-                        class: if invalid { "event-cell-input invalid" } else { "event-cell-input" },
-                        value: "{value}",
-                        oninput: move |evt: FormEvent| on_value.call(evt.value()),
-                        option { value: "", "（留空）" }
-                        option { value: "true", "true" }
-                        option { value: "false", "false" }
+                    if native_autocomplete {
+                        select {
+                            class: if invalid { "event-cell-input invalid" } else { "event-cell-input" },
+                            value: "{value}",
+                            oninput: move |evt: FormEvent| on_value.call(evt.value()),
+                            option { value: "", "（留空）" }
+                            option { value: "true", "true" }
+                            option { value: "false", "false" }
+                        }
+                    } else {
+                        SuggestInput {
+                            text: value.clone(),
+                            options: SuggestOptions::Fixed(BOOL_OPTIONS),
+                            invalid,
+                            on_value,
+                            on_focus: move |_| {},
+                            on_blur: move |_| {},
+                        }
                     }
                 } else if parts.is_some() {
                     div { class: "event-value-parts",
-                        for (index , text , list_id , suffix) in segment_render {
+                        for (index , text , kind , suffix) in segment_render {
                             if index > 0 {
                                 span { class: "event-value-sep", "=" }
                             }
                             ValuePartInput {
                                 text,
-                                list_id,
+                                kind,
                                 suffix,
                                 invalid,
                                 segment_index: index,
                                 full_value: value.clone(),
+                                native_autocomplete,
+                                lookup: lookup.clone(),
                                 on_value,
                             }
                         }
@@ -332,6 +658,8 @@ fn GridSection(
 	title: String,
 	rows: Vec<(usize, String, String)>,
 	datalist: &'static str,
+	options: Shared<Vec<(String, String)>>,
+	native_autocomplete: bool,
 	lookup: Shared<EventLookup>,
 	can_add: bool,
 	can_remove: bool,
@@ -368,6 +696,8 @@ fn GridSection(
                     invalid: is_invalid(&key, &value),
                     note: note_for(&key),
                     datalist,
+                    options: options.clone(),
+                    native_autocomplete,
                     lookup: lookup.clone(),
                     show_delete: can_remove,
                     key_readonly: !editable_key,
@@ -403,8 +733,14 @@ fn mutate_event(event: Signal<Option<MissionEvent>>, f: impl FnOnce(&mut Mission
 
 /// 特化 Excel 表格编辑器。直接编辑 `MissionEvent` 信号。
 /// `lookup` 为文明/政体对照表（事件面板加载后传入，供值单元格补全与名称提示）。
+/// `native_autocomplete` 为 true 时（桌面端）用原生 `datalist`；安卓端改用页面内
+/// 自绘下拉（原生弹层在滚动/软键盘后上/下都会错位）。
 #[component]
-pub fn EventGrid(event: Signal<Option<MissionEvent>>, lookup: Shared<EventLookup>) -> Element {
+pub fn EventGrid(
+	event: Signal<Option<MissionEvent>>,
+	lookup: Shared<EventLookup>,
+	native_autocomplete: bool,
+) -> Element {
 	let mut editing_key: Signal<Option<(usize, HeaderGroup)>> = use_signal(|| None);
 	let snapshot = event.read().clone();
 	let Some(data) = snapshot else {
@@ -436,6 +772,10 @@ pub fn EventGrid(event: Signal<Option<MissionEvent>>, lookup: Shared<EventLookup
 	let header_datalist = header_suggestions(&data);
 	let trigger_datalist = trigger_suggestions(&data);
 	let effect_datalist = effect_suggestions(&data);
+	// 安卓自绘下拉的键候选（Shared 指针供各行/各输入框共享，避免逐行深拷贝）。
+	let header_options = Shared::new(header_datalist.clone());
+	let trigger_options = Shared::new(trigger_datalist.clone());
+	let effect_options = Shared::new(effect_datalist.clone());
 
 	// ===== 头部字段编辑 =====
 	// 通过 mutate_event 共享访问，保证闭包是 Fn（可被多个表格分区复用）。
@@ -612,32 +952,36 @@ pub fn EventGrid(event: Signal<Option<MissionEvent>>, lookup: Shared<EventLookup
 	let option_blocks = data.options.clone();
 
 	rsx! {
-        div { class: "event-grid",
-            // 自动补全候选（每个分区类型一个 datalist）
-            datalist { id: "evdl-header",
-                for key in header_datalist {
-                    option { value: "{key}" }
+        div { class: if native_autocomplete { "event-grid" } else { "event-grid suggest-overlay" },
+            // 桌面端：原生 datalist 候选（选项标签为「说明」提示）；安卓端改用自绘下拉。
+            if native_autocomplete {
+                datalist { id: "evdl-header",
+                    for (key , note) in header_datalist {
+                        option { value: "{key}", "{note}" }
+                    }
                 }
-            }
-            datalist { id: "evdl-trigger",
-                for key in trigger_datalist {
-                    option { value: "{key}" }
+                datalist { id: "evdl-trigger",
+                    for (key , note) in trigger_datalist {
+                        option { value: "{key}", "{note}" }
+                    }
                 }
-            }
-            datalist { id: "evdl-effect",
-                for key in effect_datalist {
-                    option { value: "{key}" }
+                datalist { id: "evdl-effect",
+                    for (key , note) in effect_datalist {
+                        option { value: "{key}", "{note}" }
+                    }
                 }
-            }
-            // 文明 / 政体值候选（供值单元格分段输入框引用；无数据时不渲染）
-            if !lookup.is_empty() {
-                LookupDatalists { lookup: lookup.clone() }
+                // 文明 / 政体值候选（供值单元格分段输入框引用；无数据时不渲染）
+                if !lookup.is_empty() {
+                    LookupDatalists { lookup: lookup.clone() }
+                }
             }
 
             GridSection {
                 title: "必填项目".to_string(),
                 rows: required_rows,
                 datalist: "evdl-header",
+                options: header_options.clone(),
+                native_autocomplete,
                 lookup: lookup.clone(),
                 can_add: false,
                 can_remove: false,
@@ -654,6 +998,8 @@ pub fn EventGrid(event: Signal<Option<MissionEvent>>, lookup: Shared<EventLookup
                 title: "可填项目".to_string(),
                 rows: optional_rows,
                 datalist: "evdl-header",
+                options: header_options.clone(),
+                native_autocomplete,
                 lookup: lookup.clone(),
                 can_add: true,
                 can_remove: true,
@@ -670,6 +1016,8 @@ pub fn EventGrid(event: Signal<Option<MissionEvent>>, lookup: Shared<EventLookup
                 title: "其他（未识别字段）".to_string(),
                 rows: unknown_rows,
                 datalist: "evdl-header",
+                options: header_options.clone(),
+                native_autocomplete,
                 lookup: lookup.clone(),
                 can_add: true,
                 can_remove: true,
@@ -685,41 +1033,76 @@ pub fn EventGrid(event: Signal<Option<MissionEvent>>, lookup: Shared<EventLookup
 
             for (block_index , block) in trigger_blocks.iter().enumerate() {
                 section { class: "event-section",
-                    div { class: "event-section-title",
+                    div { class: "event-section-title event-section-title-block",
                         span { "触发条件 #{block_index + 1}" }
                         div { class: "event-block-controls",
-                            label { "块类型" }
-                            select {
-                                class: "event-block-select",
-                                value: "{block.kind.open_token()}",
-                                oninput: move |evt: FormEvent| {
-                                    set_trigger_kind((block_index, TriggerKind::from_open_token(&evt.value())));
-                                },
-                                option { value: "trigger_and", "and" }
-                                option { value: "trigger_or", "or" }
-                                option { value: "trigger_and_not", "and_not" }
+                            // 标签 + 控件成对成组：窄面板换行时不会把标签与控件拆到两行。
+                            span { class: "event-block-pair",
+                                label { "块类型" }
+                                if native_autocomplete {
+                                    select {
+                                        class: "event-block-select",
+                                        value: "{block.kind.open_token()}",
+                                        oninput: move |evt: FormEvent| {
+                                            set_trigger_kind((block_index, TriggerKind::from_open_token(&evt.value())));
+                                        },
+                                        option { value: "trigger_and", "and" }
+                                        option { value: "trigger_or", "or" }
+                                        option { value: "trigger_and_not", "and_not" }
+                                    }
+                                } else {
+                                    // 安卓自绘：显示短名（与原生 select 标签一致），写回时映射回类型。
+                                    SuggestInput {
+                                        text: trigger_kind_short(block.kind).to_string(),
+                                        options: SuggestOptions::Fixed(TRIGGER_KIND_OPTIONS),
+                                        invalid: false,
+                                        on_value: move |text: String| {
+                                            set_trigger_kind((block_index, trigger_kind_from_text(&text)));
+                                        },
+                                        on_focus: move |_| {},
+                                        on_blur: move |_| {},
+                                    }
+                                }
                             }
-                            label { "连接" }
-                            select {
-                                class: "event-block-select",
-                                value: "{block.join.map_or(String::new(), |join| join.token().to_string())}",
-                                oninput: move |evt: FormEvent| {
-                                    let join = NextOp::from_token(&evt.value());
-                                    set_trigger_join((block_index, join));
-                                },
-                                option { value: "", "（不写）" }
-                                option { value: "next_and", "next_and" }
-                                option { value: "next_or", "next_or" }
-                                option { value: "next_and_not", "next_and_not" }
+                            span { class: "event-block-pair",
+                                label { "连接" }
+                                if native_autocomplete {
+                                    select {
+                                        class: "event-block-select",
+                                        value: "{block.join.map_or(String::new(), |join| join.token().to_string())}",
+                                        oninput: move |evt: FormEvent| {
+                                            let join = NextOp::from_token(&evt.value());
+                                            set_trigger_join((block_index, join));
+                                        },
+                                        option { value: "", "（不写）" }
+                                        option { value: "next_and", "next_and" }
+                                        option { value: "next_or", "next_or" }
+                                        option { value: "next_and_not", "next_and_not" }
+                                    }
+                                } else {
+                                    // 安卓自绘：候选为操作符 token，空文本 = 不写连接行。
+                                    SuggestInput {
+                                        text: block.join.map_or(String::new(), |join| join.token().to_string()),
+                                        options: SuggestOptions::Fixed(TRIGGER_JOIN_OPTIONS),
+                                        invalid: false,
+                                        on_value: move |text: String| {
+                                            set_trigger_join((block_index, NextOp::from_token(&text)));
+                                        },
+                                        on_focus: move |_| {},
+                                        on_blur: move |_| {},
+                                    }
+                                }
                             }
-                            button {
-                                class: "event-del event-block-del",
-                                r#type: "button",
-                                title: "删除此块",
-                                aria_label: "删除此块",
-                                onclick: move |_| remove_trigger_block(block_index),
-                                "×"
-                            }
+                        }
+                        // 删除按钮绝对定位在标题行右上角：不参与控件换行，
+                        // 避免窄面板下「×」被单独挤到一行（见 styles.css）。
+                        button {
+                            class: "event-del event-block-del",
+                            r#type: "button",
+                            title: "删除此块",
+                            aria_label: "删除此块",
+                            onclick: move |_| remove_trigger_block(block_index),
+                            "×"
                         }
                     }
                     GridHead {}
@@ -731,6 +1114,8 @@ pub fn EventGrid(event: Signal<Option<MissionEvent>>, lookup: Shared<EventLookup
                             invalid: is_invalid(&entry.key, entry.value_or_default()),
                             note: note_for(&entry.key),
                             datalist: "evdl-trigger",
+                            options: trigger_options.clone(),
+                            native_autocomplete,
                             lookup: lookup.clone(),
                             show_delete: true,
                             key_readonly: false,
@@ -784,6 +1169,8 @@ pub fn EventGrid(event: Signal<Option<MissionEvent>>, lookup: Shared<EventLookup
                             invalid: is_invalid(&entry.key, entry.value_or_default()),
                             note: note_for(&entry.key),
                             datalist: "evdl-effect",
+                            options: effect_options.clone(),
+                            native_autocomplete,
                             lookup: lookup.clone(),
                             show_delete: true,
                             key_readonly: false,
