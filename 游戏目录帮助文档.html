@@ -28,7 +28,7 @@ pre code{background:none;padding:0;color:inherit;white-space:pre}
 .tag{display:inline-block;padding:2px 8px;border-radius:12px;font-size:11.5px;background:#1c2128;color:#8b949e;border:1px solid var(--border);margin:2px}
 </style></head><body><div class="wrap">
 <h1>GameCivs 模组制作帮助文档</h1>
-<p class="subtitle">基于 参考目录 + 暮色黄昏 0.25.1 APK 源码反推整理 · 共 478 个文件 · 离线单文件</p>
+<p class="subtitle">基于 参考目录 + 文明时代3 APK 源码反推整理 · 共 478 个文件 · 离线单文件</p>
 <div class="toc"><h3>目录</h3><ol>
 <li><a href="#s1">目录结构与加载机制</a></li>
 <li><a href="#s2">JSON 配置格式约定</a></li>
@@ -134,9 +134,9 @@ pre code{background:none;padding:0;color:inherit;white-space:pre}
 <table><thead><tr><th>字段</th><th>说明</th></tr></thead><tbody><tr><td><code>Rulers</code></td><td>领袖数组，可定义多个</td></tr><tr><td><code>Name</code></td><td>显示名称</td></tr><tr><td><code>ImageID</code></td><td>领袖图片名（在 <code>game/rulers/rulersImages/H/</code> 下）</td></tr><tr><td><code>BornDay / BornMonth / BornYear</code></td><td>出生日期</td></tr><tr><td><code>ReignYear</code></td><td>在位年份（从哪一年开始显示）</td></tr><tr><td><code>Age_of_History</code></td><td>固定标记，值为 <code>Rulers</code>，不能省略</td></tr></tbody></table>
 <h3>3.4 民族精神（NationalSpirit.json）</h3>
 <pre><code>{
-	    &quot;id&quot;:&quot;药娘国度&quot;,#图片索引名称
-		&quot;name&quot;:&quot;药娘国度&quot;,#显示标题
-		&quot;desc&quot;:&quot;§!这个国家被药娘统治了\\n\\n§g建筑费用-20%\\n§g研究点数+20\\n研究效率+20%\\n§r生产效率-10%\\n§r每月政治点数-2\\n§r攻击力-8\\n§r防御力-16\\n§r人力恢复速度-32%\\n§r招聘时间+6%\\n§r招聘费用+12%\\n§g每月政治点数100&quot;,
+	    &quot;id&quot;:&quot;国度&quot;,#图片索引名称
+		&quot;name&quot;:&quot;国度&quot;,#显示标题
+		&quot;desc&quot;:&quot;§!这个国家被统治了\\n\\n§g建筑费用-20%\\n§g研究点数+20\\n研究效率+20%\\n§r生产效率-10%\\n§r每月政治点数-2\\n§r攻击力-8\\n§r防御力-16\\n§r人力恢复速度-32%\\n§r招聘时间+6%\\n§r招聘费用+12%\\n§g每月政治点数100&quot;,
 		&quot;Bonuses&quot;:{
 		    &quot;AdministrationBuildingsCost&quot;:-0.2,
 		    &quot;MilitaryBuildingsCost&quot;:-0.2,
@@ -673,7 +673,7 @@ TheGreatWar;</code></pre>
 <tr><th>问题</th><th>位置</th><th>影响</th></tr>
 <tr><td><code>pobssible_to_run</code> 多写一个 <code>b</code></td><td>所有 missionsEvents/*.txt</td><td>0.25.1 解析器字符串表中不存在该拼写 → 字段不会被读取；正确键为 <code>possible_to_run</code></td></tr>
 <tr><td><code>legcy=25</code> 拼写错误</td><td>ynqin中部工厂.txt</td><td>源码只有 <code>legacy</code>，此效果可能不执行</td></tr>
-<tr><td><code>MonthlyLegacy</code> 重复定义</td><td>NationalSpirit.json 药娘国度条目</td><td>后值覆盖前值，不是叠加</td></tr>
+<tr><td><code>MonthlyLegacy</code> 重复定义</td><td>NationalSpirit.json 国度条目</td><td>后值覆盖前值，不是叠加</td></tr>
 <tr><td><code>Governments.json</code> 为空（0 字节）</td><td>game/</td><td>游戏会回退到 APK 内置的政体定义</td></tr>
 <tr><td><code>Religions.json</code> 为空（0 字节）</td><td>game/</td><td>同上，回退内置宗教定义</td></tr>
 <tr><td><code>Ages.json</code> 为空（0 字节）</td><td>game/</td><td>回退内置时代配置</td></tr>
