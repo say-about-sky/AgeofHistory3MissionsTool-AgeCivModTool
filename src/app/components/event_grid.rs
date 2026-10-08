@@ -41,6 +41,7 @@ fn note_for(key: &str) -> String {
 	if let Some(spec) = event_schema::lookup(key) {
 		return spec.annotation.to_string();
 	}
+	let key = key.trim();
 	if let Some((_, fix)) = event_schema::KNOWN_TYPOS.iter().find(|(typo, _)| *typo == key) {
 		return format!("疑似拼写错误，应为 {fix}（保存时原样保留）");
 	}
@@ -137,6 +138,12 @@ fn ValuePartInput(
 	full_value: String,
 	native_autocomplete: bool,
 	lookup: Shared<EventLookup>,
+	/// 图片资源候选（`image` / `mission_image` 等），安卓自绘模式使用。
+	images: Shared<Vec<String>>,
+	/// 事件候选（`run_event` / `run_event_instantly` 值 = 文件名去 `.txt`）。
+	events: Shared<Vec<String>>,
+	/// 音乐候选（`musicName` / `play_music` 值）。
+	music: Shared<Vec<String>>,
 	on_value: EventHandler<String>,
 ) -> Element {
 	let on_text = EventHandler::new(move |new_text: String| {
@@ -160,7 +167,13 @@ fn ValuePartInput(
         } else {
             SuggestInput {
                 text,
-                options: SuggestOptions::Lookup(lookup, kind),
+                // 资源类字段用文件名 / 名称候选；其余字段用对照表候选。
+                options: match kind {
+                    ValuePart::Image => SuggestOptions::Names(images),
+                    ValuePart::EventId => SuggestOptions::Names(events),
+                    ValuePart::Music => SuggestOptions::Names(music),
+                    _ => SuggestOptions::Lookup(lookup, kind),
+                },
                 invalid,
                 on_value: on_text,
                 on_focus: move |_| {},
@@ -188,6 +201,11 @@ fn ValuePartInput(
 //      `on_focus` / `on_blur` 供调用方额外记账（如键行的冻结分组），无需求传 `move |_| {}`。
 //   3. 桌面端保留原生控件时用 `native_autocomplete` 开关分支（见 `GridRow` 与触发块控件）。
 //
+// 【新增一种资源候选】以图片 / 事件 / 音乐为例：后端在 `list_event_assets`（`EventAssets`，
+//   工作区目录 + 源 APK 条目，见 `missions_db.rs`）里增加一类收集函数与字段；前端在
+//   `event_lookup.rs` 加 `ValuePart` 变体；在 `event.rs` 加载后经 `images` / `events` /
+//   `music` 属性传到 `ValuePartInput`（`SuggestOptions::Names`）。
+//
 // 【层级与裁剪】`.suggest-wrap`（展开时 z26）内含：遮罩 z24 / 输入框 z25 / 列表 z30；
 //   分区的 `overflow` 裁剪切由 `.event-grid.suggest-overlay` 解除；展开方向与限高由
 //   实测空间控制（`.suggest-list-up` 向上展开）。
@@ -201,6 +219,8 @@ enum SuggestOptions {
 	Fixed(&'static [(&'static str, &'static str)]),
 	/// 键候选（键, 说明）——由表格分区提供。
 	Keys(Shared<Vec<(String, String)>>),
+	/// 资源名称候选（图片 `.png` / 事件名 / 音乐名，无说明标签）——由事件面板按资源根加载。
+	Names(Shared<Vec<String>>),
 	/// 对照表候选——按字段类型实时过滤（值, 名称）。
 	Lookup(Shared<EventLookup>, ValuePart),
 }
@@ -315,6 +335,7 @@ fn SuggestInput(
 				event_lookup::filter_suggestions(&items, &text, 60)
 			}
 			SuggestOptions::Keys(list) => event_lookup::filter_suggestions(list, &text, 60),
+			SuggestOptions::Names(names) => event_lookup::filter_names(names, &text, 60),
 			SuggestOptions::Lookup(lookup, kind) => {
 				event_lookup::matching_lookup(lookup, *kind, &text, 60)
 			}
@@ -468,6 +489,30 @@ fn LookupDatalists(lookup: Shared<EventLookup>) -> Element {
                 option { value: "{name}" }
             }
         }
+        datalist { id: "{event_lookup::NATIONAL_SPIRIT_DATALIST_ID}",
+            for item in lookup.national_spirits.iter() {
+                if item.name.is_empty() {
+                    option { value: "{item.id}" }
+                } else {
+                    option { value: "{item.id}", "{item.name}" }
+                }
+            }
+        }
+        datalist { id: "{event_lookup::TECHNOLOGY_DATALIST_ID}",
+            for item in lookup.technologies.iter() {
+                option { value: "{item.id}", "{item.name}" }
+            }
+        }
+        datalist { id: "{event_lookup::RELIGION_DATALIST_ID}",
+            for item in lookup.religions.iter() {
+                option { value: "{item.id}", "{item.name}" }
+            }
+        }
+        datalist { id: "{event_lookup::RESOURCE_DATALIST_ID}",
+            for item in lookup.resources.iter() {
+                option { value: "{item.id}", "{item.name}" }
+            }
+        }
     }
 }
 
@@ -483,6 +528,9 @@ fn GridRow(
 	options: Shared<Vec<(String, String)>>,
 	native_autocomplete: bool,
 	lookup: Shared<EventLookup>,
+	images: Shared<Vec<String>>,
+	events: Shared<Vec<String>>,
+	music: Shared<Vec<String>>,
 	show_delete: bool,
 	key_readonly: bool,
 	on_key: EventHandler<String>,
@@ -595,6 +643,9 @@ fn GridRow(
                                 full_value: value.clone(),
                                 native_autocomplete,
                                 lookup: lookup.clone(),
+                                images: images.clone(),
+                                events: events.clone(),
+                                music: music.clone(),
                                 on_value,
                             }
                         }
@@ -661,6 +712,9 @@ fn GridSection(
 	options: Shared<Vec<(String, String)>>,
 	native_autocomplete: bool,
 	lookup: Shared<EventLookup>,
+	images: Shared<Vec<String>>,
+	events: Shared<Vec<String>>,
+	music: Shared<Vec<String>>,
 	can_add: bool,
 	can_remove: bool,
 	editable_key: bool,
@@ -699,6 +753,9 @@ fn GridSection(
                     options: options.clone(),
                     native_autocomplete,
                     lookup: lookup.clone(),
+                    images: images.clone(),
+                    events: events.clone(),
+                    music: music.clone(),
                     show_delete: can_remove,
                     key_readonly: !editable_key,
                     on_key: move |new_key: String| on_key.call((index, new_key)),
@@ -735,11 +792,17 @@ fn mutate_event(event: Signal<Option<MissionEvent>>, f: impl FnOnce(&mut Mission
 /// `lookup` 为文明/政体对照表（事件面板加载后传入，供值单元格补全与名称提示）。
 /// `native_autocomplete` 为 true 时（桌面端）用原生 `datalist`；安卓端改用页面内
 /// 自绘下拉（原生弹层在滚动/软键盘后上/下都会错位）。
+/// `images` 为事件图片候选（`image` / `mission_image` 等字段的 `.png` 文件名），
+/// `events` 为事件候选（`run_event` 值 = 文件名去 `.txt`），`music` 为音乐候选
+/// （`musicName` / `play_music` 值）——均由事件面板按资源根加载，含从 apk 导入工作区的源 APK 兜底。
 #[component]
 pub fn EventGrid(
 	event: Signal<Option<MissionEvent>>,
 	lookup: Shared<EventLookup>,
 	native_autocomplete: bool,
+	images: Shared<Vec<String>>,
+	events: Shared<Vec<String>>,
+	music: Shared<Vec<String>>,
 ) -> Element {
 	let mut editing_key: Signal<Option<(usize, HeaderGroup)>> = use_signal(|| None);
 	let snapshot = event.read().clone();
@@ -827,6 +890,8 @@ pub fn EventGrid(
 		mutate_event(event, |data| {
 			if let Some(block) = data.triggers.get_mut(block_index) {
 				block.kind = kind;
+				// 改成新类型后，结束行按新类型写（不再保留原文件的手误结束行）。
+				block.close = None;
 			}
 		});
 	};
@@ -834,6 +899,8 @@ pub fn EventGrid(
 		mutate_event(event, |data| {
 			if let Some(block) = data.triggers.get_mut(block_index) {
 				block.join = join;
+				// 用户改动连接方式后按标准 token 写（不再保留原文件的别名写法）。
+				block.join_token = None;
 			}
 		});
 	};
@@ -884,6 +951,11 @@ pub fn EventGrid(
 				blank_before: 1,
 				kind: TriggerKind::And,
 				join: Some(NextOp::And),
+				join_after: 0,
+				join_blank_before: 0,
+				join_token: None,
+				close_blank_before: 0,
+				close: None,
 				conditions: vec![EntryLine::new("is_civ", "")],
 			});
 		});
@@ -943,6 +1015,10 @@ pub fn EventGrid(
 			data.options.push(super::event_parser::OptionBlock {
 				blank_before: 1,
 				name: Some(String::new()),
+				name_after: 0,
+				name_blank_before: 0,
+				close_blank_before: 0,
+				close: None,
 				effects: Vec::new(),
 			});
 		});
@@ -974,6 +1050,29 @@ pub fn EventGrid(
                 if !lookup.is_empty() {
                     LookupDatalists { lookup: lookup.clone() }
                 }
+                // 图片资源候选（image / mission_image 等字段引用的 .png 文件名）
+                if !images.is_empty() {
+                    datalist { id: "{event_lookup::IMAGE_DATALIST_ID}",
+                        for name in images.iter() {
+                            option { value: "{name}" }
+                        }
+                    }
+                }
+                // 事件 / 音乐候选（run_event 与 musicName / play_music 字段的值）
+                if !events.is_empty() {
+                    datalist { id: "{event_lookup::EVENT_DATALIST_ID}",
+                        for name in events.iter() {
+                            option { value: "{name}" }
+                        }
+                    }
+                }
+                if !music.is_empty() {
+                    datalist { id: "{event_lookup::MUSIC_DATALIST_ID}",
+                        for name in music.iter() {
+                            option { value: "{name}" }
+                        }
+                    }
+                }
             }
 
             GridSection {
@@ -983,6 +1082,9 @@ pub fn EventGrid(
                 options: header_options.clone(),
                 native_autocomplete,
                 lookup: lookup.clone(),
+                images: images.clone(),
+                events: events.clone(),
+                music: music.clone(),
                 can_add: false,
                 can_remove: false,
                 editable_key: false,
@@ -1001,6 +1103,9 @@ pub fn EventGrid(
                 options: header_options.clone(),
                 native_autocomplete,
                 lookup: lookup.clone(),
+                images: images.clone(),
+                events: events.clone(),
+                music: music.clone(),
                 can_add: true,
                 can_remove: true,
                 editable_key: true,
@@ -1019,6 +1124,9 @@ pub fn EventGrid(
                 options: header_options.clone(),
                 native_autocomplete,
                 lookup: lookup.clone(),
+                images: images.clone(),
+                events: events.clone(),
+                music: music.clone(),
                 can_add: true,
                 can_remove: true,
                 editable_key: true,
@@ -1117,6 +1225,9 @@ pub fn EventGrid(
                             options: trigger_options.clone(),
                             native_autocomplete,
                             lookup: lookup.clone(),
+                            images: images.clone(),
+                            events: events.clone(),
+                            music: music.clone(),
                             show_delete: true,
                             key_readonly: false,
                             on_key: move |new_key: String| set_condition_key((block_index, row_index, new_key)),
@@ -1172,6 +1283,9 @@ pub fn EventGrid(
                             options: effect_options.clone(),
                             native_autocomplete,
                             lookup: lookup.clone(),
+                            images: images.clone(),
+                            events: events.clone(),
+                            music: music.clone(),
                             show_delete: true,
                             key_readonly: false,
                             on_key: move |new_key: String| set_effect_key((option_index, row_index, new_key)),

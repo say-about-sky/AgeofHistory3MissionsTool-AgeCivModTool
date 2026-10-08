@@ -23,7 +23,7 @@
 //!   排在清单条目之后（按字典序）；
 //! - 只为缺失翻译的 tag 读取对应 json（上游全量读取）。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 
@@ -56,6 +56,14 @@ const CITIES_FILE: &str = "cities/cities.json";
 const BUILDINGS_FILE: &str = "buildings/Buildings.json";
 /// 疾病定义（数组顺序即疾病 ID）。
 const DISEASES_FILE: &str = "diseases/Diseases.json";
+/// 国家精神（`add_ns` / `remove_ns` 的字符串 id，如 `fra1`，名称随条目给出）。
+const NATIONAL_SPIRIT_FILE: &str = "NationalSpirit.json";
+/// 科技定义（`ID:` + `Name:` 行，供 `unlock_tech` 补全）。
+const TECHNOLOGIES_FILE: &str = "technologies/Technologies.json";
+/// 宗教定义（数组顺序即宗教 ID）。
+const RELIGIONS_FILE: &str = "Religions.json";
+/// 资源定义（`Name:` + `ID:` 行，供 `resource_price_change` 系列补全）。
+const RESOURCES_FILE: &str = "resources/Resources.json";
 /// 人物定义目录（`*.json` 含 `Name:`）。
 const CHARACTERS_DIR: &str = "characters";
 /// 根语言表（疾病等名称翻译，简体中文优先）。
@@ -271,26 +279,42 @@ pub struct GovernmentEntry {
     pub tag: String,
 }
 
-/// 解析 `Governments.json`（移植自 `generate_gov_scv_bytes` 的逐行扫描）：
-/// 每遇到一个 `Extra_Tag:` 生成一条记录，`index` 从 0 开始递增；
-/// 只有 `Name:` 而没有后续 `Extra_Tag:` 的条目会被下一条 `Name:` 覆盖（与上游一致）。
+/// 解析 `Governments.json`（逐行扫描）：
+/// 每条 `Name:` 生成一条记录（`index` 从 0 递增，即游戏内政体数组顺序），
+/// 紧随其后的 `Extra_Tag:` 作为标记；没有 `Extra_Tag:` 的条目也照常保留（tag 为空），
+/// 避免跳过条目导致后续编号整体前移（旧版与上游 ScvGen 一致，会覆盖式丢弃这类条目）。
+/// 兼容带引号键写法（`"Name":` / `"Extra_Tag":`）与键名大小写差异（`name:` 等）。
 pub fn parse_governments(text: &str) -> Vec<GovernmentEntry> {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut entries: Vec<GovernmentEntry> = Vec::new();
     let mut current_name: Option<String> = None;
     for line in text.lines() {
         let line = line.trim();
-        if let Some(rest) = line.strip_prefix("Name:") {
-            current_name = Some(parse_field_value(rest));
-        } else if let Some(rest) = line.strip_prefix("Extra_Tag:") {
+        if let Some(name) = line_scalar_field(line, "Name") {
+            if let Some(previous) = current_name.take() {
+                entries.push(GovernmentEntry {
+                    index: entries.len(),
+                    name: previous,
+                    tag: String::new(),
+                });
+            }
+            current_name = Some(name);
+        } else if let Some(tag) = line_scalar_field(line, "Extra_Tag") {
             if let Some(name) = current_name.take() {
                 entries.push(GovernmentEntry {
                     index: entries.len(),
                     name,
-                    tag: parse_field_value(rest),
+                    tag,
                 });
             }
         }
+    }
+    if let Some(name) = current_name.take() {
+        entries.push(GovernmentEntry {
+            index: entries.len(),
+            name,
+            tag: String::new(),
+        });
     }
     entries
 }
@@ -459,8 +483,7 @@ pub fn parse_map_folders(text: &str) -> Vec<String> {
     let mut folders = Vec::new();
     for line in text.lines() {
         let line = line.trim();
-        if let Some(rest) = line.strip_prefix("Folder:") {
-            let folder = parse_field_value(rest);
+        if let Some(folder) = line_scalar_field(line, "Folder") {
             if !folder.is_empty() {
                 folders.push(folder);
             }
@@ -470,13 +493,19 @@ pub fn parse_map_folders(text: &str) -> Vec<String> {
 }
 
 /// 宽松扫描 `key:` 之后的全部「字符串或字符串数组」值（保持出现顺序）。
+/// 兼容带引号的键写法（`"key":`）与键名大小写差异（`name:` / `NAME:` 等）。
 fn scan_key_values(text: &str, key: &str) -> Vec<Vec<String>> {
     let mut values: Vec<Vec<String>> = Vec::new();
     let mut cursor = 0;
-    while let Some(position) = text[cursor..].find(key) {
-        let start = cursor + position + key.len();
+    // 大小写不敏感查找：`to_ascii_lowercase` 只改 ASCII 字节且不改变长度，
+    // 所以小写副本上的命中位置可以直接用于原文切片。
+    let lowered = text.to_ascii_lowercase();
+    let needle = key.to_ascii_lowercase();
+    while let Some(position) = lowered[cursor..].find(needle.as_str()) {
+        let start = cursor + position + needle.len();
         cursor = start;
         let rest = text[start..].trim_start();
+        let rest = rest.strip_prefix('"').unwrap_or(rest);
         let Some(rest) = rest.strip_prefix(':') else {
             continue;
         };
@@ -569,18 +598,18 @@ pub fn parse_province_ids(text: &str) -> Vec<u32> {
 
 /// 解析 `<地图>/cities/cities.json`：逐行扫描 `Name:` / `p:` 对（`//` 注释行自然跳过）。
 /// 返回（省份 ID，地名）列表（同一省份可出现多次，调用方按首个地名优先）。
+/// 兼容带引号的键写法（`"Name":` / `"p":`）。
 pub fn parse_city_names(text: &str) -> Vec<(u32, String)> {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut entries = Vec::new();
     let mut current_name: Option<String> = None;
     for line in text.lines() {
         let line = line.trim();
-        if let Some(rest) = line.strip_prefix("Name:") {
-            let name = parse_field_value(rest);
+        if let Some(name) = line_scalar_field(line, "Name") {
             current_name = if name.is_empty() { None } else { Some(name) };
-        } else if let Some(rest) = line.strip_prefix("p:") {
+        } else if let Some(value) = line_scalar_field(line, "p") {
             if let Some(name) = current_name.take() {
-                if let Ok(id) = parse_field_value(rest).parse::<u32>() {
+                if let Ok(id) = value.parse::<u32>() {
                     entries.push((id, name));
                 }
             }
@@ -619,11 +648,101 @@ pub fn parse_diseases(text: &str, translations: &HashMap<String, String>) -> Vec
         .collect()
 }
 
+/// 字符串 ID + 名称条目（国家精神等以字符串标识的数据表，如 `fra1` → `法兰西万岁`）。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct IdTextNameEntry {
+    pub id: String,
+    pub name: String,
+}
+
+/// 数值 ID + 名称条目（科技 / 宗教 / 资源等数组表共用；`id` 即游戏内整数）。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct IdNameEntry {
+    pub id: u32,
+    pub name: String,
+}
+
+/// 行首（可带引号、可含空白）键后的标量值：`Name: "甲",` / `Name: Grain,` /
+/// `"id":"fra1",` / `name: 甲,`（键名不区分大小写）都会解析为去掉引号与尾逗号的文本。
+///
+/// 要求整个键段（首个 `:` 之前的内容，允许多余空白/引号）与目标键相等（忽略大小写）：
+/// `MaintainTechnologyName:` 这类后缀键不会命中 `Name`；`ImageID:` / `GroupID:` 不会命中 `ID`。
+fn line_scalar_field(line: &str, key: &str) -> Option<String> {
+    let colon = line.find(':')?;
+    let head = line[..colon].trim();
+    let head = head
+        .strip_prefix('"')
+        .and_then(|inner| inner.strip_suffix('"'))
+        .unwrap_or(head);
+    if !head.eq_ignore_ascii_case(key) {
+        return None;
+    }
+    Some(parse_field_value(&line[colon + 1..]))
+}
+
+/// 解析 `NationalSpirit.json`：宽松 JSON 的 `"id"` + `"name"` 成对提取
+/// （`id` 为字符串如 `fra1`；`desc` / `Bonuses` 等行不会干扰）。
+pub fn parse_national_spirits(text: &str) -> Vec<IdTextNameEntry> {
+    let mut entries = Vec::new();
+    let mut pending_id: Option<String> = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(id) = line_scalar_field(line, "id") {
+            pending_id = Some(id);
+        } else if let Some(name) = line_scalar_field(line, "name") {
+            if let Some(id) = pending_id.take() {
+                entries.push(IdTextNameEntry { id, name });
+            }
+        }
+    }
+    entries
+}
+
+/// 解析「`Name:` + `ID:`」配对的数据表（两种字段顺序都支持：
+/// `Technologies.json` 为先 `ID` 后 `Name`，`Resources.json` 为先 `Name` 后 `ID`）。
+/// 输出按 `id` 升序。
+pub fn parse_id_name_table(text: &str) -> Vec<IdNameEntry> {
+    let mut entries: Vec<IdNameEntry> = Vec::new();
+    let mut pending_id: Option<u32> = None;
+    let mut pending_name: Option<String> = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(id) = line_scalar_field(line, "ID").and_then(|raw| raw.parse::<u32>().ok()) {
+            pending_id = Some(id);
+        } else if let Some(name) = line_scalar_field(line, "Name") {
+            pending_name = Some(name);
+        }
+        // 注意：不能在 if-let 的元组里直接 `.take()`（匹配失败也会取走值），
+        // 必须先判空再取。
+        if pending_id.is_some() && pending_name.is_some() {
+            entries.push(IdNameEntry {
+                id: pending_id.take().unwrap(),
+                name: pending_name.take().unwrap(),
+            });
+        }
+    }
+    entries.sort_by_key(|entry| entry.id);
+    entries
+}
+
+/// 解析「数组顺序即 ID」的 `Name:` 清单（如 `Religions.json`；名称为裸词或字符串）。
+pub fn parse_ordered_names(text: &str) -> Vec<IdNameEntry> {
+    let mut entries = Vec::new();
+    for line in text.lines() {
+        if let Some(name) = line_scalar_field(line.trim(), "Name") {
+            entries.push(IdNameEntry {
+                id: entries.len() as u32,
+                name,
+            });
+        }
+    }
+    entries
+}
+
 /// 提取人物 json 中的首个 `Name:` 值（人物文件为小型数组包装）。
 fn character_name_of(content: &str) -> Option<String> {
     find_key_string(content, "Name").filter(|name| !name.is_empty())
 }
-
 /// 由（文件名, 内容）列表构建人物名单：内部 `Name` 与文件名（去除 `.json`）都会收录
 /// （去重、保持文件顺序）。少数文件两者不同（标签前缀/改名），两者都作为候选。
 fn build_character_names(files: &[(String, String)]) -> Vec<String> {
@@ -669,6 +788,14 @@ pub struct EventLookup {
     pub buildings: Vec<BuildingEntry>,
     /// 疾病清单（数组顺序即 ID）。
     pub diseases: Vec<DiseaseEntry>,
+    /// 国家精神清单（`NationalSpirit.json`，`id` 为字符串；供 `add_ns` / `remove_ns`）。
+    pub national_spirits: Vec<IdTextNameEntry>,
+    /// 科技清单（`technologies/Technologies.json`；供 `unlock_tech`）。
+    pub technologies: Vec<IdNameEntry>,
+    /// 宗教清单（`Religions.json` 数组顺序即 ID；供 `change_religion` 等）。
+    pub religions: Vec<IdNameEntry>,
+    /// 资源清单（`resources/Resources.json`；供 `resource_price_change` 系列）。
+    pub resources: Vec<IdNameEntry>,
 }
 
 /// 名称解析核心（与 `generate_civ` 的查找优先级一致）：
@@ -1094,6 +1221,15 @@ fn load_translations_from(source: &dyn DataSource, relatives: &[&str]) -> HashMa
     translations
 }
 
+/// 附加游戏数据表（读取对照原料时一并解析，字段与 [`EventLookup`] 对应）。
+#[derive(Default)]
+struct LookupTables {
+    national_spirits: Vec<IdTextNameEntry>,
+    technologies: Vec<IdNameEntry>,
+    religions: Vec<IdNameEntry>,
+    resources: Vec<IdNameEntry>,
+}
+
 /// 组装对照表（真实路径 / SAF / 测试共用）。
 #[allow(clippy::too_many_arguments)]
 fn assemble_lookup(
@@ -1105,6 +1241,7 @@ fn assemble_lookup(
     provinces: Vec<ProvinceEntry>,
     buildings: Vec<BuildingEntry>,
     diseases: Vec<DiseaseEntry>,
+    tables: LookupTables,
 ) -> EventLookup {
     EventLookup {
         civs: build_civ_entries(tags, translations, |tag| civ_jsons.get(tag).cloned()),
@@ -1113,6 +1250,10 @@ fn assemble_lookup(
         provinces,
         buildings,
         diseases,
+        national_spirits: tables.national_spirits,
+        technologies: tables.technologies,
+        religions: tables.religions,
+        resources: tables.resources,
     }
 }
 
@@ -1319,6 +1460,26 @@ fn load_lookup_from_sources(
         None => Vec::new(),
     };
 
+    // 附加数据表：国家精神 / 科技 / 宗教 / 资源（文件缺失时按空表处理）。
+    let tables = LookupTables {
+        national_spirits: game
+            .read_text(NATIONAL_SPIRIT_FILE)
+            .map(|text| parse_national_spirits(&text))
+            .unwrap_or_default(),
+        technologies: game
+            .read_text(TECHNOLOGIES_FILE)
+            .map(|text| parse_id_name_table(&text))
+            .unwrap_or_default(),
+        religions: game
+            .read_text(RELIGIONS_FILE)
+            .map(|text| parse_ordered_names(&text))
+            .unwrap_or_default(),
+        resources: game
+            .read_text(RESOURCES_FILE)
+            .map(|text| parse_id_name_table(&text))
+            .unwrap_or_default(),
+    };
+
     assemble_lookup(
         &tags,
         &translations,
@@ -1328,6 +1489,7 @@ fn load_lookup_from_sources(
         provinces,
         buildings,
         diseases,
+        tables,
     )
 }
 
@@ -1705,6 +1867,34 @@ pub async fn load_event_lookup_scoped<R: tauri::Runtime>(
             None => Vec::new(),
         };
 
+        // 附加数据表：国家精神 / 科技 / 宗教 / 资源（文件缺失时按空表处理）。
+        let national_spirits =
+            bridge::read_text_file(&app, &folder_id, &join_rel(&candidate, NATIONAL_SPIRIT_FILE))
+                .await
+                .map(|text| parse_national_spirits(&text))
+                .unwrap_or_default();
+        let technologies =
+            bridge::read_text_file(&app, &folder_id, &join_rel(&candidate, TECHNOLOGIES_FILE))
+                .await
+                .map(|text| parse_id_name_table(&text))
+                .unwrap_or_default();
+        let religions =
+            bridge::read_text_file(&app, &folder_id, &join_rel(&candidate, RELIGIONS_FILE))
+                .await
+                .map(|text| parse_ordered_names(&text))
+                .unwrap_or_default();
+        let resources =
+            bridge::read_text_file(&app, &folder_id, &join_rel(&candidate, RESOURCES_FILE))
+                .await
+                .map(|text| parse_id_name_table(&text))
+                .unwrap_or_default();
+        let tables = LookupTables {
+            national_spirits,
+            technologies,
+            religions,
+            resources,
+        };
+
         return Ok(assemble_lookup(
             &tags,
             &translations,
@@ -1714,6 +1904,7 @@ pub async fn load_event_lookup_scoped<R: tauri::Runtime>(
             provinces,
             buildings,
             diseases,
+            tables,
         ));
     }
 
@@ -1740,6 +1931,428 @@ pub async fn load_event_lookup_scoped<R: tauri::Runtime>(
     }
 
     Ok(EventLookup::default())
+}
+
+// ===== 事件脚本资源候选（图片 / 事件 / 音乐三类「指向资源」的值补全） =====
+//
+// 事件脚本里的资源值按「missions 资源根」推导候选目录，逐个探测后合并去重
+// （目录缺失自动跳过），并统一经 `list_event_assets` 提供给前端：
+// - 图片：值 = 含扩展名的文件名（如 `国策通用.png`），来源 `missionsImages` /
+//   `events/images` / `decisionsImages` 等目录（`image` / `mission_image` 字段）；
+// - 事件：值 = 事件文件名去 `.txt`（如 `1919年巴西大选补选`），来源 `missionsEvents` /
+//   剧本 `events/common` / 全局 `events/common`（`run_event` / `run_event_instantly` 字段）；
+// - 音乐：值 = 音乐名（如 `世界大战`），来源 `assets/audio/music` 的音频文件名去扩展名
+//   与 `list*.txt` 清单条目（`musicName` / `play_music` 字段）。
+// 「从 apk 中导入」的版块工作区会回退源 APK 条目（与对照表同规则）。
+// 扩展其它资源类型时：仿照本节的目录推导 + 收集函数，把结果并入 [`EventAssets`]，
+// 并在前端 `event_lookup.rs` 增加对应 `ValuePart` 与加载器即可。
+
+/// 事件图片的候选目录（工作区相对路径，按顺序探测并合并）：
+/// 1. `<missions_root>/missionsImages/H`——剧本自带图片（场景事件 `image`、国策树图标）；
+/// 2. `<missions_root 同级>/events/images/H`——全局事件图片（如 `assets/game/events/images/H`）；
+/// 3. `<missions_root 同级>/decisions/decisionsImages/H`——决议图片（存在时收录）。
+fn event_image_relative_dirs(missions_root: &str) -> Vec<String> {
+    let root = missions_root.trim().trim_matches('/');
+    let segments: Vec<&str> = root
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    let parent = if segments.is_empty() {
+        String::new()
+    } else {
+        segments[..segments.len() - 1].join("/")
+    };
+    let mut dirs = Vec::new();
+    if !root.is_empty() {
+        dirs.push(format!("{root}/missionsImages/H"));
+    }
+    dirs.push(join_rel(&parent, "events/images/H"));
+    dirs.push(join_rel(&parent, "decisions/decisionsImages/H"));
+    dirs
+}
+
+/// 事件 ID（`run_event` / `run_event_instantly` 值 = 事件文件名去 `.txt`）的候选目录：
+/// 1. `<missions_root>/missionsEvents`——国策事件；
+/// 2. `<missions_root 同级>/events/common`——剧本事件（如 `TheGreatWar/events/common`）；
+/// 3. 游戏数据目录下的 `events/common`——全局事件（如 `assets/game/events/common`）。
+fn event_script_relative_dirs(missions_root: &str) -> Vec<String> {
+    let root = missions_root.trim().trim_matches('/');
+    let segments: Vec<&str> = root
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    let parent = if segments.is_empty() {
+        String::new()
+    } else {
+        segments[..segments.len() - 1].join("/")
+    };
+    let mut dirs = Vec::new();
+    let mut push = |dir: String| {
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    };
+    if !root.is_empty() {
+        push(format!("{root}/missionsEvents"));
+    }
+    push(join_rel(&parent, "events/common"));
+    if let Some(game_dir) = game_dir_candidates(missions_root).into_iter().next() {
+        push(join_rel(&game_dir, "events/common"));
+    }
+    dirs
+}
+
+/// 音乐候选目录：`<assets 前缀>/assets/audio/music`（从 missions_root 的 `assets` 段推导；
+/// 音频与 `list*.txt` 清单都放在该目录）。无 `assets` 段（经典布局）时返回空列表。
+fn event_music_relative_dirs(missions_root: &str) -> Vec<String> {
+    let root = missions_root.trim().trim_matches('/');
+    let segments: Vec<&str> = root
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    for (index, segment) in segments.iter().enumerate() {
+        if *segment == "assets" {
+            let prefix = segments[..=index].join("/");
+            return vec![format!("{prefix}/audio/music")];
+        }
+    }
+    Vec::new()
+}
+
+/// 音频扩展名判断（音乐值即音频文件名去扩展名）。
+fn is_audio_file(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    [".ogg", ".mp3", ".wav", ".flac"]
+        .iter()
+        .any(|extension| lower.ends_with(extension))
+}
+
+/// 音乐清单文件判断（`list.txt` / `listWar.txt` / `list_1.txt`；条目以 `;` 分隔）。
+fn is_music_list_file(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.starts_with("list") && lower.ends_with(".txt")
+}
+
+/// 扫描工作区目录下的图片候选（真实路径模式；`.png` 以外的文件忽略，同名去重）。
+fn collect_event_image_names(root: &Path, missions_root: &str) -> Vec<String> {
+    let mut names: BTreeSet<String> = BTreeSet::new();
+    for dir in event_image_relative_dirs(missions_root) {
+        let Ok(entries) = fs::read_dir(root.join(&dir)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            if path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("png"))
+            {
+                if let Some(name) = path.file_name() {
+                    names.insert(name.to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
+    names.into_iter().collect()
+}
+
+/// 扫描工作区目录下的事件文件名（去 `.txt` 扩展名，同名去重）。
+fn collect_event_names(root: &Path, missions_root: &str) -> Vec<String> {
+    let mut names: BTreeSet<String> = BTreeSet::new();
+    for dir in event_script_relative_dirs(missions_root) {
+        let Ok(entries) = fs::read_dir(root.join(&dir)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            if path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("txt"))
+            {
+                if let Some(stem) = path.file_stem() {
+                    names.insert(stem.to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
+    names.into_iter().collect()
+}
+
+/// 扫描音乐目录：音频文件（去扩展名）与 `list*.txt` 清单条目（`;` 分隔）合并去重。
+fn collect_music_names(root: &Path, missions_root: &str) -> Vec<String> {
+    let mut names: BTreeSet<String> = BTreeSet::new();
+    for dir in event_music_relative_dirs(missions_root) {
+        let Ok(entries) = fs::read_dir(root.join(&dir)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let file_name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if is_audio_file(&file_name) {
+                if let Some(stem) = path.file_stem() {
+                    names.insert(stem.to_string_lossy().into_owned());
+                }
+            } else if is_music_list_file(&file_name) {
+                if let Ok(text) = fs::read_to_string(&path) {
+                    for item in text.split(';') {
+                        let item = item.trim();
+                        if !item.is_empty() {
+                            names.insert(item.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    names.into_iter().collect()
+}
+
+/// 从已打开的源 APK 收集图片条目名（「从 apk 中导入」的版块工作区不含
+/// `events/images` 等目录；把工作区相对目录转成 APK 条目前缀后直接过滤，免解压）。
+fn apk_event_image_names(archive: &ApkArchive, missions_root: &str) -> Vec<String> {
+    let mut names: BTreeSet<String> = BTreeSet::new();
+    for dir in event_image_relative_dirs(missions_root) {
+        // 复用候选前缀推导：取 `assets` 段起的部分即为 APK 内目录。
+        let Some(apk_dir) = apk_base_of_candidate(&dir) else {
+            continue;
+        };
+        let prefix = format!("{apk_dir}/");
+        for entry in &archive.entries {
+            let Some(rest) = entry.name.strip_prefix(&prefix) else {
+                continue;
+            };
+            if !rest.contains('/') && rest.to_ascii_lowercase().ends_with(".png") {
+                names.insert(rest.to_string());
+            }
+        }
+    }
+    names.into_iter().collect()
+}
+
+/// 从已打开的源 APK 收集事件文件名（去 `.txt`；脚本候选目录 → APK 条目前缀过滤）。
+fn apk_event_names(archive: &ApkArchive, missions_root: &str) -> Vec<String> {
+    let mut names: BTreeSet<String> = BTreeSet::new();
+    for dir in event_script_relative_dirs(missions_root) {
+        // 复用候选前缀推导：取 `assets` 段起的部分即为 APK 内目录。
+        let Some(apk_dir) = apk_base_of_candidate(&dir) else {
+            continue;
+        };
+        let prefix = format!("{apk_dir}/");
+        for entry in &archive.entries {
+            let Some(rest) = entry.name.strip_prefix(&prefix) else {
+                continue;
+            };
+            if rest.contains('/') {
+                continue;
+            }
+            if let Some(stem) = rest.strip_suffix(".txt").or_else(|| rest.strip_suffix(".TXT")) {
+                if !stem.is_empty() {
+                    names.insert(stem.to_string());
+                }
+            }
+        }
+    }
+    names.into_iter().collect()
+}
+
+/// 从已打开的源 APK 收集音乐名（音频条目去扩展名 + `list*.txt` 条目内容）。
+fn apk_music_names(archive: &ApkArchive, missions_root: &str) -> Vec<String> {
+    let mut names: BTreeSet<String> = BTreeSet::new();
+    for dir in event_music_relative_dirs(missions_root) {
+        let Some(apk_dir) = apk_base_of_candidate(&dir) else {
+            continue;
+        };
+        let prefix = format!("{apk_dir}/");
+        for entry in &archive.entries {
+            let Some(rest) = entry.name.strip_prefix(&prefix) else {
+                continue;
+            };
+            if rest.contains('/') {
+                continue;
+            }
+            if is_audio_file(rest) {
+                if let Some(stem) = Path::new(rest).file_stem() {
+                    names.insert(stem.to_string_lossy().into_owned());
+                }
+            } else if is_music_list_file(rest) {
+                if let Some(text) = archive.read_entry(&entry.name) {
+                    for item in text.split(';') {
+                        let item = item.trim();
+                        if !item.is_empty() {
+                            names.insert(item.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    names.into_iter().collect()
+}
+
+/// 事件脚本资源候选（`list_event_assets` 命令的返回结构）。
+/// - `images`：`.png` 文件名（含扩展名）；
+/// - `events`：事件文件名去 `.txt`（`run_event` 值）；
+/// - `music`：音乐名（音频文件名去扩展名 + `list*.txt` 清单条目）。
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct EventAssets {
+    pub images: Vec<String>,
+    pub events: Vec<String>,
+    pub music: Vec<String>,
+}
+
+/// 列出事件脚本可引用的资源候选（见 [`EventAssets`]）。
+/// 数据来源：工作区候选目录 + 「从 apk 中导入」工作区的源 APK 条目（与对照表同规则）。
+#[tauri::command]
+pub async fn list_event_assets<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    work_directory: String,
+    missions_root: String,
+) -> Result<EventAssets, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = PathBuf::from(&work_directory);
+        if !root.is_dir() {
+            return Err(format!("工作目录不存在：{}", root.display()));
+        }
+        let mut images: BTreeSet<String> = collect_event_image_names(&root, &missions_root)
+            .into_iter()
+            .collect();
+        let mut events: BTreeSet<String> = collect_event_names(&root, &missions_root)
+            .into_iter()
+            .collect();
+        let mut music: BTreeSet<String> = collect_music_names(&root, &missions_root)
+            .into_iter()
+            .collect();
+        let mut extend_from_archive = |archive: &ApkArchive| {
+            images.extend(apk_event_image_names(archive, &missions_root));
+            events.extend(apk_event_names(archive, &missions_root));
+            music.extend(apk_music_names(archive, &missions_root));
+        };
+        #[cfg(target_os = "android")]
+        {
+            use tauri_plugin_android_fs::{AndroidFsExt, FsUri};
+            let open_apk = |location: &str| {
+                if !location.contains("://") {
+                    if let Ok(file) = File::open(location) {
+                        return Some(file);
+                    }
+                }
+                let uri = if location.contains("://") {
+                    FsUri::from_uri(location.to_string())
+                } else {
+                    FsUri::from_path(Path::new(location))
+                };
+                app.android_fs().open_file_readable(&uri).ok()
+            };
+            if let Some(archive) = open_source_apk(&root, &missions_root, &open_apk) {
+                extend_from_archive(&archive);
+            }
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = app;
+            if let Some(archive) =
+                open_source_apk(&root, &missions_root, &|location| File::open(location).ok())
+            {
+                extend_from_archive(&archive);
+            }
+        }
+        Ok(EventAssets {
+            images: images.into_iter().collect(),
+            events: events.into_iter().collect(),
+            music: music.into_iter().collect(),
+        })
+    })
+    .await
+    .map_err(|error| format!("加载资源候选失败：{error}"))?
+}
+
+/// [`list_event_assets`] 的 SAF/scoped 版：目录列举经 android-fs bridge。
+#[tauri::command]
+pub async fn list_event_assets_scoped<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    folder_id: String,
+    missions_root: String,
+) -> Result<EventAssets, String> {
+    if folder_id.trim().is_empty() {
+        return Err("缺少 scoped 目录授权".to_string());
+    }
+    let mut images: BTreeSet<String> = BTreeSet::new();
+    for dir in event_image_relative_dirs(&missions_root) {
+        let Ok(entries) = bridge::list_dir(&app, &folder_id, Some(dir)).await else {
+            continue;
+        };
+        for entry in entries {
+            if !entry.is_dir && entry.name.to_ascii_lowercase().ends_with(".png") {
+                images.insert(entry.name);
+            }
+        }
+    }
+    let mut events: BTreeSet<String> = BTreeSet::new();
+    for dir in event_script_relative_dirs(&missions_root) {
+        let Ok(entries) = bridge::list_dir(&app, &folder_id, Some(dir)).await else {
+            continue;
+        };
+        for entry in entries {
+            if entry.is_dir {
+                continue;
+            }
+            let lower = entry.name.to_ascii_lowercase();
+            if lower.ends_with(".txt") {
+                events.insert(entry.name[..entry.name.len() - 4].to_string());
+            }
+        }
+    }
+    let mut music: BTreeSet<String> = BTreeSet::new();
+    for dir in event_music_relative_dirs(&missions_root) {
+        let Ok(entries) = bridge::list_dir(&app, &folder_id, Some(dir.clone())).await else {
+            continue;
+        };
+        for entry in entries {
+            if entry.is_dir {
+                continue;
+            }
+            if is_audio_file(&entry.name) {
+                let stem = Path::new(&entry.name)
+                    .file_stem()
+                    .map(|stem| stem.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                if !stem.is_empty() {
+                    music.insert(stem);
+                }
+            } else if is_music_list_file(&entry.name) {
+                let relative = join_rel(&dir, &entry.name);
+                if let Ok(text) = bridge::read_text_file(&app, &folder_id, &relative).await {
+                    for item in text.split(';') {
+                        let item = item.trim();
+                        if !item.is_empty() {
+                            music.insert(item.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(archive) = open_scoped_source_apk(&app, &folder_id, &missions_root).await {
+        images.extend(apk_event_image_names(&archive, &missions_root));
+        events.extend(apk_event_names(&archive, &missions_root));
+        music.extend(apk_music_names(&archive, &missions_root));
+    }
+    Ok(EventAssets {
+        images: images.into_iter().collect(),
+        events: events.into_iter().collect(),
+        music: music.into_iter().collect(),
+    })
 }
 
 #[cfg(test)]
@@ -1840,6 +2453,52 @@ mod tests {
             vec![
                 DiseaseEntry { id: 0, name: "黑死病".into() },
                 DiseaseEntry { id: 1, name: "Smallpox".into() },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_national_spirits_reads_id_name_pairs() {
+        let text = "{\n\"nationalSpirits\":[\n{\n\"id\":\"fra1\",\n\"name\":\"法兰西万岁\",\n\"desc\":\"§!描述：含冒号，name 字样不干扰\",\n\"Bonuses\":{\n\"UnitsDefense\":15,\n},\n},\n{\n\"id\":\"sov3\",\n\"name\":\"苏维埃精神\",\n},\n]}";
+        assert_eq!(
+            parse_national_spirits(text),
+            vec![
+                IdTextNameEntry { id: "fra1".into(), name: "法兰西万岁".into() },
+                IdTextNameEntry { id: "sov3".into(), name: "苏维埃精神".into() },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_id_name_table_reads_both_field_orders() {
+        // 科技：先 `ID` 后 `Name`；`ImageID` / `MaintainTechnologyName` 不误匹配。
+        let tech = "{\nTechnology:[\n{\nID: 0,\nName: \"毒气科技\",\nImageID: 0,\nMaintainTechnologyName: true,\n},\n{\nID: 1,\nName: \"毒气桶\",\n},\n]}";
+        assert_eq!(
+            parse_id_name_table(tech),
+            vec![
+                IdNameEntry { id: 0, name: "毒气科技".into() },
+                IdNameEntry { id: 1, name: "毒气桶".into() },
+            ]
+        );
+        // 资源：先 `Name` 后 `ID`；`GroupID` / `RequiredTechID` 不误匹配。
+        let resources = "{\nResources:[\n{\nName: Grain,\nID: 0,\nImageID: 0,\nGroupID: 0,\n},\n{\nName: \"Rice\",\nID: 1,\nRequiredTechID: -1,\n},\n]}";
+        assert_eq!(
+            parse_id_name_table(resources),
+            vec![
+                IdNameEntry { id: 0, name: "Grain".into() },
+                IdNameEntry { id: 1, name: "Rice".into() },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_ordered_names_uses_array_order() {
+        let text = "{\nAge_of_History: Data,\nData:[\n{\nName: Pagan,\nReligionGroupID: 0,\n},\n{\nName: \"Catholic\",\nReligionGroupID: 1,\n},\n]}";
+        assert_eq!(
+            parse_ordered_names(text),
+            vec![
+                IdNameEntry { id: 0, name: "Pagan".into() },
+                IdNameEntry { id: 1, name: "Catholic".into() },
             ]
         );
     }
@@ -1993,7 +2652,8 @@ mod tests {
     ]
 }"#;
         let entries = parse_governments(text);
-        assert_eq!(entries.len(), 3);
+        // 没有 Extra_Tag 的条目也保留（tag 为空）：跳过会使其后所有政体编号前移。
+        assert_eq!(entries.len(), 4);
         assert_eq!(entries[0].index, 0);
         assert_eq!(entries[0].name, "临时政府");
         assert_eq!(entries[0].tag, "");
@@ -2001,7 +2661,80 @@ mod tests {
         assert_eq!(entries[1].name, "绝对君主制");
         assert_eq!(entries[1].tag, "m");
         assert_eq!(entries[2].index, 2);
-        assert_eq!(entries[2].name, "带,逗号的政府");
+        assert_eq!(entries[2].name, "只有名字没有 Extra_Tag");
+        assert_eq!(entries[2].tag, "");
+        assert_eq!(entries[3].index, 3);
+        assert_eq!(entries[3].name, "带,逗号的政府");
+    }
+
+    /// 1566 等模组把键写成带引号形式（`"Name":` / `"Extra_Tag":`），同样要能解析。
+    #[test]
+    fn parse_governments_tolerates_quoted_keys() {
+        let text = r##"{
+    "Government": [
+        {
+            "Name": "天朝礼法君主制",
+            "Extra_Tag": "1",
+            "GOV_GROUP_ID": 0,
+        },
+        {
+            "Name": "军政府",
+            "Extra_Tag": "m",
+        },
+    ]
+}"##;
+        let entries = parse_governments(text);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, "天朝礼法君主制");
+        assert_eq!(entries[0].tag, "1");
+        assert_eq!(entries[1].name, "军政府");
+        assert_eq!(entries[1].tag, "m");
+    }
+
+    /// 键名大小写差异（新模组的常见写法）也要能读到：`name:` / `NAME:` / `"P":` 等。
+    #[test]
+    fn parsers_tolerate_key_case_variants() {
+        let governments =
+            "{\n\"government\": [\n{\nname: \"临时政府\",\nextra_tag: \"x\",\n},\n]\n}";
+        let entries = parse_governments(governments);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "临时政府");
+        assert_eq!(entries[0].tag, "x");
+
+        let cities = "{\n\"cities\": [\n{\n\"NAME\": \"广州\",\n\"P\": 12,\n},\n]\n}";
+        assert_eq!(parse_city_names(cities), vec![(12, "广州".to_string())]);
+
+        let maps = "{\n\"maps\": [\n{\nfolder: \"Earth3\",\n},\n]\n}";
+        assert_eq!(parse_map_folders(maps), vec!["Earth3".to_string()]);
+
+        let buildings =
+            "{\nBuildings: [\n{ name: [\"要塞\"], },\n{ NAME: [\"工厂\", \"大工厂\"], },\n]\n}";
+        let parsed = parse_buildings(buildings);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[1].name, "工厂/大工厂");
+    }
+
+    /// 带引号的城市 / 地图键（`"Name":` / `"p":` / `"Folder":`）回归。
+    #[test]
+    fn parse_city_names_and_map_folders_tolerate_quoted_keys() {
+        let cities = r#"{
+    "cities": [
+        {
+            "Name": "北京",
+            "p": 13,
+        },
+        {
+            "Name": "南京",
+            "p": 25,
+        },
+    ]
+}"#;
+        assert_eq!(
+            parse_city_names(cities),
+            vec![(13, "北京".to_string()), (25, "南京".to_string())]
+        );
+        let maps = "{\n\"Maps\": [\n{\n\"Folder\": \"Earth3\"\n},\n{\n\"Folder\": \"ES\"\n},\n]}";
+        assert_eq!(parse_map_folders(maps), vec!["Earth3".to_string(), "ES".to_string()]);
     }
 
     #[test]
@@ -2132,6 +2865,37 @@ mod tests {
             .iter()
             .any(|entry| entry.id == 0 && entry.name == "黑死病"));
 
+        // 附加数据表：国家精神 / 科技 / 宗教 / 资源。
+        assert!(
+            lookup.national_spirits.len() >= 50,
+            "国家精神过少：{}",
+            lookup.national_spirits.len()
+        );
+        let fra1 = lookup
+            .national_spirits
+            .iter()
+            .find(|entry| entry.id == "fra1")
+            .unwrap();
+        assert_eq!(fra1.name, "法兰西新兴产业");
+        assert!(
+            lookup.technologies.len() >= 50,
+            "科技过少：{}",
+            lookup.technologies.len()
+        );
+        assert!(lookup
+            .technologies
+            .iter()
+            .any(|entry| entry.id == 0 && entry.name == "毒气科技"));
+        assert!(lookup.religions.len() >= 3);
+        assert!(lookup
+            .religions
+            .iter()
+            .any(|entry| entry.id == 0 && entry.name == "Pagan"));
+        assert!(lookup
+            .resources
+            .iter()
+            .any(|entry| entry.id == 0 && entry.name == "Grain"));
+
         // 剧本根（`assets/map/<地图>/scenarios/<剧本>/missions`）应同样加载到地图省份。
         let scenario_root = "暮色黄昏_世界大战0.25.1/assets/map/Earth3/scenarios/TheGreatWar/missions";
         let scenario_lookup =
@@ -2141,6 +2905,53 @@ mod tests {
             .provinces
             .iter()
             .any(|entry| entry.id == 12049 && entry.name == "费罗尔"));
+
+        // 事件图片候选（image / mission_image 的 .png 值）：工作区目录 + 源 APK 条目合并。
+        let workspace_images =
+            collect_event_image_names(Path::new(work_directory), missions_root);
+        assert!(
+            workspace_images.iter().any(|name| name == "专注侦察机.png"),
+            "工作区 missionsImages 应含 专注侦察机.png"
+        );
+        let archive = open_source_apk(
+            Path::new(work_directory),
+            missions_root,
+            &|location| File::open(location).ok(),
+        )
+        .expect("应能找到源 APK");
+        let apk_images = apk_event_image_names(&archive, missions_root);
+        assert!(
+            apk_images.len() >= 800,
+            "APK 事件图片过少：{}",
+            apk_images.len()
+        );
+        assert!(apk_images.iter().any(|name| name == "国策通用.png"));
+        // 剧本根：图片来自剧本自带的 missionsImages（APK 内同名目录）。
+        let scenario_images = apk_event_image_names(&archive, scenario_root);
+        assert!(scenario_images
+            .iter()
+            .any(|name| name == "国策通用.png"));
+
+        // 事件 / 音乐候选（run_event 与 musicName / play_music 的取值来源）。
+        // 全局根的候选 = game/missions/missionsEvents（97）+ game/events/common（55）。
+        let apk_events = apk_event_names(&archive, missions_root);
+        assert!(
+            apk_events.len() >= 100,
+            "APK 事件文件过少：{}",
+            apk_events.len()
+        );
+        assert!(apk_events.iter().any(|name| name == "专制主义"));
+        // 剧本根 = 剧本 missionsEvents（4807）+ 剧本 events/common（2176）+ 全局 events/common。
+        let scenario_events = apk_event_names(&archive, scenario_root);
+        assert!(
+            scenario_events.len() >= 5000,
+            "剧本事件文件过少：{}",
+            scenario_events.len()
+        );
+        assert!(scenario_events.iter().any(|name| name == "1919年巴西大选补选"));
+        let apk_music = apk_music_names(&archive, missions_root);
+        assert!(apk_music.iter().any(|name| name == "世界大战"));
+        assert!(apk_music.iter().any(|name| name == "默认"));
 
         // 标记文件方式：工作区只有导入版块，标记指向工作区之外的源 APK
         // （避免拷贝 GB 级文件，与 Android 上 `content://` URI 用法一致）。
@@ -2160,7 +2971,56 @@ mod tests {
         assert_eq!(marked.civs.len(), lookup.civs.len());
         assert_eq!(marked.provinces.len(), lookup.provinces.len());
         assert!(marked.characters.iter().any(|name| name == "约瑟夫·霞飞"));
+        assert!(!marked.national_spirits.is_empty());
         let _ = fs::remove_dir_all(&import_dir);
+    }
+
+    /// 本机验证：全部模组工作区（均为「从 apk 中导入」的版块目录 + 源 APK 兜底）的
+    /// 补全数据都能加载——覆盖各自的自定义地图名（Earth3 / ES / Begonia）。
+    /// 默认忽略：`cargo test -p age_civ_mod_tool --lib real_all_mods_lookup -- --ignored`
+    #[test]
+    #[ignore = "需要真实数据 A:\\android\\GameCivs"]
+    fn real_all_mods_lookup_via_apk_fallback() {
+        let work_directory = r"A:\android\GameCivs";
+        let mods = [
+            "1566AuroraPrever2",
+            "europe",
+            "road_to_56",
+            "暮色黄昏_世界大战0.25.1",
+            "白日升",
+        ];
+        for name in mods {
+            let root = format!("{name}/assets/game/missions");
+            let lookup = load_event_lookup_blocking(work_directory, &root)
+                .unwrap_or_else(|error| panic!("{name}：{error}"));
+            assert!(!lookup.civs.is_empty(), "{name} 文明清单为空");
+            assert!(!lookup.governments.is_empty(), "{name} 政体清单为空");
+            assert!(!lookup.provinces.is_empty(), "{name} 省份清单为空");
+            println!(
+                "{name}：文明 {} / 政体 {} / 省份 {} / 人物 {} / 国家精神 {} / 科技 {} / 宗教 {} / 资源 {}",
+                lookup.civs.len(),
+                lookup.governments.len(),
+                lookup.provinces.len(),
+                lookup.characters.len(),
+                lookup.national_spirits.len(),
+                lookup.technologies.len(),
+                lookup.religions.len(),
+                lookup.resources.len(),
+            );
+        }
+        // 自定义地图名的剧本根（europe 的 ES / 白日升的 Begonia / 1566 的 Earth3）：
+        // 省份按所属地图过滤加载。
+        for (name, root) in [
+            ("europe/Ukr2014", "europe/assets/map/ES/scenarios/Ukr2014/missions"),
+            ("europe/RusUkrWar", "europe/assets/map/ES/scenarios/RusUkrWar/missions"),
+            ("1566/ming", "1566AuroraPrever2/assets/map/Earth3/scenarios/ming/missions"),
+            ("白日升/RWS", "白日升/assets/map/Begonia/scenarios/RWS/missions"),
+        ] {
+            let lookup = load_event_lookup_blocking(work_directory, root)
+                .unwrap_or_else(|error| panic!("{name}：{error}"));
+            assert!(!lookup.provinces.is_empty(), "{name} 省份清单为空");
+            println!("{name}：省份 {}", lookup.provinces.len());
+        }
     }
 
     /// 写入合成源 APK（「从 apk 中导入」兜底测试用）。
@@ -2200,6 +3060,23 @@ mod tests {
         );
         add("assets/game/languages/Bundle_cn_sp.properties", "Plague = 瘟疫");
         add("assets/game/characters/某人.json", "[{ Name: \"某人甲\", }]");
+        // 附加数据表：国家精神 / 科技 / 宗教 / 资源。
+        add(
+            "assets/game/NationalSpirit.json",
+            "{\n\"nationalSpirits\":[\n{\n\"id\":\"fra1\",\n\"name\":\"法兰西万岁\",\n},\n{\n\"id\":\"sov3\",\n\"name\":\"苏维埃精神\",\n},\n]}",
+        );
+        add(
+            "assets/game/technologies/Technologies.json",
+            "{\nTechnology:[\n{\nID: 0,\nName: \"毒气科技\",\n},\n{\nID: 1,\nName: \"毒气桶\",\nMaintainTechnologyName: true,\n},\n]}",
+        );
+        add(
+            "assets/game/Religions.json",
+            "{\nData:[\n{\nName: Pagan,\nReligionGroupID: 0,\n},\n{\nName: \"Catholic\",\nReligionGroupID: 1,\n},\n]}",
+        );
+        add(
+            "assets/game/resources/Resources.json",
+            "{\nResources:[\n{\nName: Grain,\nID: 0,\nImageID: 0,\n},\n{\nName: \"Rice\",\nID: 1,\n},\n]}",
+        );
         add(
             "assets/map/Maps.json",
             "{\n Map: [\n {\n Folder: \"TestMap\",\n },\n ]\n}",
@@ -2213,6 +3090,22 @@ mod tests {
             "assets/map/TestMap/cities/cities.json",
             "[\n{\n Name: \"示例城\",\n p: 7\n},\n{\n Name: \"无名城\",\n p: 42\n},\n]",
         );
+        // 事件图片候选（image / mission_image 字段的 .png 文件名）
+        add("assets/game/events/images/H/通用图.png", "png");
+        add("assets/game/events/images/H/readme.txt", "忽略非 png");
+        // 事件（run_event 值 = 文件名去 .txt）与音乐候选（音频去扩展名 + list*.txt）。
+        add("assets/game/missions/missionsEvents/国策事件.txt", "{}");
+        add("assets/game/events/common/全局事件.txt", "{}");
+        add(
+            "assets/map/TestMap/scenarios/TheGreatWar/events/common/剧本事件.txt",
+            "{}",
+        );
+        add(
+            "assets/map/TestMap/scenarios/TheGreatWar/missions/missionsEvents/剧本国策.txt",
+            "{}",
+        );
+        add("assets/audio/music/世界大战.ogg", "ogg");
+        add("assets/audio/music/list.txt", "西线;东线;");
         drop(add);
         zip.finish().unwrap();
     }
@@ -2253,6 +3146,35 @@ mod tests {
             vec![
                 ProvinceEntry { id: 7, name: "示例城".into() },
                 ProvinceEntry { id: 9, name: String::new() },
+            ]
+        );
+        // 附加数据表：国家精神 / 科技 / 宗教 / 资源。
+        assert_eq!(
+            lookup.national_spirits,
+            vec![
+                IdTextNameEntry { id: "fra1".into(), name: "法兰西万岁".into() },
+                IdTextNameEntry { id: "sov3".into(), name: "苏维埃精神".into() },
+            ]
+        );
+        assert_eq!(
+            lookup.technologies,
+            vec![
+                IdNameEntry { id: 0, name: "毒气科技".into() },
+                IdNameEntry { id: 1, name: "毒气桶".into() },
+            ]
+        );
+        assert_eq!(
+            lookup.religions,
+            vec![
+                IdNameEntry { id: 0, name: "Pagan".into() },
+                IdNameEntry { id: 1, name: "Catholic".into() },
+            ]
+        );
+        assert_eq!(
+            lookup.resources,
+            vec![
+                IdNameEntry { id: 0, name: "Grain".into() },
+                IdNameEntry { id: 1, name: "Rice".into() },
             ]
         );
     }
@@ -2346,5 +3268,145 @@ mod tests {
 
         let _ = fs::remove_dir_all(&workspace);
         let _ = fs::remove_file(&apk);
+    }
+
+    #[test]
+    fn event_image_dirs_cover_layouts() {
+        assert_eq!(
+            event_image_relative_dirs("包名/assets/game/missions"),
+            vec![
+                "包名/assets/game/missions/missionsImages/H".to_string(),
+                "包名/assets/game/events/images/H".to_string(),
+                "包名/assets/game/decisions/decisionsImages/H".to_string(),
+            ]
+        );
+        assert_eq!(
+            event_image_relative_dirs("包名/assets/map/Earth3/scenarios/TheGreatWar/missions"),
+            vec![
+                "包名/assets/map/Earth3/scenarios/TheGreatWar/missions/missionsImages/H"
+                    .to_string(),
+                "包名/assets/map/Earth3/scenarios/TheGreatWar/events/images/H".to_string(),
+                "包名/assets/map/Earth3/scenarios/TheGreatWar/decisions/decisionsImages/H"
+                    .to_string(),
+            ]
+        );
+        // 经典根：同级目录直接从工作区根推导。
+        let classic = event_image_relative_dirs("missions");
+        assert_eq!(classic[0], "missions/missionsImages/H");
+        assert_eq!(classic[1], "events/images/H");
+    }
+
+    #[test]
+    fn collect_event_image_names_merges_dirs() {
+        let workspace = temp_dir("event-images");
+        let game = workspace.join("包名/assets/game");
+        fs::create_dir_all(game.join("missions/missionsImages/H")).unwrap();
+        fs::create_dir_all(game.join("events/images/H")).unwrap();
+        fs::write(game.join("missions/missionsImages/H/树标.png"), b"x").unwrap();
+        fs::write(game.join("events/images/H/国策通用.png"), b"x").unwrap();
+        // 同名重复：去重；非 png：忽略。
+        fs::write(game.join("events/images/H/树标.png"), b"x").unwrap();
+        fs::write(game.join("events/images/H/readme.txt"), b"x").unwrap();
+
+        let names = collect_event_image_names(&workspace, "包名/assets/game/missions");
+        assert_eq!(
+            names,
+            vec!["国策通用.png".to_string(), "树标.png".to_string()]
+        );
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn event_script_and_music_dirs_cover_layouts() {
+        let game = event_script_relative_dirs("包名/assets/game/missions");
+        assert_eq!(game[0], "包名/assets/game/missions/missionsEvents");
+        assert!(game.contains(&"包名/assets/game/events/common".to_string()));
+        let scenario =
+            event_script_relative_dirs("包名/assets/map/Earth3/scenarios/TheGreatWar/missions");
+        assert_eq!(
+            scenario[0],
+            "包名/assets/map/Earth3/scenarios/TheGreatWar/missions/missionsEvents"
+        );
+        assert!(scenario
+            .contains(&"包名/assets/map/Earth3/scenarios/TheGreatWar/events/common".to_string()));
+        assert!(scenario.contains(&"包名/assets/game/events/common".to_string()));
+        // 经典根：missions 同级（重复候选去重）。
+        assert_eq!(
+            event_script_relative_dirs("missions"),
+            vec![
+                "missions/missionsEvents".to_string(),
+                "events/common".to_string(),
+            ]
+        );
+
+        assert_eq!(
+            event_music_relative_dirs("包名/assets/game/missions"),
+            vec!["包名/assets/audio/music".to_string()]
+        );
+        assert_eq!(
+            event_music_relative_dirs("包名/assets/map/Earth3/scenarios/TheGreatWar/missions"),
+            vec!["包名/assets/audio/music".to_string()]
+        );
+        // 无 assets 段（经典布局）：不推导音乐目录。
+        assert!(event_music_relative_dirs("missions").is_empty());
+    }
+
+    #[test]
+    fn collect_event_and_music_names_merge_sources() {
+        let workspace = temp_dir("event-music-names");
+        let game = workspace.join("包名/assets/game");
+        fs::create_dir_all(game.join("missions/missionsEvents")).unwrap();
+        fs::create_dir_all(game.join("events/common")).unwrap();
+        fs::create_dir_all(workspace.join("包名/assets/audio/music")).unwrap();
+        fs::write(game.join("missions/missionsEvents/国策事件.txt"), "{}").unwrap();
+        fs::write(game.join("events/common/全局事件.txt"), "{}").unwrap();
+        fs::write(game.join("events/common/readme.json"), "{}").unwrap();
+        fs::write(workspace.join("包名/assets/audio/music/世界大战.ogg"), b"x").unwrap();
+        fs::write(workspace.join("包名/assets/audio/music/list.txt"), "西线;东线;;").unwrap();
+
+        let events = collect_event_names(&workspace, "包名/assets/game/missions");
+        assert_eq!(events, vec!["全局事件".to_string(), "国策事件".to_string()]);
+        let music = collect_music_names(&workspace, "包名/assets/game/missions");
+        assert_eq!(
+            music,
+            vec![
+                "世界大战".to_string(),
+                "东线".to_string(),
+                "西线".to_string(),
+            ]
+        );
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn apk_event_image_names_reads_entries() {
+        let dir = temp_dir("event-images-apk");
+        let apk = dir.join("测试包.apk");
+        write_synthetic_source_apk(&apk);
+        let archive = ApkArchive::open(File::open(&apk).unwrap()).unwrap();
+        let names = apk_event_image_names(&archive, "测试包/assets/game/missions");
+        assert_eq!(names, vec!["通用图.png".to_string()]);
+        // 事件候选：国策 missionsEvents + 全局 events/common（去 .txt）。
+        let events = apk_event_names(&archive, "测试包/assets/game/missions");
+        assert_eq!(events, vec!["全局事件".to_string(), "国策事件".to_string()]);
+        // 音乐候选：音频文件名去扩展名 + list*.txt 清单条目。
+        let music = apk_music_names(&archive, "测试包/assets/game/missions");
+        assert_eq!(
+            music,
+            vec![
+                "世界大战".to_string(),
+                "东线".to_string(),
+                "西线".to_string(),
+            ]
+        );
+        // 剧本根：剧本 events/common 与 missionsEvents 同样收录。
+        let scenario_events = apk_event_names(
+            &archive,
+            "测试包/assets/map/TestMap/scenarios/TheGreatWar/missions",
+        );
+        assert!(scenario_events.contains(&"剧本事件".to_string()));
+        assert!(scenario_events.contains(&"剧本国策".to_string()));
+        assert!(scenario_events.contains(&"全局事件".to_string()));
+        let _ = fs::remove_dir_all(&dir);
     }
 }

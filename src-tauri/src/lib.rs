@@ -94,6 +94,8 @@ pub fn run() {
             commands::missions_db::load_event_lookup_scoped,
             commands::missions_db::set_lookup_source_apk,
             commands::missions_db::set_lookup_source_apk_scoped,
+            commands::missions_db::list_event_assets,
+            commands::missions_db::list_event_assets_scoped,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

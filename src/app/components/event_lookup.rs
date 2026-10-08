@@ -1,4 +1,4 @@
-//! 事件编辑器「文明 / 政体 / 省份 / 建筑 / 疾病 / 人物对照表」。
+//! 事件编辑器「文明 / 政体 / 省份 / 建筑 / 疾病 / 人物 / 国家精神 / 科技 / 宗教 / 资源对照表」。
 //!
 //! 数据由后端命令提供（解析核心移植自 ScvGen 库，见
 //! `src-tauri/src/commands/missions_db.rs`）：
@@ -7,10 +7,14 @@
 //!   序号即游戏内使用的「政体整数」）；
 //! - 省份：地图（`assets/map/Maps.json` 发现）省份 ID → 地名（`cities/cities.json`）；
 //! - 建筑 / 疾病：定义数组顺序即 ID（疾病名称经根语言表翻译）；
-//! - 人物：`characters/**.json` 的 `Name` 与文件名（供 add_general 系列补全）。
+//! - 人物：`characters/**.json` 的 `Name` 与文件名（供 add_general 系列补全）；
+//! - 国家精神：`NationalSpirit.json` 的字符串 id（如 `fra1`）→ 名称（add_ns / remove_ns）；
+//! - 科技 / 资源：`Name:` + `ID:` 配对表（TypeNames / Resources.json）；
+//! - 宗教：`Religions.json` 数组顺序即 ID（change_religion 等）。
 //!
 //! 供 `event_grid` 为对应值单元格提供候选补全与「值 → 名称」对照提示：
 //! 桌面端走原生 `<datalist>`，安卓端走 `event_grid::SuggestInput` 页面内自绘下拉（同一套数据）。
+//! 另载入「指向资源」的事件 / 音乐 / 图片候选（见 [`load_event_assets`]）。
 
 use serde::{Deserialize, Serialize};
 use wasm_bindgen_futures::JsFuture;
@@ -32,10 +36,17 @@ pub struct GovItem {
 	pub name: String,
 }
 
-/// 数值 ID + 名称对照条目（省份 / 建筑 / 疾病共用）。
+/// 数值 ID + 名称对照条目（省份 / 建筑 / 疾病 / 科技 / 宗教 / 资源共用）。
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 pub struct IdNameItem {
 	pub id: u32,
+	pub name: String,
+}
+
+/// 字符串 ID + 名称对照条目（国家精神：`id` 如 `fra1`）。
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct IdTextItem {
+	pub id: String,
 	pub name: String,
 }
 
@@ -58,6 +69,18 @@ pub struct EventLookup {
 	/// 疾病清单（数组顺序即 ID）。
 	#[serde(default)]
 	pub diseases: Vec<IdNameItem>,
+	/// 国家精神清单（`id` 为字符串；add_ns / remove_ns）。
+	#[serde(default)]
+	pub national_spirits: Vec<IdTextItem>,
+	/// 科技清单（unlock_tech）。
+	#[serde(default)]
+	pub technologies: Vec<IdNameItem>,
+	/// 宗教清单（数组顺序即 ID；change_religion 等）。
+	#[serde(default)]
+	pub religions: Vec<IdNameItem>,
+	/// 资源清单（resource_price_change 系列）。
+	#[serde(default)]
+	pub resources: Vec<IdNameItem>,
 }
 
 impl EventLookup {
@@ -69,6 +92,10 @@ impl EventLookup {
 			&& self.provinces.is_empty()
 			&& self.buildings.is_empty()
 			&& self.diseases.is_empty()
+			&& self.national_spirits.is_empty()
+			&& self.technologies.is_empty()
+			&& self.religions.is_empty()
+			&& self.resources.is_empty()
 	}
 
 	/// 按 tag 查文明名称（ASCII 大小写不敏感，中文等非 ASCII 精确匹配）。
@@ -101,6 +128,29 @@ impl EventLookup {
 	pub fn disease_name(&self, id: u32) -> Option<&str> {
 		name_of(&self.diseases, id)
 	}
+
+	/// 按字符串 ID 查国家精神名称。
+	pub fn national_spirit_name(&self, id: &str) -> Option<&str> {
+		self.national_spirits
+			.iter()
+			.find(|item| item.id == id)
+			.map(|item| item.name.as_str())
+	}
+
+	/// 按 ID 查科技名称。
+	pub fn technology_name(&self, id: u32) -> Option<&str> {
+		name_of(&self.technologies, id)
+	}
+
+	/// 按 ID 查宗教名称。
+	pub fn religion_name(&self, id: u32) -> Option<&str> {
+		name_of(&self.religions, id)
+	}
+
+	/// 按 ID 查资源名称。
+	pub fn resource_name(&self, id: u32) -> Option<&str> {
+		name_of(&self.resources, id)
+	}
 }
 
 /// 按 ID 二分查找非空名称（后端输出按 ID 升序）。
@@ -129,6 +179,20 @@ pub enum ValuePart {
 	Disease,
 	/// 人物名称（`characters` 清单，值本身就是名称）。
 	Character,
+	/// 国家精神字符串 ID（`NationalSpirit.json`，如 `fra1`）。
+	NationalSpirit,
+	/// 科技整数 ID（`Technologies.json` 顺序号）。
+	Technology,
+	/// 宗教整数 ID（`Religions.json` 顺序号）。
+	Religion,
+	/// 资源整数 ID（`Resources.json`；`resource_price_change` 系列）。
+	Resource,
+	/// 事件文件名（`run_event` / `run_event_instantly`，值 = 文件名去 `.txt`）。
+	EventId,
+	/// 音乐名（`musicName` / `play_music`；音频文件名去扩展名或 `list*.txt` 条目）。
+	Music,
+	/// 图片资源文件名（`image` / `mission_image` / `decision_image`，含 `.png` 扩展名）。
+	Image,
 	/// 普通文本段（不提供补全与提示）。
 	Plain,
 }
@@ -139,6 +203,13 @@ pub const PROVINCE_DATALIST_ID: &str = "evdl-prov";
 pub const BUILDING_DATALIST_ID: &str = "evdl-build";
 pub const DISEASE_DATALIST_ID: &str = "evdl-disease";
 pub const CHARACTER_DATALIST_ID: &str = "evdl-char";
+pub const NATIONAL_SPIRIT_DATALIST_ID: &str = "evdl-ns";
+pub const TECHNOLOGY_DATALIST_ID: &str = "evdl-tech";
+pub const RELIGION_DATALIST_ID: &str = "evdl-religion";
+pub const RESOURCE_DATALIST_ID: &str = "evdl-resource";
+pub const EVENT_DATALIST_ID: &str = "evdl-event";
+pub const MUSIC_DATALIST_ID: &str = "evdl-music";
+pub const IMAGE_DATALIST_ID: &str = "evdl-image";
 
 /// 分段语义对应的 datalist id（`Plain` 无候选列表）。
 pub fn datalist_id(kind: ValuePart) -> &'static str {
@@ -149,6 +220,13 @@ pub fn datalist_id(kind: ValuePart) -> &'static str {
 		ValuePart::Building => BUILDING_DATALIST_ID,
 		ValuePart::Disease => DISEASE_DATALIST_ID,
 		ValuePart::Character => CHARACTER_DATALIST_ID,
+		ValuePart::NationalSpirit => NATIONAL_SPIRIT_DATALIST_ID,
+		ValuePart::Technology => TECHNOLOGY_DATALIST_ID,
+		ValuePart::Religion => RELIGION_DATALIST_ID,
+		ValuePart::Resource => RESOURCE_DATALIST_ID,
+		ValuePart::EventId => EVENT_DATALIST_ID,
+		ValuePart::Music => MUSIC_DATALIST_ID,
+		ValuePart::Image => IMAGE_DATALIST_ID,
 		ValuePart::Plain => "",
 	}
 }
@@ -163,7 +241,7 @@ pub fn part_suffix(kind: ValuePart) -> &'static str {
 
 /// 按键名查询值分段语义；返回 `None` 表示该键与对照表无关。
 ///
-/// 依据《国策系统说明文档.md》与 `event_schema` 的注解整理：
+/// 依据《国策系统说明文档》（docs/国策系统说明文档.md）与 `event_schema` 的注解整理：
 /// 只有标注「文明ID / tag / civ」的段位返回 [`ValuePart::Civ`]，
 /// 只有「政体」相关字段返回 [`ValuePart::Gov`]；省份 / 建筑 / 疾病 / 人物同理。
 pub fn value_parts(key: &str) -> Option<&'static [ValuePart]> {
@@ -175,7 +253,6 @@ pub fn value_parts(key: &str) -> Option<&'static [ValuePart]> {
 		"civ_is_vassal_of_civ" | "civs_are_at_war" => &[Civ, Civ],
 		"has_variable_civ" => &[Civ, Plain],
 		"province_has_building" => &[Province, Building],
-		"province_core_of" => &[Province, Plain],
 		// ===== 收益效果 =====
 		"change_ideology" => &[Gov],
 		"change_ideology_civ" => &[Civ, Gov],
@@ -188,13 +265,15 @@ pub fn value_parts(key: &str) -> Option<&'static [ValuePart]> {
 		"set_civ_tag2" | "make_puppet" | "declare_war2" | "white_peace" | "white_peace2"
 		| "add_defensive_pact" | "add_guarantee" | "add_truce" => &[Civ, Civ],
 		"annex_by_civ_from_civ" => &[Civ, Civ, Civ],
-		"relation_change" | "relation_set" | "change_religion_civ" | "add_variable_civ"
-		| "remove_variable_civ" | "annex_provinces_from_civ" => &[Civ, Plain],
+		"relation_change" | "relation_set" | "add_variable_civ" | "remove_variable_civ"
+		| "annex_provinces_from_civ" => &[Civ, Plain],
 		// 省份（第二段为数值/未确认语义时按 Plain 处理）
 		"move_capital" | "province_id_nuke" => &[Province],
 		"province_economy_id" | "province_manpower_id" | "province_devastation_id"
-		| "province_id_pop_set" | "province_id_core_add" | "province_id_core_remove" => {
-			&[Province, Plain]
+		| "province_id_pop_set" => &[Province, Plain],
+		// 核心相关：文档为「省份ID=文明ID」（第二段是文明而非数字）。
+		"province_core_of" | "province_id_core_add" | "province_id_core_remove" => {
+			&[Province, Civ]
 		}
 		"province_id_build_add" | "province_id_build_remove" => &[Province, Building],
 		"province_id_spread_disease" => &[Province, Disease],
@@ -205,6 +284,21 @@ pub fn value_parts(key: &str) -> Option<&'static [ValuePart]> {
 			&[Character]
 		}
 		"add_general_character_attack_defense" => &[Character, Plain, Plain],
+		// 图片资源（值=含扩展名的文件名，如 `国策通用.png`）：候选来自
+		// `<missions root>/missionsImages/H` 与 `<game>/events/images/H`（见后端 list_event_assets）。
+		"image" | "mission_image" | "decision_image" => &[Image],
+		// 国家精神（值 = `NationalSpirit.json` 的字符串 id，如 `fra1`）。
+		"add_ns" | "remove_ns" => &[NationalSpirit],
+		// 科技 / 宗教 / 资源（值 = 对应数据表的整数 ID）。
+		"unlock_tech" => &[Technology],
+		"change_religion" | "province_religion_all" => &[Religion],
+		"change_religion_civ" => &[Civ, Religion],
+		"resource_price_change" | "resource_price_change_up" | "resource_price_change_down"
+		| "resource_price_change_random" => &[Resource, Plain],
+		// 事件（值 = 事件文件名去 `.txt`，如 `1919年巴西大选补选`）。
+		"run_event" | "run_event_instantly" => &[EventId],
+		// 音乐（值 = 音频文件名去扩展名或 `list*.txt` 清单条目）。
+		"musicName" | "play_music" => &[Music],
 		_ => return None,
 	};
 	Some(parts)
@@ -271,8 +365,29 @@ pub fn name_hint(lookup: &EventLookup, parts: &[ValuePart], value: &str) -> Stri
 					}
 				}
 			}
-			// 人物名称本身就是值，无需再对照。
-			ValuePart::Character | ValuePart::Plain => {}
+			ValuePart::NationalSpirit => {
+				if let Some(name) = lookup.national_spirit_name(part) {
+					pieces.push(format!("{part}={name}"));
+				}
+			}
+			ValuePart::Technology | ValuePart::Religion | ValuePart::Resource => {
+				if let Ok(id) = part.parse::<u32>() {
+					let name = match kind {
+						ValuePart::Technology => lookup.technology_name(id),
+						ValuePart::Religion => lookup.religion_name(id),
+						_ => lookup.resource_name(id),
+					};
+					if let Some(name) = name {
+						pieces.push(format!("{part}={name}"));
+					}
+				}
+			}
+			// 人物 / 事件 / 音乐的值本身就是名称，无需再对照；图片文件名同理（无「值→名称」映射）。
+			ValuePart::Character
+			| ValuePart::EventId
+			| ValuePart::Music
+			| ValuePart::Image
+			| ValuePart::Plain => {}
 		}
 	}
 	pieces.join(" · ")
@@ -387,6 +502,11 @@ pub fn filter_suggestions(
 	)
 }
 
+/// 资源文件名候选过滤（无说明标签；`filter_suggestions` 的纯名称版）。
+pub fn filter_names(names: &[String], query: &str, limit: usize) -> Vec<(String, String)> {
+	str_rank_filter(names.iter().map(|name| (name.as_str(), "")), query, limit)
+}
+
 /// 对照表候选：按字段类型生成「值, 说明」并过滤（支持按名称/地名搜索，
 /// 如输入「奥」可命中 `atr=奥地利`，输入「上海」可命中对应省份 ID）。
 pub fn matching_lookup(
@@ -441,6 +561,34 @@ pub fn matching_lookup(
 			query,
 			limit,
 		),
+		ValuePart::NationalSpirit => str_rank_filter(
+			lookup
+				.national_spirits
+				.iter()
+				.map(|item| (item.id.as_str(), item.name.as_str())),
+			query,
+			limit,
+		),
+		ValuePart::Technology => numbered_rank_filter(
+			lookup
+				.technologies
+				.iter()
+				.map(|item| (item.id, item.name.as_str())),
+			query,
+			limit,
+		),
+		ValuePart::Religion => numbered_rank_filter(
+			lookup.religions.iter().map(|item| (item.id, item.name.as_str())),
+			query,
+			limit,
+		),
+		ValuePart::Resource => numbered_rank_filter(
+			lookup.resources.iter().map(|item| (item.id, item.name.as_str())),
+			query,
+			limit,
+		),
+		// 事件 / 音乐 / 图片候选不走对照表（由 `list_event_assets` 单独加载，见 `SuggestOptions::Names`）。
+		ValuePart::EventId | ValuePart::Music | ValuePart::Image => Vec::new(),
 		ValuePart::Plain => Vec::new(),
 	}
 }
@@ -520,6 +668,64 @@ struct LookupScopedArgs {
 	missions_root: String,
 }
 
+/// 事件脚本资源候选（后端 `list_event_assets` 命令返回结构的镜像）。
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+pub struct EventAssets {
+	/// 图片：`.png` 文件名（含扩展名，如 `国策通用.png`）。
+	#[serde(default)]
+	pub images: Vec<String>,
+	/// 事件：文件名去 `.txt`（`run_event` / `run_event_instantly` 的值）。
+	#[serde(default)]
+	pub events: Vec<String>,
+	/// 音乐：音频文件名去扩展名与 `list*.txt` 条目（`musicName` / `play_music` 的值）。
+	#[serde(default)]
+	pub music: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EventAssetsArgs {
+	work_directory: String,
+	missions_root: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EventAssetsScopedArgs {
+	folder_id: String,
+	missions_root: String,
+}
+
+/// 加载事件脚本资源候选（图片 / 事件 / 音乐，见 [`EventAssets`]）。
+///
+/// 真实路径走 `list_event_assets`，SAF 走 scoped 变体；两者都会在「从 apk 中导入」
+/// 的版块工作区里回退读取源 APK 条目。失败由调用方兜底为空（编辑器仅无候选，不报错）。
+pub async fn load_event_assets(
+	directory: &WorkDirectory,
+	missions_root: &str,
+) -> Result<EventAssets, String> {
+	let value = if let Some(folder_id) = &directory.folder_id {
+		let args = serde_wasm_bindgen::to_value(&EventAssetsScopedArgs {
+			folder_id: folder_id.clone(),
+			missions_root: missions_root.to_string(),
+		})
+		.map_err(|error| error.to_string())?;
+		JsFuture::from(invoke("list_event_assets_scoped", args))
+			.await
+			.map_err(|error| format!("加载资源候选失败：{error:?}"))?
+	} else {
+		let args = serde_wasm_bindgen::to_value(&EventAssetsArgs {
+			work_directory: directory.root_path.clone(),
+			missions_root: missions_root.to_string(),
+		})
+		.map_err(|error| error.to_string())?;
+		JsFuture::from(invoke("list_event_assets", args))
+			.await
+			.map_err(|error| format!("加载资源候选失败：{error:?}"))?
+	};
+	serde_wasm_bindgen::from_value(value).map_err(|error| format!("资源候选格式错误：{error}"))
+}
+
 /// 加载对照表：真实路径模式走 `load_event_lookup`，SAF 模式走 `load_event_lookup_scoped`。
 ///
 /// 工作区没有游戏数据文件时后端返回空表（编辑器不显示补全但不报错）。
@@ -581,6 +787,22 @@ mod tests {
 			diseases: vec![
 				IdNameItem { id: 0, name: "黑死病".into() },
 				IdNameItem { id: 1, name: "天花".into() },
+			],
+			national_spirits: vec![
+				IdTextItem { id: "fra1".into(), name: "法兰西万岁".into() },
+				IdTextItem { id: "sov3".into(), name: "苏维埃精神".into() },
+			],
+			technologies: vec![
+				IdNameItem { id: 0, name: "毒气科技".into() },
+				IdNameItem { id: 15, name: "机械化".into() },
+			],
+			religions: vec![
+				IdNameItem { id: 0, name: "Pagan".into() },
+				IdNameItem { id: 1, name: "Catholic".into() },
+			],
+			resources: vec![
+				IdNameItem { id: 0, name: "Grain".into() },
+				IdNameItem { id: 1, name: "Rice".into() },
 			],
 		}
 	}
@@ -706,6 +928,116 @@ mod tests {
 		assert_eq!(game_dir_key("assets/game/missions"), "assets/game");
 		assert_eq!(game_dir_key("missions"), "");
 		assert_eq!(game_dir_key("foo/missions"), "foo");
+	}
+
+	#[test]
+	fn value_parts_covers_new_lookup_fields() {
+		let spirit: &[ValuePart] = &[ValuePart::NationalSpirit];
+		let technology: &[ValuePart] = &[ValuePart::Technology];
+		let religion: &[ValuePart] = &[ValuePart::Religion];
+		let resource: &[ValuePart] = &[ValuePart::Resource, ValuePart::Plain];
+		let civ_religion: &[ValuePart] = &[ValuePart::Civ, ValuePart::Religion];
+		let event: &[ValuePart] = &[ValuePart::EventId];
+		let music: &[ValuePart] = &[ValuePart::Music];
+		let province_civ: &[ValuePart] = &[ValuePart::Province, ValuePart::Civ];
+
+		assert_eq!(value_parts("add_ns"), Some(spirit));
+		assert_eq!(value_parts("remove_ns"), Some(spirit));
+		assert_eq!(value_parts("unlock_tech"), Some(technology));
+		assert_eq!(value_parts("change_religion"), Some(religion));
+		assert_eq!(value_parts("province_religion_all"), Some(religion));
+		assert_eq!(value_parts("change_religion_civ"), Some(civ_religion));
+		assert_eq!(value_parts("resource_price_change"), Some(resource));
+		assert_eq!(value_parts("resource_price_change_random"), Some(resource));
+		assert_eq!(value_parts("run_event"), Some(event));
+		assert_eq!(value_parts("run_event_instantly"), Some(event));
+		assert_eq!(value_parts("musicName"), Some(music));
+		assert_eq!(value_parts("play_music"), Some(music));
+		// 文档更正：核心相关字段第二段是文明 ID（而非数字）。
+		assert_eq!(value_parts("province_core_of"), Some(province_civ));
+		assert_eq!(value_parts("province_id_core_add"), Some(province_civ));
+		assert_eq!(value_parts("province_id_core_remove"), Some(province_civ));
+		// datalist 归属。
+		assert_eq!(
+			datalist_id(ValuePart::NationalSpirit),
+			NATIONAL_SPIRIT_DATALIST_ID
+		);
+		assert_eq!(datalist_id(ValuePart::Technology), TECHNOLOGY_DATALIST_ID);
+		assert_eq!(datalist_id(ValuePart::Religion), RELIGION_DATALIST_ID);
+		assert_eq!(datalist_id(ValuePart::Resource), RESOURCE_DATALIST_ID);
+		assert_eq!(datalist_id(ValuePart::EventId), EVENT_DATALIST_ID);
+		assert_eq!(datalist_id(ValuePart::Music), MUSIC_DATALIST_ID);
+	}
+
+	#[test]
+	fn name_hint_maps_new_lookup_fields() {
+		let lookup = sample_lookup();
+		let parts = value_parts("add_ns").unwrap();
+		assert_eq!(name_hint(&lookup, parts, "fra1"), "fra1=法兰西万岁");
+		assert_eq!(name_hint(&lookup, parts, "fr"), "");
+		let parts = value_parts("unlock_tech").unwrap();
+		assert_eq!(name_hint(&lookup, parts, "15"), "15=机械化");
+		assert_eq!(name_hint(&lookup, parts, "99"), "");
+		let parts = value_parts("change_religion").unwrap();
+		assert_eq!(name_hint(&lookup, parts, "1"), "1=Catholic");
+		let parts = value_parts("change_religion_civ").unwrap();
+		assert_eq!(name_hint(&lookup, parts, "fra=0"), "fra=法兰西 · 0=Pagan");
+		let parts = value_parts("resource_price_change").unwrap();
+		assert_eq!(name_hint(&lookup, parts, "1=5"), "1=Rice");
+		let parts = value_parts("province_id_core_add").unwrap();
+		assert_eq!(name_hint(&lookup, parts, "3475=atr"), "3475=北平 · atr=奥地利");
+		// 事件 / 音乐的值本身就是名称，不产生对照提示。
+		let parts = value_parts("run_event").unwrap();
+		assert_eq!(name_hint(&lookup, parts, "1919年巴西大选补选"), "");
+		let parts = value_parts("play_music").unwrap();
+		assert_eq!(name_hint(&lookup, parts, "世界大战"), "");
+	}
+
+	#[test]
+	fn lookup_filter_supports_new_tables() {
+		let lookup = sample_lookup();
+		let matched = matching_lookup(&lookup, ValuePart::NationalSpirit, "fra", 10);
+		assert_eq!(matched[0], ("fra1".to_string(), "法兰西万岁".to_string()));
+		let matched = matching_lookup(&lookup, ValuePart::NationalSpirit, "苏维埃", 10);
+		assert_eq!(matched, vec![("sov3".to_string(), "苏维埃精神".to_string())]);
+		let matched = matching_lookup(&lookup, ValuePart::Technology, "毒气", 10);
+		assert_eq!(matched, vec![("0".to_string(), "毒气科技".to_string())]);
+		let matched = matching_lookup(&lookup, ValuePart::Religion, "cath", 10);
+		assert_eq!(matched, vec![("1".to_string(), "Catholic".to_string())]);
+		let matched = matching_lookup(&lookup, ValuePart::Resource, "grain", 10);
+		assert_eq!(matched, vec![("0".to_string(), "Grain".to_string())]);
+		// 事件 / 音乐候选不走对照表（由 list_event_assets 加载）。
+		assert!(matching_lookup(&lookup, ValuePart::EventId, "x", 10).is_empty());
+		assert!(matching_lookup(&lookup, ValuePart::Music, "x", 10).is_empty());
+	}
+
+	#[test]
+	fn value_parts_covers_image_fields() {
+		let image: &[ValuePart] = &[ValuePart::Image];
+		assert_eq!(value_parts("image"), Some(image));
+		assert_eq!(value_parts("mission_image"), Some(image));
+		assert_eq!(value_parts("decision_image"), Some(image));
+		assert_eq!(datalist_id(ValuePart::Image), IMAGE_DATALIST_ID);
+		assert_eq!(part_suffix(ValuePart::Image), "");
+		// 图片值不参与「值 → 名称」对照。
+		let lookup = sample_lookup();
+		assert_eq!(name_hint(&lookup, image, "国策通用.png"), "");
+	}
+
+	#[test]
+	fn name_filter_ranks_prefix_then_contains() {
+		let names: Vec<String> = ["国策通用.png", "通用图标.png", "tww.png", "map.png"]
+			.iter()
+			.map(|name| name.to_string())
+			.collect();
+		let matched = filter_names(&names, "通用", 10);
+		// 前缀优先：通用图标.png 排在 国策通用.png 之前。
+		assert_eq!(matched[0].0, "通用图标.png");
+		assert!(matched.iter().any(|(value, _)| value == "国策通用.png"));
+		// 空查询取前 limit 条；无匹配为空；标签均为空。
+		assert_eq!(filter_names(&names, "", 2).len(), 2);
+		assert!(filter_names(&names, "zzz", 10).is_empty());
+		assert!(matched.iter().all(|(_, label)| label.is_empty()));
 	}
 
 	#[test]

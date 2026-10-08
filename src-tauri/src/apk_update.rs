@@ -1,5 +1,6 @@
 //! APK 版块更新（「导出到 APK」）：把工作区中的 `assets/game/missions/` 与
-//! `assets/map/Earth3/scenarios/` 目录以「更新替换式覆盖」写回 APK。
+//! 各剧本目录（`assets/map/<地图>/scenarios/<剧本>/`，目录名按工作区实际结构
+//! 自动识别，适配各模组自定义命名）以「更新替换式覆盖」写回 APK。
 //!
 //! # 实现方式（追加新数据 + 重建中央目录）
 //!
@@ -39,8 +40,44 @@ const DOS_TIME: u16 = 0;
 const DOS_DATE: u16 = 0x21;
 const ZIP32_LIMIT: u64 = 0xFFFF_FFFF;
 
-/// 「从 APK 中导入 / 导出到 APK」处理的版块前缀（保留完整路径）。
-pub const APK_SECTION_PREFIXES: [&str; 2] = ["assets/game/missions/", "assets/map/Earth3/scenarios/"];
+/// 从工作区目录推导「导出到 APK」的版块前缀（适配各模组自定义地图 / 剧本目录名）：
+/// - `assets/game/missions/`（目录存在时）；
+/// - 工作区里全部实际存在的 `assets/map/<地图>/scenarios/<剧本>/` 目录
+///   （地图目录名由各模组的 `maps/Maps.json` 指定、剧本目录名由 `<地图>/Scenarios.txt`
+///   指定；导出时按工作区里已有的目录识别，与导入时写入的内容一一对应）。
+pub fn discover_workspace_section_prefixes(source_root: &Path) -> Vec<String> {
+    let mut prefixes: Vec<String> = Vec::new();
+    if source_root.join("assets/game/missions").is_dir() {
+        prefixes.push("assets/game/missions/".to_string());
+    }
+    let mut scenarios: Vec<String> = Vec::new();
+    if let Ok(maps) = fs::read_dir(source_root.join("assets/map")) {
+        for map in maps.flatten() {
+            let Some(map_name) = map.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            let scenarios_dir = map.path().join("scenarios");
+            if !scenarios_dir.is_dir() {
+                continue;
+            }
+            if let Ok(entries) = fs::read_dir(&scenarios_dir) {
+                for scenario in entries.flatten() {
+                    if !scenario.path().is_dir() {
+                        continue;
+                    }
+                    let scenario_name = scenario.file_name();
+                    let Some(scenario_name) = scenario_name.to_str() else {
+                        continue;
+                    };
+                    scenarios.push(format!("assets/map/{map_name}/scenarios/{scenario_name}/"));
+                }
+            }
+        }
+    }
+    scenarios.sort();
+    prefixes.extend(scenarios);
+    prefixes
+}
 
 /// 更新结果统计。
 #[derive(Debug)]
@@ -68,14 +105,11 @@ pub fn update_apk_sections(
 ) -> Result<SectionUpdateOutcome, String> {
     let (source_files, missing_dirs) = collect_section_files(source_root, prefixes);
     if source_files.is_empty() && missing_dirs == prefixes.len() as u64 {
-        return Err(format!(
-            "工作区中未找到 {} —— 请先对目标 APK 执行「从 apk 中导入」",
-            prefixes
-                .iter()
-                .map(|prefix| prefix.trim_end_matches('/'))
-                .collect::<Vec<_>>()
-                .join(" 与 ")
-        ));
+        return Err(
+            "工作区中未找到国策版块（assets/game/missions、assets/map/*/scenarios/*）\
+             —— 请先对目标 APK 执行「从 apk 中导入」"
+                .to_string(),
+        );
     }
 
     let central = crate::apk_extract::read_central_directory(apk)?;
@@ -350,23 +384,29 @@ mod tests {
         let workspace = dir.join("ws");
         write_file(&workspace.join("assets/game/missions/a.txt"), "new-a");
         write_file(&workspace.join("assets/game/missions/sub/b.txt"), "added-b");
+        // 自定义地图 / 剧本目录名（如白日升的 Begonia/RWS）同样写回。
+        write_file(
+            &workspace.join("assets/map/Begonia/scenarios/RWS/missions/t.json"),
+            "new-t",
+        );
 
         let mut file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(&apk)
             .unwrap();
-        let outcome =
-            update_apk_sections(&mut file, &workspace, &APK_SECTION_PREFIXES, &|_, _| {}).unwrap();
+        let prefixes = discover_workspace_section_prefixes(&workspace);
+        let refs: Vec<&str> = prefixes.iter().map(String::as_str).collect();
+        let outcome = update_apk_sections(&mut file, &workspace, &refs, &|_, _| {}).unwrap();
         assert_eq!(outcome.replaced, 1);
-        assert_eq!(outcome.added, 1);
+        assert_eq!(outcome.added, 2);
         assert_eq!(outcome.kept, 3);
         drop(file);
 
         let out = dir.join("out");
         fs::create_dir_all(&out).unwrap();
         let extracted = crate::apk_extract::extract_apk_contents(&apk, &out).unwrap();
-        assert_eq!(extracted.entries, 5);
+        assert_eq!(extracted.entries, 6);
         assert_eq!(
             fs::read_to_string(out.join("assets/game/missions/a.txt")).unwrap(),
             "new-a"
@@ -374,6 +414,11 @@ mod tests {
         assert_eq!(
             fs::read_to_string(out.join("assets/game/missions/sub/b.txt")).unwrap(),
             "added-b"
+        );
+        assert_eq!(
+            fs::read_to_string(out.join("assets/map/Begonia/scenarios/RWS/missions/t.json"))
+                .unwrap(),
+            "new-t"
         );
         assert_eq!(
             fs::read_to_string(out.join("assets/map/Earth3/scenarios/s.json")).unwrap(),
@@ -411,10 +456,41 @@ mod tests {
             .write(true)
             .open(&apk)
             .unwrap();
-        let error =
-            update_apk_sections(&mut file, &workspace, &APK_SECTION_PREFIXES, &|_, _| {})
-                .unwrap_err();
+        let prefixes = discover_workspace_section_prefixes(&workspace);
+        assert!(prefixes.is_empty());
+        let refs: Vec<&str> = prefixes.iter().map(String::as_str).collect();
+        let error = update_apk_sections(&mut file, &workspace, &refs, &|_, _| {}).unwrap_err();
         assert!(error.contains("从 apk 中导入"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn discovers_workspace_section_prefixes_for_custom_maps() {
+        let dir = temp_dir("discover-ws");
+        let workspace = dir.join("ws");
+        fs::create_dir_all(&workspace).unwrap();
+        // 空工作区：没有版块目录。
+        assert!(discover_workspace_section_prefixes(&workspace).is_empty());
+        write_file(&workspace.join("assets/game/missions/Missions.json"), "[]");
+        write_file(
+            &workspace.join("assets/map/Begonia/scenarios/RWS/missions/Missions.json"),
+            "[]",
+        );
+        write_file(
+            &workspace.join("assets/map/Earth3/scenarios/TheGreatWar/missions/Missions.json"),
+            "[]",
+        );
+        // 非目录 / 无关目录不收录。
+        fs::write(workspace.join("assets/map/Begonia/scenarios/readme.txt"), "x").unwrap();
+        fs::create_dir_all(workspace.join("assets/map/Begonia/data")).unwrap();
+        assert_eq!(
+            discover_workspace_section_prefixes(&workspace),
+            vec![
+                "assets/game/missions/".to_string(),
+                "assets/map/Begonia/scenarios/RWS/".to_string(),
+                "assets/map/Earth3/scenarios/TheGreatWar/".to_string(),
+            ]
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

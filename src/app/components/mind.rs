@@ -26,22 +26,75 @@ pub struct FocusIcon {
 pub struct MissionRecord {
     #[serde(rename = "ID")]
     pub id: i64,
-    #[serde(rename = "Name")]
+    #[serde(rename = "Name", default)]
     pub name: String,
-    #[serde(rename = "ImageName")]
+    #[serde(rename = "ImageName", default)]
     pub image_name: String,
-    #[serde(rename = "MissionEvent")]
+    #[serde(rename = "MissionEvent", default)]
     pub mission_event: String,
-    #[serde(rename = "TreeColumn")]
+    #[serde(rename = "TreeColumn", default)]
     pub tree_column: u32,
-    #[serde(rename = "TreeRow")]
+    #[serde(rename = "TreeRow", default)]
     pub tree_row: u32,
-    #[serde(rename = "RequiredMission")]
-    pub required_mission: i64,
-    #[serde(rename = "RequiredMission2")]
-    pub required_mission2: i64,
-    #[serde(rename = "AI")]
+    /// 前置国策（标量写法，-1 表示无）；`None` = 原文件未写该字段（列表写法）。
+    #[serde(
+        rename = "RequiredMission",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub required_mission: Option<i64>,
+    #[serde(
+        rename = "RequiredMission2",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub required_mission2: Option<i64>,
+    /// 前置国策列表（需全部完成；白日升等模组的列表写法）。
+    #[serde(
+        rename = "RequiredMissions",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub required_missions: Option<Vec<i64>>,
+    /// 前置国策列表（满足其中任一即可；OR 组 1）。
+    #[serde(
+        rename = "RequiredMissionsOR",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub required_missions_or: Option<Vec<i64>>,
+    /// OR 组 2。
+    #[serde(
+        rename = "RequiredMissionsOR2",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub required_missions_or2: Option<Vec<i64>>,
+    /// OR 组 3。
+    #[serde(
+        rename = "RequiredMissionsOR3",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub required_missions_or3: Option<Vec<i64>>,
+    /// 互斥国策 ID 列表（不能同时选择）。
+    #[serde(
+        rename = "MutuallyExclusiveMissions",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub mutually_exclusive_missions: Option<Vec<i64>>,
+    /// AI 权重（0~100；缺失时按 100 读取，保存时沿用原值）。
+    #[serde(rename = "AI", default = "default_mission_ai")]
     pub ai: i32,
+    /// 工具尚未注册的未知字段（未来游戏 / 模组新增键）：解析时收集、保存时原样带回。
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+/// 缺少 `AI` 字段时的默认权重（与新建卡片的默认一致）。
+fn default_mission_ai() -> i32 {
+    100
 }
 
 fn initial_zoom() -> f64 {
@@ -73,7 +126,20 @@ pub struct MindNode {
     pub icon_index: usize,
     pub tree_column: u32,
     pub tree_row: u32,
+    /// AI 权重（0~100；原样保留，新建卡片默认 100）。
+    pub ai: i32,
     pub children: Vec<usize>,
+    /// 原本是否使用「标量写法」的标量前置字段（RequiredMission / RequiredMission2）：
+    /// 保存时列表写法的条目保持原样，不会被补上 `-1` 标量。
+    pub scalar_style: bool,
+    /// 列表写法的前置 / 互斥关系（原样保留；保存时按节点新下标重映射）。
+    pub required_missions: Option<Vec<i64>>,
+    pub required_missions_or: Option<Vec<i64>>,
+    pub required_missions_or2: Option<Vec<i64>>,
+    pub required_missions_or3: Option<Vec<i64>>,
+    pub mutually_exclusive_missions: Option<Vec<i64>>,
+    /// 工具未注册的未知字段（原样保留，保存时带回）。
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 /// 共享只读数据句柄：克隆只增加引用计数，相等按指针判断。
@@ -135,6 +201,21 @@ fn mission_event_file(mission_event: &str, name: &str) -> String {
         format!("{}.txt", name)
     } else {
         trimmed.to_string()
+    }
+}
+
+/// 保存时把引用旧节点编号的 ID 列表重映射为新的节点下标；引用了已删除节点的
+/// 条目被丢弃，重映射后为空时返回 `None`（不产生空数组字段）。
+fn remap_id_list(ids: Option<&[i64]>, remap: &HashMap<i64, i64>) -> Option<Vec<i64>> {
+    let ids = ids?;
+    let mapped: Vec<i64> = ids
+        .iter()
+        .filter_map(|id| remap.get(id).copied())
+        .collect();
+    if mapped.is_empty() {
+        None
+    } else {
+        Some(mapped)
     }
 }
 
@@ -238,12 +319,24 @@ impl MindMapState {
                     .unwrap_or(usize::MAX),
                 tree_column: mission.tree_column,
                 tree_row: mission.tree_row,
+                ai: mission.ai,
                 children: Vec::new(),
+                scalar_style: mission.required_mission.is_some()
+                    || mission.required_mission2.is_some(),
+                required_missions: mission.required_missions.clone(),
+                required_missions_or: mission.required_missions_or.clone(),
+                required_missions_or2: mission.required_missions_or2.clone(),
+                required_missions_or3: mission.required_missions_or3.clone(),
+                mutually_exclusive_missions: mission.mutually_exclusive_missions.clone(),
+                extra: mission.extra.clone(),
             })
             .collect();
 
         for (child_index, mission) in missions.iter().enumerate() {
-            for parent_id in [mission.required_mission, mission.required_mission2] {
+            for parent_id in [mission.required_mission, mission.required_mission2]
+                .into_iter()
+                .flatten()
+            {
                 if parent_id < 0 {
                     continue;
                 }
@@ -483,6 +576,14 @@ pub fn MindMapCanvas(
         pending_save_snapshot.set(Some(snapshot));
 
         let current = state.read();
+        // 保存时节点按新下标重排 ID：列表写法的引用按「旧编号 → 新下标」重映射
+        // （引用了已删除节点的条目被丢弃）。
+        let id_remap: HashMap<i64, i64> = current
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node)| (node.id as i64, index as i64))
+            .collect();
         let records = current
             .nodes
             .iter()
@@ -496,6 +597,15 @@ pub fn MindMapCanvas(
                     .map(|(parent_index, _)| parent_index as i64)
                     .take(2)
                     .collect();
+                // 老写法（标量）只在「有连线」或「原本就用标量」时写出；
+                // 列表写法的条目保持原样，不被补上 -1 标量。
+                let (required_mission, required_mission2) = if !parents.is_empty() {
+                    (Some(parents[0]), Some(parents.get(1).copied().unwrap_or(-1)))
+                } else if node.scalar_style {
+                    (Some(-1), Some(-1))
+                } else {
+                    (None, None)
+                };
                 MissionRecord {
                     id: index as i64,
                     name: node.text.clone(),
@@ -503,9 +613,27 @@ pub fn MindMapCanvas(
                     mission_event: mission_event_file(&node.mission_event, &node.text),
                     tree_column: node.tree_column,
                     tree_row: node.tree_row,
-                    required_mission: parents.first().copied().unwrap_or(-1),
-                    required_mission2: parents.get(1).copied().unwrap_or(-1),
-                    ai: 100,
+                    required_mission,
+                    required_mission2,
+                    required_missions: remap_id_list(node.required_missions.as_deref(), &id_remap),
+                    required_missions_or: remap_id_list(
+                        node.required_missions_or.as_deref(),
+                        &id_remap,
+                    ),
+                    required_missions_or2: remap_id_list(
+                        node.required_missions_or2.as_deref(),
+                        &id_remap,
+                    ),
+                    required_missions_or3: remap_id_list(
+                        node.required_missions_or3.as_deref(),
+                        &id_remap,
+                    ),
+                    mutually_exclusive_missions: remap_id_list(
+                        node.mutually_exclusive_missions.as_deref(),
+                        &id_remap,
+                    ),
+                    ai: node.ai,
+                    extra: node.extra.clone(),
                 }
             })
             .collect();
@@ -828,6 +956,15 @@ pub fn MindMapCanvas(
                 !event_files.iter().any(|existing| existing == &path)
             })
         });
+    // 右键目标卡片是否连有依赖线（双向）：「取消连接」据此决定是否可用。
+    let target_has_edges = menu_position
+        .and_then(|(_, _, target)| target)
+        .is_some_and(|node_id| {
+            state.read().nodes.iter().any(|node| {
+                (node.id == node_id && !node.children.is_empty())
+                    || node.children.contains(&node_id)
+            })
+        });
     // 「链接事件」候选：本资源根下现有的事件脚本名（仅在选择器打开时快照）。
     let link_event_items: Vec<(String, EventHandler<()>)> = if linking_open {
         let prefix = format!("{missions_root}/missionsEvents/");
@@ -897,11 +1034,11 @@ pub fn MindMapCanvas(
     } else if editing_node_id.is_some() {
         150
     } else if matches!(menu_position, Some((_, _, Some(_)))) {
-        // 空国策菜单多出「新建事件 / 链接事件」两项。
+        // 卡片菜单：空国策多出「新建事件 / 链接事件」两项（每项约 34px）。
         if target_event_missing {
-            210
+            244
         } else {
-            176
+            210
         }
     } else {
         52
@@ -1109,7 +1246,16 @@ pub fn MindMapCanvas(
                                             icon_index,
                                             tree_column: column,
                                             tree_row: row,
+                                            ai: 100,
                                             children: Vec::new(),
+                                            // 新建卡片默认沿用标量写法（与工具历史行为一致）。
+                                            scalar_style: true,
+                                            required_missions: None,
+                                            required_missions_or: None,
+                                            required_missions_or2: None,
+                                            required_missions_or3: None,
+                                            mutually_exclusive_missions: None,
+                                            extra: BTreeMap::new(),
                                         });
                                     if let Some(parent_id) = target_node {
                                         if let Some(parent) = current.node_mut(parent_id) {
@@ -1331,6 +1477,24 @@ pub fn MindMapCanvas(
                         }
                         button {
                             r#type: "button",
+                            disabled: !target_has_edges,
+                            title: "断开该卡片与其它卡片之间的全部依赖线，使其成为独立卡片",
+                            onclick: move |_| {
+                                commit_history();
+                                let mut current = state.write();
+                                // 双向断开：其它卡片不再以它为前置，它自身也不再有前置。
+                                for node in current.nodes.iter_mut() {
+                                    node.children.retain(|child| *child != parent_id);
+                                }
+                                if let Some(node) = current.node_mut(parent_id) {
+                                    node.children.clear();
+                                }
+                                context_menu.set(None);
+                            },
+                            "取消连接"
+                        }
+                        button {
+                            r#type: "button",
                             onclick: move |_| {
                                 confirming_delete.set(Some(parent_id));
                             },
@@ -1470,5 +1634,72 @@ fn NodeView(
                 "{display_text}"
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mission_record_reads_required_mission_list_style() {
+        let record: MissionRecord = serde_json::from_str(
+            r#"{"ID":0,"Name":"n","ImageName":"i.png","MissionEvent":"e.txt","TreeColumn":1,"TreeRow":2,"AI":5,"RequiredMissions":[2,3],"RequiredMissionsOR2":[4,5],"MutuallyExclusiveMissions":[6]}"#,
+        )
+        .expect("列表写法（缺标量字段）应可解析");
+        assert_eq!(record.required_mission, None);
+        assert_eq!(record.required_mission2, None);
+        assert_eq!(record.required_missions.as_deref(), Some(&[2, 3][..]));
+        assert_eq!(record.required_missions_or2.as_deref(), Some(&[4, 5][..]));
+        assert_eq!(record.mutually_exclusive_missions.as_deref(), Some(&[6][..]));
+        // 回传后端时：未写过的字段不产生 null。
+        let back = serde_json::to_string(&record).unwrap();
+        assert!(back.contains("\"RequiredMissions\":[2,3]"));
+        assert!(!back.contains("\"RequiredMission\":"));
+    }
+
+    #[test]
+    fn mission_record_defaults_missing_base_fields() {
+        // 缺省的基础字段按空串 / 0 / 100 读取（road_to_56 等模组存在缺 AI 的条目）。
+        let record: MissionRecord = serde_json::from_str(r#"{"ID":5}"#).expect("缺省字段应可解析");
+        assert_eq!(record.name, "");
+        assert_eq!(record.tree_column, 0);
+        assert_eq!(record.tree_row, 0);
+        assert_eq!(record.ai, 100);
+        assert!(record.required_mission.is_none());
+    }
+
+    #[test]
+    fn mission_record_preserves_unknown_fields() {
+        // 工具未注册的未知字段（未来游戏 / 模组新增键）解析后保留、回传后端时写出，
+        // 且会随卡片原样带到保存环节（from_missions 镜像）。
+        let record: MissionRecord = serde_json::from_str(
+            r#"{"ID":0,"Name":"n","NewRequirement":[1,2],"FutureFlag":true,"ExtraNote":"x"}"#,
+        )
+        .expect("未知字段应被 flatten 收集");
+        assert_eq!(record.extra.len(), 3);
+        assert_eq!(record.extra.get("FutureFlag"), Some(&serde_json::json!(true)));
+        let back = serde_json::to_string(&record).unwrap();
+        assert!(back.contains("\"NewRequirement\":[1,2]"));
+        assert!(back.contains("\"FutureFlag\":true"));
+
+        let icons: Vec<FocusIcon> = Vec::new();
+        let state = MindMapState::from_missions(&[record], &icons);
+        assert_eq!(state.nodes[0].extra.len(), 3);
+        assert_eq!(
+            state.nodes[0].extra.get("ExtraNote"),
+            Some(&serde_json::Value::String("x".to_string()))
+        );
+    }
+
+    #[test]
+    fn remap_id_list_remaps_and_drops_missing() {
+        let mut remap: HashMap<i64, i64> = HashMap::new();
+        remap.insert(0, 0);
+        remap.insert(2, 1);
+        // 引用已删除节点（1）的条目被丢弃；结果为空返回 None（不写空数组）。
+        assert_eq!(remap_id_list(Some(&[0, 1, 2][..]), &remap), Some(vec![0, 1]));
+        assert_eq!(remap_id_list(Some(&[1][..]), &remap), None);
+        assert_eq!(remap_id_list(None, &remap), None);
     }
 }

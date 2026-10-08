@@ -28,7 +28,7 @@ pub fn parse_missions(contents: String) -> Result<ParsedMissions, String> {
     })
 }
 
-/// 规范化并序列化国策列表（按顺序重写 ID、补默认事件文件名、AI 统一为 100）。
+/// 规范化并序列化国策列表（按顺序重写 ID、补默认事件文件名；AI 等其余字段原样保留）。
 #[tauri::command]
 pub fn serialize_missions(mut missions: Vec<MissionRecord>) -> Result<String, String> {
     for (index, mission) in missions.iter_mut().enumerate() {
@@ -36,7 +36,6 @@ pub fn serialize_missions(mut missions: Vec<MissionRecord>) -> Result<String, St
         if mission.mission_event.trim().is_empty() {
             mission.mission_event = format!("{}.txt", mission.name);
         }
-        mission.ai = 100;
     }
     serialize_mission_file(&missions)
 }

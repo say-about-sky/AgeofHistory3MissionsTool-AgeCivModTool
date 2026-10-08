@@ -160,8 +160,9 @@ pub fn extract_from_file(
     extract_selected_from_file(file, destination, &[], on_progress)
 }
 
-/// 从路径打开并按前缀过滤解压（「从 APK 中导入」版块的桌面入口）。
-#[cfg(not(target_os = "android"))]
+/// 从路径打开并按前缀过滤解压（「从 APK 中导入」版块的测试辅助；正式命令统一走
+/// [`extract_selected_from_file`] 的已打开文件句柄路径，桌面 / 安卓共用）。
+#[cfg(test)]
 pub fn extract_apk_sections_with_progress(
     apk: &Path,
     destination: &Path,
@@ -171,6 +172,42 @@ pub fn extract_apk_sections_with_progress(
     let file =
         File::open(apk).map_err(|error| format!("打开 APK 失败 {}：{error}", apk.display()))?;
     extract_selected_from_file(&file, destination, prefixes, on_progress)
+}
+
+/// 动态推导「从 APK 中导入」的版块前缀（适配各模组自定义的地图 / 剧本目录名）。
+///
+/// 国策相关目录的命名是各模组自定义、由游戏运行时加载的：
+/// `assets/map/<地图目录名：由 map/Maps.json 的 Folder: 指定>/scenarios/<剧本目录名：
+/// 由该地图的 Scenarios.txt 清单指定>/`——不能写死具体名字（例如「白日升」用
+/// `Begonia/RWS`、「暮色黄昏」用 `Earth3/TheGreatWar`）。这里直接按中央目录里
+/// 实际存在的 `assets/map/*/scenarios/*/` 组合识别（清单缺失 / 自定义的模组同样覆盖），
+/// 并固定包含 `assets/game/missions/`（全局国策）。
+pub fn discover_section_prefixes(file: &File) -> Result<Vec<String>, String> {
+    let entries = list_apk_entries(file)?;
+    let mut prefixes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    prefixes.insert("assets/game/missions/".to_string());
+    for entry in &entries {
+        if let Some(prefix) = section_prefix_of_entry(&entry.name) {
+            prefixes.insert(prefix);
+        }
+    }
+    Ok(prefixes.into_iter().collect())
+}
+
+/// 条目名属于剧本版块（`assets/map/<地图>/scenarios/<剧本>/…`）时返回其版块前缀
+/// （末尾带 `/`）；非该结构（如 `assets/map/Maps.json`）返回 `None`。
+fn section_prefix_of_entry(name: &str) -> Option<String> {
+    let rest = name.strip_prefix("assets/map/")?;
+    let mut segments = rest.split('/');
+    let map = segments.next()?;
+    if segments.next()? != "scenarios" {
+        return None;
+    }
+    let scenario = segments.next()?;
+    if map.is_empty() || scenario.is_empty() {
+        return None;
+    }
+    Some(format!("assets/map/{map}/scenarios/{scenario}/"))
 }
 
 /// 基于已打开文件句柄的宽容解压：全程使用定位读取（`read_at`），
@@ -1062,7 +1099,7 @@ mod tests {
 
     #[test]
     fn extracts_only_selected_prefixes() {
-        // 版块过滤：只解压 missions 与 Earth3/scenarios，其余条目静默跳过。
+        // 版块过滤：只解压给定前缀（全局 missions 与指定剧本目录），其余条目静默跳过。
         let dir = temp_dir("sections");
         let apk = dir.join("sections.apk");
         {
@@ -1095,5 +1132,97 @@ mod tests {
         assert!(!dest.join("assets/other").exists());
         assert!(!dest.join("root.txt").exists());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn discovers_section_prefixes_for_custom_maps() {
+        // 版块前缀按中央目录实际结构识别：地图 / 剧本目录名各模组自定义
+        // （如白日升的 Begonia/RWS、暮色黄昏的 Earth3/TheGreatWar）。
+        let dir = temp_dir("discover");
+        let apk = dir.join("mod.apk");
+        {
+            let mut zip = zip::ZipWriter::new(File::create(&apk).unwrap());
+            for name in [
+                "assets/game/missions/missionsEvents/a.txt",
+                "assets/game/missions/missionsImages/H/x.png",
+                "assets/map/Begonia/scenarios/RWS/missions/tree.json",
+                "assets/map/Begonia/scenarios/RWS/missionsEvents/e.txt",
+                "assets/map/Earth3/scenarios/TheGreatWar/missions/tree.json",
+                "assets/map/Maps.json",
+                "assets/other/x.txt",
+                "AndroidManifest.xml",
+            ] {
+                zip.start_file(name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                zip.write_all(b"x").unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        let file = File::open(&apk).unwrap();
+        let prefixes = discover_section_prefixes(&file).unwrap();
+        assert_eq!(
+            prefixes,
+            vec![
+                "assets/game/missions/".to_string(),
+                "assets/map/Begonia/scenarios/RWS/".to_string(),
+                "assets/map/Earth3/scenarios/TheGreatWar/".to_string(),
+            ]
+        );
+        // 用识别出的前缀解压：只落盘版块内容（资源文件 / 其他目录不进工作区）。
+        let dest = dir.join("out");
+        fs::create_dir_all(&dest).unwrap();
+        let refs: Vec<&str> = prefixes.iter().map(String::as_str).collect();
+        let outcome = extract_selected_from_file(&file, &dest, &refs, &|_, _| {}).unwrap();
+        assert_eq!(outcome.entries, 5);
+        assert!(dest
+            .join("assets/map/Begonia/scenarios/RWS/missions/tree.json")
+            .is_file());
+        assert!(!dest.join("assets/other").exists());
+        assert!(!dest.join("assets/map/Maps.json").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 真实模组 APK 的版块识别（各模组自定义地图 / 剧本目录名）：
+    /// `cargo test -p age_civ_mod_tool --lib discover_real_apk_section_prefixes -- --ignored`
+    #[test]
+    #[ignore = "需要真实模组 APK（A:\\android\\GameCivs）"]
+    fn discover_real_apk_section_prefixes() {
+        let cases: [(&str, &[&str]); 5] = [
+            (
+                r"A:\android\GameCivs\暮色黄昏_世界大战0.25.1.apk",
+                &["assets/map/Earth3/scenarios/TheGreatWar/"],
+            ),
+            (r"A:\android\GameCivs\白日升.apk", &["assets/map/Begonia/scenarios/RWS/"]),
+            (r"A:\android\GameCivs\road_to_56.apk", &["assets/map/Earth3/scenarios/WW2/"]),
+            (
+                r"A:\android\GameCivs\europe.apk",
+                &[
+                    "assets/map/ES/scenarios/RusUkrWar/",
+                    "assets/map/ES/scenarios/Ukr2014/",
+                ],
+            ),
+            (
+                r"A:\android\GameCivs\1566AuroraPrever2.apk",
+                &[
+                    "assets/map/Earth3/scenarios/ming/",
+                    "assets/map/Earth3/scenarios/province/",
+                    "assets/map/Earth3/scenarios/zhu/",
+                ],
+            ),
+        ];
+        for (path, expected) in cases {
+            let file = File::open(path).unwrap_or_else(|error| panic!("打开 {path} 失败：{error}"));
+            let prefixes = discover_section_prefixes(&file).unwrap();
+            assert!(
+                prefixes.iter().any(|prefix| prefix == "assets/game/missions/"),
+                "{path} 缺全局 missions 版块"
+            );
+            for prefix in expected {
+                assert!(
+                    prefixes.iter().any(|item| item == prefix),
+                    "{path} 缺 {prefix}（实际：{prefixes:?}）"
+                );
+            }
+        }
     }
 }

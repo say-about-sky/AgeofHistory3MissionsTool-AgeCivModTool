@@ -62,6 +62,9 @@ pub fn normalize_loose_json(content: &str) -> String {
     let chars: Vec<char> = content.chars().collect();
     let mut out = String::with_capacity(content.len() + content.len() / 8);
     let mut stack: Vec<char> = Vec::new();
+    // 每个对象层级是否已出现过 `ID` 键（与 stack 平行）：
+    // 同一对象里再次出现 `ID` = 作者漏写了条目分隔（`},` + `{`），需拆分为两个条目。
+    let mut id_seen: Vec<bool> = Vec::new();
     let mut last_was_value = false;
     let mut index = 0usize;
 
@@ -103,12 +106,14 @@ pub fn normalize_loose_json(content: &str) -> String {
                     out.push(',');
                 }
                 stack.push(current);
+                id_seen.push(false);
                 last_was_value = false;
                 out.push(current);
                 index += 1;
             }
             '}' | ']' => {
                 stack.pop();
+                id_seen.pop();
                 last_was_value = true;
                 out.push(current);
                 index += 1;
@@ -124,28 +129,38 @@ pub fn normalize_loose_json(content: &str) -> String {
                 index += 1;
             }
             '"' | '\'' => {
-                if last_was_value {
-                    out.push(',');
-                }
+                // 先把整段字符串读入缓冲区（确定是键后再按顺序写出，
+                // 以便在「重复 ID 键」处插入条目分隔）。
                 let quote = current;
-                out.push(quote);
+                let mut text = String::new();
                 index += 1;
                 while index < chars.len() {
                     let ch = chars[index];
-                    out.push(ch);
                     index += 1;
                     if ch == '\\' {
+                        text.push(ch);
                         if index < chars.len() {
-                            out.push(chars[index]);
+                            text.push(chars[index]);
                             index += 1;
                         }
                     } else if ch == quote {
                         break;
+                    } else {
+                        text.push(ch);
                     }
                 }
                 // 对象里的字符串若不是紧跟着冒号，则是普通值而非键。
                 let is_key = matches!(stack.last(), Some('{'))
                     && next_significant_char(&chars, index) == Some(':');
+                if last_was_value {
+                    out.push(',');
+                }
+                if is_key && text.eq_ignore_ascii_case("ID") {
+                    push_split_if_duplicate_id(&mut out, &mut id_seen);
+                }
+                out.push(quote);
+                out.push_str(&text);
+                out.push(quote);
                 last_was_value = !is_key;
             }
             _ if current.is_ascii_digit()
@@ -203,6 +218,9 @@ pub fn normalize_loose_json(content: &str) -> String {
                     out.push(',');
                 }
                 if is_key && is_valid_unquoted_key(&ident) {
+                    if ident.eq_ignore_ascii_case("ID") {
+                        push_split_if_duplicate_id(&mut out, &mut id_seen);
+                    }
                     out.push_str(&ident);
                     last_was_value = false;
                 } else {
@@ -232,6 +250,18 @@ pub fn normalize_loose_json(content: &str) -> String {
     }
 
     out
+}
+
+/// 拆分「漏写条目分隔」的对象：同一对象里出现第二个 `ID` 键时，在键前插入
+/// `},\n{` 关闭旧对象并开启新对象（工具随后按两个独立条目解析）。
+/// 仅当字符串处于对象键位置时调用；写入后把当前层标记为「新对象已有 ID」。
+fn push_split_if_duplicate_id(out: &mut String, id_seen: &mut Vec<bool>) {
+    if *id_seen.last().unwrap_or(&false) {
+        out.push_str("},\n{");
+    }
+    if let Some(seen) = id_seen.last_mut() {
+        *seen = true;
+    }
 }
 
 /// 判断宽松语法的数字记号是否是 JSON5 合法数字
@@ -295,6 +325,15 @@ fn next_significant_char(chars: &[char], mut index: usize) -> Option<char> {
 }
 
 /// 把国策记录序列化为工具自己的规范格式（游戏可直接读回）。
+///
+/// 前置国策字段按原样保留：标量写法（`RequiredMission` / `RequiredMission2`）只为
+/// 原本就有该字段的记录写出；列表写法（`RequiredMissions` / `RequiredMissionsOR` /
+/// `RequiredMissionsOR2` / `RequiredMissionsOR3` / `MutuallyExclusiveMissions`）
+/// 只在存在时写出——列表写法的条目不会被额外补上 `-1` 标量，避免改变引擎对
+/// 两种写法的解读（白日升等模组的文件里两种写法混用）。
+///
+/// 未知字段（[`MissionRecord::extra`]，未来游戏 / 模组新增的键）逐条原样写出，
+/// 保证「打开一次再保存」不会把工具还不认识的字段抹掉。
 pub fn serialize_mission_file(missions: &[MissionRecord]) -> Result<String, String> {
     let mut content = String::from("{\n\tMission:\n\t[\n");
     for mission in missions {
@@ -304,20 +343,88 @@ pub fn serialize_mission_file(missions: &[MissionRecord]) -> Result<String, Stri
         let mission_event =
             serde_json::to_string(&mission.mission_event).map_err(|error| error.to_string())?;
         content.push_str(&format!(
-            "\t\t{{\n\t\t\tID: {},\n\t\t\tName: {},\n\t\t\tImageName: {},\n\t\t\tMissionEvent: {},\n\t\t\tTreeColumn: {},\n\t\t\tTreeRow: {},\n\t\t\tRequiredMission: {},\n\t\t\tRequiredMission2: {},\n\t\t\tAI: {},\n\t\t}},\n",
-            mission.id,
-            name,
-            image_name,
-            mission_event,
-            mission.tree_column,
-            mission.tree_row,
-            mission.required_mission,
-            mission.required_mission2,
-            mission.ai,
+            "\t\t{{\n\t\t\tID: {},\n\t\t\tName: {},\n\t\t\tImageName: {},\n\t\t\tMissionEvent: {},\n\t\t\tTreeColumn: {},\n\t\t\tTreeRow: {},\n",
+            mission.id, name, image_name, mission_event, mission.tree_column, mission.tree_row,
         ));
+        if let Some(value) = mission.required_mission {
+            content.push_str(&format!("\t\t\tRequiredMission: {value},\n"));
+        }
+        if let Some(value) = mission.required_mission2 {
+            content.push_str(&format!("\t\t\tRequiredMission2: {value},\n"));
+        }
+        push_id_list(&mut content, "RequiredMissions", &mission.required_missions);
+        push_id_list(
+            &mut content,
+            "RequiredMissionsOR",
+            &mission.required_missions_or,
+        );
+        push_id_list(
+            &mut content,
+            "RequiredMissionsOR2",
+            &mission.required_missions_or2,
+        );
+        push_id_list(
+            &mut content,
+            "RequiredMissionsOR3",
+            &mission.required_missions_or3,
+        );
+        push_id_list(
+            &mut content,
+            "MutuallyExclusiveMissions",
+            &mission.mutually_exclusive_missions,
+        );
+        // 未知字段原样写出（工具未注册的键：未来游戏 / 模组扩展）。
+        for (key, value) in &mission.extra {
+            content.push_str(&format!(
+                "\t\t\t{}: {},\n",
+                render_extra_key(key),
+                render_extra_value(value)
+            ));
+        }
+        content.push_str(&format!("\t\t\tAI: {},\n\t\t}},\n", mission.ai));
     }
     content.push_str("\t],\n\tAge_of_History: Mission\n}\n");
     Ok(content)
+}
+
+/// 未知字段键名：常规标识符原样写出，含特殊字符时按 JSON 字符串转义。
+fn render_extra_key(key: &str) -> String {
+    let is_identifier = !key.is_empty()
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if is_identifier {
+        key.to_string()
+    } else {
+        serde_json::to_string(key).unwrap_or_else(|_| format!("\"{key}\""))
+    }
+}
+
+/// 未知字段值按 JSON 渲染（数组内逗号后补空格，与规范格式其余部分保持一致）。
+fn render_extra_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Array(items) => {
+            let parts: Vec<String> = items.iter().map(render_extra_value).collect();
+            format!("[{}]", parts.join(", "))
+        }
+        other => serde_json::to_string(other).unwrap_or_else(|_| "null".to_string()),
+    }
+}
+
+/// 向规范格式追加一行 `键: [ID, ID, …],`（值为 `None` 或空列表时跳过）。
+fn push_id_list(content: &mut String, key: &str, values: &Option<Vec<i64>>) {
+    let Some(values) = values else {
+        return;
+    };
+    if values.is_empty() {
+        return;
+    }
+    let list = values
+        .iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    content.push_str(&format!("\t\t\t{key}: [{list}],\n"));
 }
 
 #[cfg(test)]
@@ -453,5 +560,298 @@ mod tests {
             parse_mission_file_with_correction(&corrected).expect("纠正后的内容应可直接解析");
         assert_eq!(again.mission.len(), file.mission.len());
         assert!(second_correction.is_none());
+    }
+
+    /// 工具未注册的未知字段（未来游戏 / 模组新增的键）解析后保留、序列化时原样写出，
+    /// 「打开一次再保存」不得把新字段抹掉。
+    #[test]
+    fn mission_file_preserves_unknown_fields() {
+        let source = r#"{
+	Mission:
+	[
+		{
+			ID: 0,
+			Name: "甲",
+			ImageName: "甲.png",
+			MissionEvent: "甲.txt",
+			TreeColumn: 0,
+			TreeRow: 0,
+			RequiredMission: -1,
+			AI: 80,
+			NewRequirement: [1, 2, 3],
+			FutureFlag: true,
+			ExtraNote: "自定义文本",
+		},
+	],
+	Age_of_History: Mission
+}"#;
+        let (file, _correction) = parse_mission_file_with_correction(source).expect("应能解析");
+        let record = &file.mission[0];
+        assert_eq!(
+            record.extra.get("FutureFlag"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert_eq!(
+            record.extra.get("NewRequirement"),
+            Some(&serde_json::json!([1, 2, 3]))
+        );
+
+        let rendered = serialize_mission_file(&file.mission).expect("应能序列化");
+        assert!(rendered.contains("\t\t\tNewRequirement: [1, 2, 3],\n"));
+        assert!(rendered.contains("\t\t\tFutureFlag: true,\n"));
+        assert!(rendered.contains("\t\t\tExtraNote: \"自定义文本\",\n"));
+
+        // 再次解析：未知字段内容一致，且规范格式无需二次纠正。
+        let (again, second_correction) =
+            parse_mission_file_with_correction(&rendered).expect("规范格式应可直接解析");
+        assert!(second_correction.is_none());
+        assert_eq!(again.mission[0].extra, record.extra);
+        assert_eq!(again.mission[0].ai, 80);
+    }
+
+    /// 白日升等模组的「列表写法」前置国策：`RequiredMissions` / `RequiredMissionsOR`
+    /// （含 OR2 / OR3 两组）/ `MutuallyExclusiveMissions`——缺少标量字段时不应报
+    /// missing field，且两种写法在规范化写回时都按原样保留。
+    #[test]
+    fn mission_file_supports_required_mission_lists() {
+        let source = r#"{
+	Mission:
+	[
+		{
+			ID: 0,
+			Name: "抓住机会",
+			ImageName: "抓住机会.png",
+			MissionEvent: "抓住机会.txt",
+			TreeColumn: 3,
+			TreeRow: 0,
+			RequiredMission: -1,
+			RequiredMission2: -1,
+			AI: 5,
+		}
+		{
+			ID: 1,
+			Name: "发布讨逆檄文",
+			ImageName: "发布讨逆檄文.png",
+			MissionEvent: "发布讨逆檄文.txt",
+			TreeColumn: 3,
+			TreeRow: 3,
+			RequiredMissions: [2, 3, 4, 5],
+			RequiredMissionsOR: [99, 101],
+			RequiredMissionsOR2: [108, 110],
+			RequiredMissionsOR3: [115, 116],
+			MutuallyExclusiveMissions: [6, 10],
+			AI: 5,
+		}
+	],
+	Age_of_History: Mission
+}"#;
+
+        let (file, corrected) = parse_mission_file_with_correction(source)
+            .expect("列表写法应能解析（缺标量字段时按未写处理）");
+        assert_eq!(file.mission.len(), 2);
+        // 标量字段缺失 → None（而不是 missing field 报错）。
+        assert_eq!(file.mission[1].required_mission, None);
+        assert_eq!(file.mission[1].required_mission2, None);
+        assert_eq!(
+            file.mission[1].required_missions.as_deref(),
+            Some(&[2, 3, 4, 5][..])
+        );
+        assert_eq!(
+            file.mission[1].required_missions_or.as_deref(),
+            Some(&[99, 101][..])
+        );
+        assert_eq!(
+            file.mission[1].required_missions_or2.as_deref(),
+            Some(&[108, 110][..])
+        );
+        assert_eq!(
+            file.mission[1].required_missions_or3.as_deref(),
+            Some(&[115, 116][..])
+        );
+        assert_eq!(
+            file.mission[1].mutually_exclusive_missions.as_deref(),
+            Some(&[6, 10][..])
+        );
+
+        // 原始文本元素间缺逗号（宽松写法）→ 产生规范内容：
+        // 标量写法条目保留标量字段；列表写法条目保持原样，不被补上 -1 标量。
+        let corrected = corrected.expect("宽松写法应产生纠正内容");
+        assert_eq!(corrected.matches("RequiredMission:").count(), 1);
+        assert_eq!(corrected.matches("RequiredMission2:").count(), 1);
+        assert!(corrected.contains("RequiredMissions: [2, 3, 4, 5],"));
+        assert!(corrected.contains("RequiredMissionsOR: [99, 101],"));
+        assert!(corrected.contains("RequiredMissionsOR2: [108, 110],"));
+        assert!(corrected.contains("RequiredMissionsOR3: [115, 116],"));
+        assert!(corrected.contains("MutuallyExclusiveMissions: [6, 10],"));
+
+        // 规范内容可直接解析（无第二次纠正），列表字段等值。
+        let (again, second_correction) =
+            parse_mission_file_with_correction(&corrected).expect("规范内容应可直接解析");
+        assert!(second_correction.is_none());
+        assert_eq!(again.mission[0].required_mission, Some(-1));
+        assert_eq!(
+            again.mission[1].required_missions,
+            file.mission[1].required_missions
+        );
+        assert_eq!(
+            again.mission[1].mutually_exclusive_missions,
+            file.mission[1].mutually_exclusive_missions
+        );
+    }
+
+    /// 复现 road_to_56/ger.json 的写法：作者漏写条目分隔（`},` + `{`），两条国策
+    /// 合并进同一个对象（对象内出现重复 `ID`），且其中一条缺 `AI`。
+    /// 自动纠正应把对象拆回两条，缺省字段按默认值读取。
+    #[test]
+    fn mission_file_splits_merged_entries_and_defaults_missing_fields() {
+        let source = r#"{
+	Mission:
+	[
+		{
+			ID: 15,
+			Name: "创新战争",
+			ImageName: "创新战争.png",
+			MissionEvent: "创新战争.txt",
+			TreeColumn: 4,
+			TreeRow: 9,
+			RequiredMission: 10,
+			RequiredMission2: -1,
+			AI: 5,
+			
+			
+			ID: 18,
+			Name: "对法作战",
+			ImageName: "对法作战.png",
+			MissionEvent: "对法作战.txt",
+			TreeColumn: 4,
+			TreeRow: 10,
+			RequiredMission: 8,
+			RequiredMission2: -1,
+		},
+	],
+	Age_of_History: Mission
+}"#;
+
+        let (file, corrected) =
+            parse_mission_file_with_correction(source).expect("合并条目应能自动拆分后解析");
+        assert_eq!(file.mission.len(), 2);
+        assert_eq!(file.mission[0].id, 15);
+        assert_eq!(file.mission[0].name, "创新战争");
+        assert_eq!(file.mission[0].ai, 5);
+        assert_eq!(file.mission[1].id, 18);
+        assert_eq!(file.mission[1].name, "对法作战");
+        assert_eq!(file.mission[1].required_mission, Some(8));
+        // 缺 `AI` 字段的条目按默认权重 100 读取。
+        assert_eq!(file.mission[1].ai, 100);
+
+        let corrected = corrected.expect("合并写法应产生纠正内容");
+        assert!(corrected.contains("创新战争"));
+        assert!(corrected.contains("对法作战"));
+        // 规范内容里两个条目各自独立。
+        assert_eq!(corrected.matches("ID: 15").count(), 1);
+        assert_eq!(corrected.matches("ID: 18").count(), 1);
+
+        let (again, second_correction) =
+            parse_mission_file_with_correction(&corrected).expect("规范内容应可直接解析");
+        assert!(second_correction.is_none());
+        assert_eq!(again.mission.len(), 2);
+        assert_eq!(again.mission[1].ai, 100);
+
+        // 带引号键的合并写法（另有模组整体使用引号键）同样能拆分；
+        // 缺省的基础字段按空串 / 0 / 100 读取。
+        let quoted = r#"{ "Mission": [ { "ID": 0, "Name": "甲", "AI": 5, "ID": 1, "Name": "乙" } ], "Age_of_History": "Mission" }"#;
+        let (file, _) = parse_mission_file_with_correction(quoted).expect("引号键合并写法应能拆分");
+        assert_eq!(file.mission.len(), 2);
+        assert_eq!(file.mission[1].id, 1);
+        assert_eq!(file.mission[1].name, "乙");
+        assert_eq!(file.mission[1].tree_column, 0);
+        assert_eq!(file.mission[1].ai, 100);
+    }
+
+    /// 本机验证：解析三个模组（白日升 / road_to_56 / 暮色黄昏）的全部国策目录，
+    /// 覆盖列表写法、合并条目、缺省字段等真实写法，并验证规范格式往返稳定。
+    /// 默认忽略：`cargo test -p age_civ_mod_tool --lib -- --ignored`
+    #[test]
+    #[ignore = "依赖本机 A:\\android\\GameCivs 下的模组目录"]
+    fn real_modded_mission_trees_parse_and_round_trip() {
+        let dirs = [
+            r"A:\android\GameCivs\1566AuroraPrever2\assets\map\Earth3\scenarios\ming\missions",
+            r"A:\android\GameCivs\europe\assets\map\ES\scenarios\RusUkrWar\missions",
+            r"A:\android\GameCivs\europe\assets\map\ES\scenarios\Ukr2014\missions",
+            r"A:\android\GameCivs\白日升\assets\map\Begonia\scenarios\RWS\missions",
+            r"A:\android\GameCivs\road_to_56\assets\map\Earth3\scenarios\WW2\missions",
+            r"A:\android\GameCivs\暮色黄昏_世界大战0.25.1\assets\map\Earth3\scenarios\TheGreatWar\missions",
+            r"A:\android\GameCivs\1566AuroraPrever2\assets\game\missions",
+            r"A:\android\GameCivs\europe\assets\game\missions",
+            r"A:\android\GameCivs\白日升\assets\game\missions",
+            r"A:\android\GameCivs\road_to_56\assets\game\missions",
+            r"A:\android\GameCivs\暮色黄昏_世界大战0.25.1\assets\game\missions",
+        ];
+        let mut files = 0_usize;
+        let mut missions_total = 0_usize;
+        for dir in dirs {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                println!("目录不存在，跳过：{dir}");
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let is_json = path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("json"));
+                if !is_json {
+                    continue;
+                }
+                let content = std::fs::read_to_string(&path).unwrap();
+                let (file, _) = parse_mission_file_with_correction(&content)
+                    .unwrap_or_else(|error| panic!("{}：{error}", path.display()));
+                // 空树（`Mission: []`）是合法内容，不要求条目数 > 0。
+                let canonical = serialize_mission_file(&file.mission).unwrap();
+                let (again, second_correction) = parse_mission_file_with_correction(&canonical)
+                    .unwrap_or_else(|error| panic!("{}（规范化后）：{error}", path.display()));
+                assert!(second_correction.is_none(), "{}", path.display());
+                assert_eq!(again.mission.len(), file.mission.len(), "{}", path.display());
+                files += 1;
+                missions_total += file.mission.len();
+            }
+        }
+        assert!(files >= 70, "解析文件过少：{files}");
+        assert!(missions_total >= 1200, "国策条目过少：{missions_total}");
+
+        // road_to_56/ger.json：漏写条目分隔的合并写法应拆回两条，缺 AI 的按 100 读取。
+        let ger = std::fs::read_to_string(
+            r"A:\android\GameCivs\road_to_56\assets\map\Earth3\scenarios\WW2\missions\ger.json",
+        )
+        .unwrap();
+        let (file, _) = parse_mission_file_with_correction(&ger).unwrap();
+        assert_eq!(file.mission.len(), 20, "ger.json 拆分后应为 20 条");
+        assert!(file
+            .mission
+            .iter()
+            .any(|mission| mission.id == 15 && mission.name == "创新战争"));
+        let war = file
+            .mission
+            .iter()
+            .find(|mission| mission.name == "对法作战")
+            .unwrap();
+        assert_eq!(war.id, 18);
+        assert_eq!(war.ai, 100);
+        assert_eq!(war.required_mission, Some(8));
+
+        // 白日升 CFT.json：OR 组写法（含 OR2 / OR3）字段在解析后保持原值。
+        let cft = std::fs::read_to_string(
+            r"A:\android\GameCivs\白日升\assets\map\Begonia\scenarios\RWS\missions\CFT.json",
+        )
+        .unwrap();
+        let (file, _) = parse_mission_file_with_correction(&cft).unwrap();
+        let entry = file
+            .mission
+            .iter()
+            .find(|mission| mission.required_missions_or2.is_some())
+            .expect("CFT.json 应含 RequiredMissionsOR2 写法");
+        assert_eq!(entry.required_missions_or.as_deref(), Some(&[99, 101][..]));
+        assert_eq!(entry.required_missions_or2.as_deref(), Some(&[108, 110][..]));
+        assert_eq!(entry.required_missions_or3.as_deref(), Some(&[115, 116][..]));
     }
 }

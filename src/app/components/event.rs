@@ -2,7 +2,9 @@ use dioxus::prelude::*;
 use serde::Serialize;
 use wasm_bindgen_futures::JsFuture;
 
-use super::event_lookup::{game_dir_key, load_event_lookup, scenario_map_key, EventLookup};
+use super::event_lookup::{
+	game_dir_key, load_event_assets, load_event_lookup, scenario_map_key, EventAssets, EventLookup,
+};
 use super::undo::{UndoRegistration, UndoScope};
 use super::{event_grid::EventGrid, event_parser::{diagnostics, MissionEvent}, mind::Shared, WorkDirectory};
 use crate::app::tauri_bridge::invoke;
@@ -303,6 +305,51 @@ pub fn EventPanel(
 		});
 	});
 
+	// —— 事件脚本资源候选（image / run_event / play_music 等「指向资源」的值补全）——
+	// 按「missions 资源根」加载：各资源根（全局 / 各剧本）有各自的
+	// missionsImages、events、audio 目录；从 apk 导入的版块工作区会回退源 APK 条目。
+	let mut event_images = use_signal(|| Shared::new(Vec::<String>::new()));
+	let mut event_events = use_signal(|| Shared::new(Vec::<String>::new()));
+	let mut event_music = use_signal(|| Shared::new(Vec::<String>::new()));
+	let mut assets_loaded_key = use_signal(|| None::<String>);
+	let mut assets_generation = use_signal(|| 0_u64);
+	let directory_for_assets = work_directory.clone();
+	use_effect(move || {
+		let root = missions_root
+			.read()
+			.clone()
+			.unwrap_or_else(|| "missions".to_string());
+		let Some(directory) = directory_for_assets.clone() else {
+			return;
+		};
+		let key = format!(
+			"{}|{}|{}",
+			directory.root_path,
+			directory.folder_id.clone().unwrap_or_default(),
+			root
+		);
+		if assets_loaded_key.peek().as_deref() == Some(key.as_str()) {
+			return;
+		}
+		assets_loaded_key.set(Some(key));
+		let generation = assets_generation.with_mut(|value| {
+			*value = value.wrapping_add(1);
+			*value
+		});
+		spawn(async move {
+			// 加载失败按空处理（编辑器仅无候选，不报错）。
+			let loaded = load_event_assets(&directory, &root)
+				.await
+				.unwrap_or_else(|_| EventAssets::default());
+			if *assets_generation.peek() != generation {
+				return;
+			}
+			event_images.set(Shared::new(loaded.images));
+			event_events.set(Shared::new(loaded.events));
+			event_music.set(Shared::new(loaded.music));
+		});
+	});
+
 	// —— 全局撤销集成 ——
 	// 待应用的撤销/重做快照：由注册的执行器写入，effect 统一落地（避免直接 set 触发追踪误注册）。
 	let mut pending_apply = use_signal(|| None::<MissionEvent>);
@@ -526,6 +573,9 @@ pub fn EventPanel(
                             event,
                             lookup: lookup.read().clone(),
                             native_autocomplete,
+                            images: event_images.read().clone(),
+                            events: event_events.read().clone(),
+                            music: event_music.read().clone(),
                         }
                     } else if busy_now {
                         div { class: "event-grid-empty", "正在读取..." }

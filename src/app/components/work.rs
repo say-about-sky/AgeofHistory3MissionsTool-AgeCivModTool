@@ -883,7 +883,8 @@ async fn extract_apk_into_workspace(
 	Ok(summary.message)
 }
 
-/// 「从 apk 中导入」：只把 missions / Earth3-scenarios 版块解压到工作区（保留完整路径）。
+/// 「从 apk 中导入」：把全局国策与各剧本版块解压到工作区（地图 / 剧本目录名按
+/// APK 实际结构自动识别，适配各模组自定义命名；保留完整路径）。
 async fn import_apk_sections_into_workspace(
 	work_directory: &str,
 	apk_path: &str,
@@ -1978,7 +1979,7 @@ pub fn Work() -> Element {
 	});
 
 	// 「从 apk 中导入」：优先资源管理器高亮的 apk，否则打开文件管理器选择；
-	// 只导入 missions / Earth3-scenarios 版块（目录保留完整路径）。
+	// 导入全局国策与各剧本版块（地图 / 剧本目录名自动识别，目录保留完整路径）。
 	let on_import_apk = EventHandler::new(move |_: ()| {
 		let work_directory = work_directory;
 		let mut workspace_files = workspace_files;
@@ -3182,10 +3183,10 @@ pub fn Work() -> Element {
                 is_android: *android_platform.read(),
                 all_files_access_granted: *all_files_access_granted.read(),
                 tabs: open_tabs
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        .read()
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        .iter()
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        .map(|tab| (tab.id.clone(), tab.title.clone()))
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        .collect(),
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        .read()
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        .iter()
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        .map(|tab| (tab.id.clone(), tab.title.clone()))
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        .collect(),
                 active_tab_id: active_tab_id.read().clone(),
                 on_select_tab,
                 on_close_tab: on_close_tab_requested,

@@ -2,7 +2,7 @@
 //!
 //! 键名、值类型与中文注释移植自：
 //! - `a:\android\missions_db\ScvGen\src\sqlite.rs`
-//! - 项目内《国策系统说明文档.md》
+//! - 项目内《国策系统说明文档》（docs/国策系统说明文档.md）
 //!
 //! 用途："特化 Excel 表格"可视化编辑器根据此表生成控件、
 //! 提供中文提示，并对用户输入做类型诊断。
@@ -138,7 +138,8 @@ pub const HEADER_FIELDS: &[FieldSpec] = &[
 pub const OPTIONAL_FIELDS: &[FieldSpec] = &[
 	FieldSpec::new("mission_image", ValueSpec::single(ValueType::Str), "国策完成照片（200x130）.png", FieldCategory::Optional),
 	FieldSpec::new("popUp", ValueSpec::single(ValueType::Bool), "完成时是否弹窗", FieldCategory::Optional),
-	FieldSpec::new("pobssible_to_run", ValueSpec::single(ValueType::Bool), "是否可执行（官方拼写，勿改）", FieldCategory::Optional),
+	FieldSpec::new("pobssible_to_run", ValueSpec::single(ValueType::Bool), "是否可执行（历史拼写，游戏内大量事件沿用；与 possible_to_run 并存）", FieldCategory::Optional),
+	FieldSpec::new("possible_to_run", ValueSpec::single(ValueType::Bool), "是否可执行（0.25.1 解析器实测读取的拼写，新写内容请用此项）", FieldCategory::Optional),
 	FieldSpec::new("no_background", ValueSpec::single(ValueType::Bool), "是否无背景", FieldCategory::Optional),
 	FieldSpec::new("no_text", ValueSpec::single(ValueType::Bool), "是否不显示文本", FieldCategory::Optional),
 	FieldSpec::new("run_in_background", ValueSpec::single(ValueType::Bool), "是否在后台运行", FieldCategory::Optional),
@@ -152,6 +153,18 @@ pub const OPTIONAL_FIELDS: &[FieldSpec] = &[
 	FieldSpec::new("layoutID", ValueSpec::single(ValueType::Int), "布局ID", FieldCategory::Optional),
 	FieldSpec::new("preprocessorID", ValueSpec::single(ValueType::Int), "预处理器ID", FieldCategory::Optional),
 	FieldSpec::new("runCivsID", ValueSpec::single(ValueType::Int), "运行文明ID", FieldCategory::Optional),
+	// 实测模组常见键（GameCivs 五模组统计后注册）
+	FieldSpec::new("ui_type", ValueSpec::single(ValueType::Int), "界面类型", FieldCategory::Optional),
+	FieldSpec::new("layout", ValueSpec::single(ValueType::Str), "布局（可留空）", FieldCategory::Optional),
+	FieldSpec::new("music_file", ValueSpec::single(ValueType::Str), "音乐文件（musicName 的模组写法）", FieldCategory::Optional),
+	FieldSpec::new("events_desc", ValueSpec::single(ValueType::Str), "事件详细描述（可留空）", FieldCategory::Optional),
+	FieldSpec::new("goal_dura", ValueSpec::single(ValueType::Int), "目标完成时长/天", FieldCategory::Optional),
+	FieldSpec::new("decision_dura", ValueSpec::single(ValueType::Int), "决策时长/天", FieldCategory::Optional),
+	FieldSpec::new("historic_choice", ValueSpec::single(ValueType::Bool), "历史性选择标记", FieldCategory::Optional),
+	FieldSpec::new("popup", ValueSpec::single(ValueType::Bool), "是否弹窗（小写写法，同 popUp）", FieldCategory::Optional),
+	FieldSpec::new("textBackground", ValueSpec::single(ValueType::Bool), "是否显示文本背景", FieldCategory::Optional),
+	FieldSpec::new("Important", ValueSpec::single(ValueType::Bool), "是否重要（大写写法，同 important）", FieldCategory::Optional),
+	FieldSpec::new("name", ValueSpec::single(ValueType::Str), "名称（选项名；选项块内由解析器单独识别）", FieldCategory::Optional),
 ];
 
 // ===== 触发条件（sqlite.rs MISSIONS_TRIGGER_BUTTON + 说明文档） =====
@@ -169,11 +182,11 @@ pub const TRIGGER_FIELDS: &[FieldSpec] = &[
 	FieldSpec::new("exists_any", ValueSpec::single(ValueType::Str), "存在某文明", FieldCategory::Trigger),
 	FieldSpec::new("exists_any_not", ValueSpec::single(ValueType::Str), "不存在某文明", FieldCategory::Trigger),
 	FieldSpec::new("province_controlled_by", ValueSpec::single(ValueType::Str), "省份被某文明控制", FieldCategory::Trigger),
-	FieldSpec::new("province_is_occupied", ValueSpec::single(ValueType::Bool), "省份是否被占领", FieldCategory::Trigger),
-	FieldSpec::new("province_is_under_siege", ValueSpec::single(ValueType::Bool), "省份是否被围困", FieldCategory::Trigger),
+	FieldSpec::new("province_is_occupied", ValueSpec::one_of(ValueType::Bool, ValueType::Int), "省份是否被占领（true/false；或省份 ID）", FieldCategory::Trigger),
+	FieldSpec::new("province_is_under_siege", ValueSpec::one_of(ValueType::Bool, ValueType::Int), "省份是否被围困（true/false；或省份 ID）", FieldCategory::Trigger),
 	FieldSpec::new("has_variable", ValueSpec::single(ValueType::Str), "拥有某变量/标签", FieldCategory::Trigger),
 	FieldSpec::new("has_variable_not", ValueSpec::single(ValueType::Str), "没有某变量/标签", FieldCategory::Trigger),
-	FieldSpec::new("has_variable_civ", ValueSpec::pair(ValueType::Str, ValueType::Str), "某文明拥有某变量", FieldCategory::Trigger),
+	FieldSpec::new("has_variable_civ", ValueSpec::single(ValueType::Str), "某文明拥有某变量（通常 `文明=变量`；也可单写变量名）", FieldCategory::Trigger),
 	FieldSpec::new("civ_capital_unrest_over", ValueSpec::single(ValueType::Float), "首都动荡度高于此值（如 0.7、5.2）", FieldCategory::Trigger),
 	FieldSpec::new("civ_capital_unrest_below", ValueSpec::single(ValueType::Float), "首都动荡度低于此值（如 0.01）", FieldCategory::Trigger),
 	FieldSpec::new("civ_prestige_over", ValueSpec::single(ValueType::Int), "威望高于此值", FieldCategory::Trigger),
@@ -205,7 +218,7 @@ pub const TRIGGER_FIELDS: &[FieldSpec] = &[
 	FieldSpec::new("civ_war_support_over", ValueSpec::single(ValueType::Int), "战争支持度超过此值", FieldCategory::Trigger),
 	FieldSpec::new("civ_war_support_below", ValueSpec::single(ValueType::Int), "战争支持度低于此值", FieldCategory::Trigger),
 	FieldSpec::new("province_has_building", ValueSpec::pair(ValueType::Int, ValueType::Int), "省份是否有某建筑", FieldCategory::Trigger),
-	FieldSpec::new("province_core_of", ValueSpec::pair(ValueType::Int, ValueType::Int), "省份是否为某文明核心", FieldCategory::Trigger),
+	FieldSpec::new("province_core_of", ValueSpec::pair(ValueType::Int, ValueType::Str), "省份是否为某文明核心（省份ID=文明ID）", FieldCategory::Trigger),
 	FieldSpec::new("province_is_coastal", ValueSpec::single(ValueType::Bool), "省份是否沿海", FieldCategory::Trigger),
 	FieldSpec::new("province_is_in_capital_continent", ValueSpec::single(ValueType::Bool), "省份是否在首都大洲", FieldCategory::Trigger),
 	FieldSpec::new("province_manpower_over", ValueSpec::single(ValueType::Int), "省份人力超过", FieldCategory::Trigger),
@@ -224,63 +237,129 @@ pub const TRIGGER_FIELDS: &[FieldSpec] = &[
 	FieldSpec::new("has_country_flag_not", ValueSpec::single(ValueType::Str), "没有国家标志", FieldCategory::Trigger),
 	FieldSpec::new("has_global_flag", ValueSpec::single(ValueType::Str), "拥有全局标志", FieldCategory::Trigger),
 	FieldSpec::new("has_global_flag_not", ValueSpec::single(ValueType::Str), "没有全局标志", FieldCategory::Trigger),
+	// 实测模组常见键（GameCivs 五模组统计后注册）
+	FieldSpec::new("exists", ValueSpec::single(ValueType::Str), "存在某文明（旧版写法，同 exists_any）", FieldCategory::Trigger),
+	FieldSpec::new("year_over", ValueSpec::single(ValueType::Int), "年份高于（如 2024）", FieldCategory::Trigger),
+	FieldSpec::new("year_below", ValueSpec::single(ValueType::Int), "年份低于", FieldCategory::Trigger),
+	FieldSpec::new("random_chance", ValueSpec::single(ValueType::Float), "随机概率（如 20.0，单位 %）", FieldCategory::Trigger),
+	FieldSpec::new("civ_government_is", ValueSpec::single(ValueType::Int), "文明政体是否为（政体编号）", FieldCategory::Trigger),
+	FieldSpec::new("civ_religion_is", ValueSpec::single(ValueType::Int), "文明宗教是否为（宗教编号）", FieldCategory::Trigger),
+	FieldSpec::new("if_counter", ValueSpec::single(ValueType::Str), "计数器条件（`$变量>阈值` / `$变量<阈值` / `$变量=阈值`）", FieldCategory::Trigger),
+	FieldSpec::new("is_player2", ValueSpec::single(ValueType::Bool), "是否操控第二位玩家", FieldCategory::Trigger),
+	// 作为条件行出现的结构行（块内衔接/结束行出现在意外位置时原样保留，注册后提示更清楚）
+	FieldSpec::new("next_and", ValueSpec::single(ValueType::Str), "触发器衔接行：与相邻条件 AND（结构行）", FieldCategory::Trigger),
+	FieldSpec::new("next_or", ValueSpec::single(ValueType::Str), "触发器衔接行：与相邻条件 OR（结构行）", FieldCategory::Trigger),
+	FieldSpec::new("next_and_not", ValueSpec::single(ValueType::Str), "触发器衔接行：与相邻条件 AND NOT（结构行）", FieldCategory::Trigger),
+	FieldSpec::new("next_or_not", ValueSpec::single(ValueType::Str), "触发器衔接行：与相邻条件 OR NOT（结构行）", FieldCategory::Trigger),
+	FieldSpec::new("trigger_and", ValueSpec::single(ValueType::Str), "触发器块开始行（出现在块外时原样保留）", FieldCategory::Trigger),
+	FieldSpec::new("trigger_or", ValueSpec::single(ValueType::Str), "或触发器块开始行（出现在块外时原样保留）", FieldCategory::Trigger),
+	FieldSpec::new("trigger_and_not", ValueSpec::single(ValueType::Str), "非触发器块开始行（出现在块外时原样保留）", FieldCategory::Trigger),
+	FieldSpec::new("trigger_and_end", ValueSpec::single(ValueType::Str), "触发器块结束行（出现在块外时原样保留）", FieldCategory::Trigger),
+	FieldSpec::new("trigger_or_end", ValueSpec::single(ValueType::Str), "或触发器块结束行（出现在块外时原样保留）", FieldCategory::Trigger),
+	FieldSpec::new("trigger_and_not_end", ValueSpec::single(ValueType::Str), "非触发器块结束行（出现在块外时原样保留）", FieldCategory::Trigger),
+	// 实测模组常见键（第二批）
+	FieldSpec::new("exists_not", ValueSpec::single(ValueType::Str), "不存在某文明（旧版写法）", FieldCategory::Trigger),
+	FieldSpec::new("government_type", ValueSpec::single(ValueType::Str), "政体类型是否为（政体名称）", FieldCategory::Trigger),
+	FieldSpec::new("alliance_special_is_member_id", ValueSpec::single(ValueType::Str), "联盟特殊成员标识（如 ming）", FieldCategory::Trigger),
+	FieldSpec::new("civ_population_over", ValueSpec::single(ValueType::Int), "文明人口高于", FieldCategory::Trigger),
+	FieldSpec::new("civ_population_below", ValueSpec::single(ValueType::Int), "文明人口低于", FieldCategory::Trigger),
+	FieldSpec::new("civ_battle_width_over", ValueSpec::single(ValueType::Int), "文明战斗宽度高于", FieldCategory::Trigger),
+	FieldSpec::new("civ_administrative_advisor_skill_over", ValueSpec::single(ValueType::Int), "行政顾问技能高于", FieldCategory::Trigger),
+	FieldSpec::new("civ_economic_advisor_skill_over", ValueSpec::single(ValueType::Int), "经济顾问技能高于", FieldCategory::Trigger),
+	FieldSpec::new("civ_innovation_advisor_skill_over", ValueSpec::single(ValueType::Int), "创新顾问技能高于", FieldCategory::Trigger),
+	FieldSpec::new("civ_military_advisor_skill_over", ValueSpec::single(ValueType::Int), "军事顾问技能高于", FieldCategory::Trigger),
+	FieldSpec::new("civ_regiments_limit_over", ValueSpec::single(ValueType::Int), "军团上限高于", FieldCategory::Trigger),
+	FieldSpec::new("civ_unlocked_advantages_over", ValueSpec::single(ValueType::Int), "已解锁优势数高于", FieldCategory::Trigger),
+	FieldSpec::new("civ_unlocked_legacies_over", ValueSpec::single(ValueType::Int), "已解锁遗产数高于", FieldCategory::Trigger),
+	FieldSpec::new("civ_vassals_over", ValueSpec::single(ValueType::Int), "附庸数量高于", FieldCategory::Trigger),
+	FieldSpec::new("civ_allies_over", ValueSpec::single(ValueType::Int), "盟友数量高于", FieldCategory::Trigger),
+	FieldSpec::new("civ_allies_below", ValueSpec::single(ValueType::Int), "盟友数量低于", FieldCategory::Trigger),
+	FieldSpec::new("civ_defensive_pacts_below", ValueSpec::single(ValueType::Int), "防御条约数量低于", FieldCategory::Trigger),
+	FieldSpec::new("civ_non_aggression_pacts_below", ValueSpec::single(ValueType::Int), "互不侵犯条约数量低于", FieldCategory::Trigger),
+	FieldSpec::new("civ_is_at_war_days", ValueSpec::single(ValueType::Int), "战争持续天数（变体写法）", FieldCategory::Trigger),
+	FieldSpec::new("civ_supreme_court_over", ValueSpec::single(ValueType::Int), "最高法院值高于", FieldCategory::Trigger),
+	FieldSpec::new("civ_research_points_over", ValueSpec::single(ValueType::Int), "科研点数高于", FieldCategory::Trigger),
+	FieldSpec::new("civ_research_per_month_over", ValueSpec::single(ValueType::Float), "每月科研高于", FieldCategory::Trigger),
+	FieldSpec::new("civ_legacy_per_month_over", ValueSpec::single(ValueType::Float), "每月威望高于", FieldCategory::Trigger),
+	FieldSpec::new("civ_manpower_perc_below", ValueSpec::single(ValueType::Float), "人力百分比低于", FieldCategory::Trigger),
+	FieldSpec::new("civ_diplomacy_over", ValueSpec::single(ValueType::Int), "外交点高于", FieldCategory::Trigger),
+	FieldSpec::new("civ_capital_has_building", ValueSpec::single(ValueType::Str), "首都拥有建筑（建筑 ID；或 `建筑ID=等级`）", FieldCategory::Trigger),
+	FieldSpec::new("civ_capital_is_occupied", ValueSpec::single(ValueType::Bool), "首都是否被占领", FieldCategory::Trigger),
+	FieldSpec::new("civ_has_more_provinces_than_civ", ValueSpec::pair(ValueType::Str, ValueType::Str), "省份数多于另一文明（如 unnn=pol）", FieldCategory::Trigger),
+	FieldSpec::new("civ_has_more_regiments_than_civ", ValueSpec::pair(ValueType::Str, ValueType::Str), "军团数多于另一文明（如 ger=czsl）", FieldCategory::Trigger),
+	FieldSpec::new("civs_are_neighbors", ValueSpec::pair(ValueType::Str, ValueType::Str), "两文明是否相邻（如 rus=ukr）", FieldCategory::Trigger),
+	FieldSpec::new("province_civ_has_core", ValueSpec::pair(ValueType::Int, ValueType::Str), "省份拥有某文明核心（省份=文明）", FieldCategory::Trigger),
+	FieldSpec::new("province_not_controlled_by", ValueSpec::pair(ValueType::Int, ValueType::Str), "省份未被某文明控制（省份=文明）", FieldCategory::Trigger),
+	FieldSpec::new("province_is_capital", ValueSpec::single(ValueType::Int), "省份是否为首都（省份 ID）", FieldCategory::Trigger),
+	FieldSpec::new("province_unrest_below", ValueSpec::single(ValueType::Float), "省份动荡低于", FieldCategory::Trigger),
+	FieldSpec::new("province_stability", ValueSpec::single(ValueType::Float), "省份稳定度", FieldCategory::Trigger),
+	FieldSpec::new("increased_manpower_over", ValueSpec::single(ValueType::Int), "人力增长值高于", FieldCategory::Trigger),
+	FieldSpec::new("buildings_constructed_over", ValueSpec::single(ValueType::Int), "已建造建筑数高于", FieldCategory::Trigger),
+	FieldSpec::new("administrative_buildings_constructed_over", ValueSpec::single(ValueType::Int), "已建造行政建筑数高于", FieldCategory::Trigger),
+	FieldSpec::new("military_buildings_constructed_over", ValueSpec::single(ValueType::Int), "已建造军事建筑数高于", FieldCategory::Trigger),
+	FieldSpec::new("economy_buildings_constructed_over", ValueSpec::single(ValueType::Int), "已建造经济建筑数高于", FieldCategory::Trigger),
+	FieldSpec::new("developed_infrastructure_over", ValueSpec::single(ValueType::Int), "已开发基建数高于", FieldCategory::Trigger),
+	FieldSpec::new("invested_in_economy_over", ValueSpec::single(ValueType::Int), "经济投资次数高于", FieldCategory::Trigger),
+	FieldSpec::new("increased_growth_rate_over", ValueSpec::single(ValueType::Int), "增长率提升次数高于", FieldCategory::Trigger),
+	FieldSpec::new("increased_tax_efficiency_over", ValueSpec::single(ValueType::Int), "税收效率提升次数高于", FieldCategory::Trigger),
+	FieldSpec::new("capital_building_level", ValueSpec::pair(ValueType::Int, ValueType::Int), "首都建筑等级（建筑ID=等级）", FieldCategory::Trigger),
 ];
 
 // ===== 收益效果（sqlite.rs MISSIONS_OPTIONS_BUTTON + 说明文档） =====
 
 pub const EFFECT_FIELDS: &[FieldSpec] = &[
-	FieldSpec::new("legacy", ValueSpec::single(ValueType::Int), "威望/遗产", FieldCategory::Effect),
+	FieldSpec::new("legacy", ValueSpec::single(ValueType::Float), "威望/遗产（可小数）", FieldCategory::Effect),
 	FieldSpec::new("gold", ValueSpec::single(ValueType::Int), "金币", FieldCategory::Effect),
 	FieldSpec::new("manpower", ValueSpec::single(ValueType::Int), "人力", FieldCategory::Effect),
-	FieldSpec::new("bonus_duration", ValueSpec::single(ValueType::Int), "后续加成的持续时间（99=永久）", FieldCategory::Effect),
+	FieldSpec::new("bonus_duration", ValueSpec::single(ValueType::Float), "后续加成的持续时间（99=永久；可为小数）", FieldCategory::Effect),
 	FieldSpec::new("bonus_monthly_legacy", ValueSpec::single(ValueType::Float), "每月威望加成（如 0.6）", FieldCategory::Effect),
-	FieldSpec::new("bonus_monthly_income", ValueSpec::single(ValueType::Int), "每月收入加成", FieldCategory::Effect),
-	FieldSpec::new("bonus_units_attack", ValueSpec::single(ValueType::Int), "部队攻击加成", FieldCategory::Effect),
-	FieldSpec::new("bonus_units_defense", ValueSpec::single(ValueType::Int), "部队防御加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_monthly_income", ValueSpec::single(ValueType::Float), "每月收入加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_units_attack", ValueSpec::single(ValueType::Float), "部队攻击加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_units_defense", ValueSpec::single(ValueType::Float), "部队防御加成", FieldCategory::Effect),
 	FieldSpec::new("bonus_army_movement_speed", ValueSpec::single(ValueType::Float), "军队移动速度加成（如 0.1）", FieldCategory::Effect),
-	FieldSpec::new("bonus_army_morale_recovery", ValueSpec::single(ValueType::Int), "军队士气恢复速度加成", FieldCategory::Effect),
-	FieldSpec::new("bonus_recruitment_time", ValueSpec::single(ValueType::Int), "征召时间加成", FieldCategory::Effect),
-	FieldSpec::new("bonus_manpower_recovery_speed", ValueSpec::single(ValueType::Int), "人力恢复速度加成", FieldCategory::Effect),
-	FieldSpec::new("bonus_max_manpower", ValueSpec::single(ValueType::Int), "最大人力加成", FieldCategory::Effect),
-	FieldSpec::new("bonus_max_manpower_percentage", ValueSpec::single(ValueType::Int), "最大人力百分比加成", FieldCategory::Effect),
-	FieldSpec::new("bonus_research", ValueSpec::single(ValueType::Int), "科研槽加成", FieldCategory::Effect),
-	FieldSpec::new("bonus_research_points", ValueSpec::single(ValueType::Int), "科研点数加成", FieldCategory::Effect),
-	FieldSpec::new("bonus_generals_attack", ValueSpec::single(ValueType::Int), "将领攻击加成", FieldCategory::Effect),
-	FieldSpec::new("bonus_generals_defense", ValueSpec::single(ValueType::Int), "将领防御加成", FieldCategory::Effect),
-	FieldSpec::new("bonus_income_production", ValueSpec::single(ValueType::Int), "收入产出加成", FieldCategory::Effect),
-	FieldSpec::new("bonus_production_efficiency", ValueSpec::single(ValueType::Int), "生产效率加成", FieldCategory::Effect),
-	FieldSpec::new("bonus_tax_efficiency", ValueSpec::single(ValueType::Int), "税收效率加成", FieldCategory::Effect),
-	FieldSpec::new("bonus_construction_cost", ValueSpec::single(ValueType::Int), "建筑成本加成", FieldCategory::Effect),
-	FieldSpec::new("bonus_construction_time", ValueSpec::single(ValueType::Int), "建筑时间加成（负数=减少）", FieldCategory::Effect),
-	FieldSpec::new("bonus_discipline", ValueSpec::single(ValueType::Int), "纪律加成", FieldCategory::Effect),
-	FieldSpec::new("bonus_loans_limit", ValueSpec::single(ValueType::Int), "贷款上限加成", FieldCategory::Effect),
-	FieldSpec::new("bonus_administration_buildings_cost", ValueSpec::single(ValueType::Int), "行政建筑成本加成", FieldCategory::Effect),
-	FieldSpec::new("bonus_military_buildings_cost", ValueSpec::single(ValueType::Int), "军事建筑成本加成", FieldCategory::Effect),
-	FieldSpec::new("bonus_economy_buildings_cost", ValueSpec::single(ValueType::Int), "经济建筑成本加成", FieldCategory::Effect),
-	FieldSpec::new("bonus_army_maintenance", ValueSpec::single(ValueType::Int), "军队维护成本加成", FieldCategory::Effect),
-	FieldSpec::new("bonus_province_maintenance", ValueSpec::single(ValueType::Int), "省份维护成本加成", FieldCategory::Effect),
-	FieldSpec::new("bonus_buildings_maintenance_cost", ValueSpec::single(ValueType::Int), "建筑维护成本加成", FieldCategory::Effect),
-	FieldSpec::new("bonus_recruit_army_cost", ValueSpec::single(ValueType::Int), "征召军队成本加成", FieldCategory::Effect),
-	FieldSpec::new("bonus_recruit_army_first_line_cost", ValueSpec::single(ValueType::Int), "征召一线部队成本加成", FieldCategory::Effect),
-	FieldSpec::new("bonus_recruit_army_second_line_cost", ValueSpec::single(ValueType::Int), "征召二线部队成本加成", FieldCategory::Effect),
-	FieldSpec::new("bonus_reinforcement_speed", ValueSpec::single(ValueType::Int), "增援速度加成", FieldCategory::Effect),
-	FieldSpec::new("province_unrest_all", ValueSpec::single(ValueType::Int), "全境动荡变化（-99=消除动荡）", FieldCategory::Effect),
-	FieldSpec::new("province_economy_capital_all", ValueSpec::single(ValueType::Int), "首都所有经济", FieldCategory::Effect),
-	FieldSpec::new("province_economy_capital_bul", ValueSpec::single(ValueType::Int), "首都经济（保加利亚特化）", FieldCategory::Effect),
-	FieldSpec::new("province_economy_all", ValueSpec::single(ValueType::Int), "所有省份经济", FieldCategory::Effect),
-	FieldSpec::new("province_economy", ValueSpec::single(ValueType::Int), "省份经济", FieldCategory::Effect),
-	FieldSpec::new("province_economy_id", ValueSpec::pair(ValueType::Int, ValueType::Int), "指定省份经济", FieldCategory::Effect),
+	FieldSpec::new("bonus_army_morale_recovery", ValueSpec::single(ValueType::Float), "军队士气恢复速度加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_recruitment_time", ValueSpec::single(ValueType::Float), "征召时间加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_manpower_recovery_speed", ValueSpec::single(ValueType::Float), "人力恢复速度加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_max_manpower", ValueSpec::single(ValueType::Float), "最大人力加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_max_manpower_percentage", ValueSpec::single(ValueType::Float), "最大人力百分比加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_research", ValueSpec::single(ValueType::Float), "科研槽加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_research_points", ValueSpec::single(ValueType::Float), "科研点数加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_generals_attack", ValueSpec::single(ValueType::Float), "将领攻击加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_generals_defense", ValueSpec::single(ValueType::Float), "将领防御加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_income_production", ValueSpec::single(ValueType::Float), "收入产出加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_production_efficiency", ValueSpec::single(ValueType::Float), "生产效率加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_tax_efficiency", ValueSpec::single(ValueType::Float), "税收效率加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_construction_cost", ValueSpec::single(ValueType::Float), "建筑成本加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_construction_time", ValueSpec::single(ValueType::Float), "建筑时间加成（负数=减少）", FieldCategory::Effect),
+	FieldSpec::new("bonus_discipline", ValueSpec::single(ValueType::Float), "纪律加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_loans_limit", ValueSpec::single(ValueType::Float), "贷款上限加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_administration_buildings_cost", ValueSpec::single(ValueType::Float), "行政建筑成本加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_military_buildings_cost", ValueSpec::single(ValueType::Float), "军事建筑成本加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_economy_buildings_cost", ValueSpec::single(ValueType::Float), "经济建筑成本加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_army_maintenance", ValueSpec::single(ValueType::Float), "军队维护成本加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_province_maintenance", ValueSpec::single(ValueType::Float), "省份维护成本加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_buildings_maintenance_cost", ValueSpec::single(ValueType::Float), "建筑维护成本加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_recruit_army_cost", ValueSpec::single(ValueType::Float), "征召军队成本加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_recruit_army_first_line_cost", ValueSpec::single(ValueType::Float), "征召一线部队成本加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_recruit_army_second_line_cost", ValueSpec::single(ValueType::Float), "征召二线部队成本加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_reinforcement_speed", ValueSpec::single(ValueType::Float), "增援速度加成", FieldCategory::Effect),
+	FieldSpec::new("province_unrest_all", ValueSpec::single(ValueType::Float), "全境动荡变化（-99=消除动荡）", FieldCategory::Effect),
+	FieldSpec::new("province_economy_capital_all", ValueSpec::single(ValueType::Float), "首都所有经济", FieldCategory::Effect),
+	FieldSpec::new("province_economy_capital_bul", ValueSpec::single(ValueType::Float), "首都经济（保加利亚特化）", FieldCategory::Effect),
+	FieldSpec::new("province_economy_all", ValueSpec::single(ValueType::Float), "所有省份经济", FieldCategory::Effect),
+	FieldSpec::new("province_economy", ValueSpec::single(ValueType::Float), "省份经济", FieldCategory::Effect),
+	FieldSpec::new("province_economy_id", ValueSpec::lambda(ValueType::Int, ValueType::Float, ValueType::Float), "指定省份经济（`省份=数值` 或 `省份列表;=数值`）", FieldCategory::Effect),
 	FieldSpec::new("province_infrastructure_all", ValueSpec::single(ValueType::Int), "所有省份基础设施", FieldCategory::Effect),
 	FieldSpec::new("province_infrastructure", ValueSpec::single(ValueType::Int), "省份基础设施", FieldCategory::Effect),
-	FieldSpec::new("province_growth_rate_all", ValueSpec::single(ValueType::Int), "所有省份增长率", FieldCategory::Effect),
-	FieldSpec::new("province_growth_rate", ValueSpec::single(ValueType::Int), "省份增长率", FieldCategory::Effect),
+	FieldSpec::new("province_growth_rate_all", ValueSpec::single(ValueType::Float), "所有省份增长率", FieldCategory::Effect),
+	FieldSpec::new("province_growth_rate", ValueSpec::single(ValueType::Float), "省份增长率", FieldCategory::Effect),
 	FieldSpec::new("province_population_all", ValueSpec::single(ValueType::Int), "所有省份人口", FieldCategory::Effect),
 	FieldSpec::new("province_religion_all", ValueSpec::single(ValueType::Int), "所有省份宗教", FieldCategory::Effect),
-	FieldSpec::new("province_manpower_id", ValueSpec::pair(ValueType::Int, ValueType::Int), "指定省份人力", FieldCategory::Effect),
+	FieldSpec::new("province_manpower_id", ValueSpec::lambda(ValueType::Int, ValueType::Float, ValueType::Float), "指定省份人力（`省份=数值` 或 `省份列表;=数值`）", FieldCategory::Effect),
 	FieldSpec::new("province_add_building", ValueSpec::lambda(ValueType::Int, ValueType::Int, ValueType::Int), "添加建筑（如 3994;=6=0）", FieldCategory::Effect),
-	FieldSpec::new("province_add_core_civ", ValueSpec::list(ValueType::Int), "添加核心省份（分号分隔）", FieldCategory::Effect),
+	FieldSpec::new("province_add_core_civ", ValueSpec::lambda(ValueType::Int, ValueType::Str, ValueType::Str), "添加核心省份（`省份列表;=文明标签`）", FieldCategory::Effect),
 	FieldSpec::new("change_ideology", ValueSpec::single(ValueType::Int), "改变意识形态倾向", FieldCategory::Effect),
-	FieldSpec::new("change_ideology_civ", ValueSpec::pair(ValueType::Str, ValueType::Int), "改变某文明的意识形态倾向", FieldCategory::Effect),
+	FieldSpec::new("change_ideology_civ", ValueSpec::pair(ValueType::Int, ValueType::Str), "改变某文明意识形态（意识形态序号=文明标签）", FieldCategory::Effect),
 	FieldSpec::new("set_civ_tag", ValueSpec::single(ValueType::Str), "设置文明标签/变身", FieldCategory::Effect),
 	FieldSpec::new("set_civ_tag2", ValueSpec::pair(ValueType::Str, ValueType::Str), "设置文明标签2（如 ger=ger_c）", FieldCategory::Effect),
 	FieldSpec::new("set_civ_tag_reset", ValueSpec::single(ValueType::Str), "重置文明标签", FieldCategory::Effect),
@@ -289,7 +368,7 @@ pub const EFFECT_FIELDS: &[FieldSpec] = &[
 	FieldSpec::new("annexed_by_civ", ValueSpec::single(ValueType::Str), "被某文明吞并", FieldCategory::Effect),
 	FieldSpec::new("annex_by_civ_from_civ", ValueSpec::triple(ValueType::Str, ValueType::Str, ValueType::Str), "从某文明吞并给另一文明", FieldCategory::Effect),
 	FieldSpec::new("make_puppet", ValueSpec::pair(ValueType::Str, ValueType::Str), "成为某文明傀儡", FieldCategory::Effect),
-	FieldSpec::new("annex", ValueSpec::single(ValueType::Int), "吞并", FieldCategory::Effect),
+	FieldSpec::new("annex", ValueSpec::list(ValueType::Int), "吞并（省份 ID，可分号分隔多个）", FieldCategory::Effect),
 	FieldSpec::new("add_ruler", ValueSpec::single(ValueType::Str), "添加统治者（如 \"鲍里斯=三世=鲍里斯三世=30=1=1894\"）", FieldCategory::Effect),
 	FieldSpec::new("add_general2", ValueSpec::single(ValueType::Str), "添加将领", FieldCategory::Effect),
 	FieldSpec::new("add_general", ValueSpec::single(ValueType::Str), "添加将领（旧版）", FieldCategory::Effect),
@@ -310,12 +389,12 @@ pub const EFFECT_FIELDS: &[FieldSpec] = &[
 	FieldSpec::new("add_decision", ValueSpec::single(ValueType::Str), "添加决议", FieldCategory::Effect),
 	FieldSpec::new("start_decision", ValueSpec::single(ValueType::Str), "启动决议", FieldCategory::Effect),
 	FieldSpec::new("taking_decision", ValueSpec::single(ValueType::Str), "执行决议", FieldCategory::Effect),
-	FieldSpec::new("join_alliance_special_id_first_tier", ValueSpec::single(ValueType::Int), "加入联盟第一层级", FieldCategory::Effect),
+	FieldSpec::new("join_alliance_special_id_first_tier", ValueSpec::single(ValueType::Str), "加入联盟第一层级（层级编号；或 `文明=层级`）", FieldCategory::Effect),
 	FieldSpec::new("join_alliance_special_id_second_tier", ValueSpec::single(ValueType::Int), "加入联盟第二层级（0=同盟国）", FieldCategory::Effect),
 	FieldSpec::new("leave_alliance_special_id", ValueSpec::single(ValueType::Int), "离开联盟（1=协约国）", FieldCategory::Effect),
-	FieldSpec::new("unlock_tech", ValueSpec::single(ValueType::Int), "解锁科技", FieldCategory::Effect),
+	FieldSpec::new("unlock_tech", ValueSpec::single(ValueType::Str), "解锁科技（科技编号；或 `文明=科技编号`）", FieldCategory::Effect),
 	FieldSpec::new("military_academy", ValueSpec::single(ValueType::Int), "军事学院", FieldCategory::Effect),
-	FieldSpec::new("set_counter", ValueSpec::pair(ValueType::Str, ValueType::Str), "设置计数器 $变量名=$表达式", FieldCategory::Effect),
+	FieldSpec::new("set_counter", ValueSpec::single(ValueType::Str), "设置计数器（`计数器=名称` 或 `计数器=名称=$表达式`）", FieldCategory::Effect),
 	FieldSpec::new("ae_set", ValueSpec::single(ValueType::Int), "设置侵略扩张值（如 -50、10、100）", FieldCategory::Effect),
 	FieldSpec::new("ae_ste", ValueSpec::single(ValueType::Int), "设置侵略扩张值（步进）", FieldCategory::Effect),
 	FieldSpec::new("se_set", ValueSpec::single(ValueType::Int), "设置超级事件值", FieldCategory::Effect),
@@ -329,10 +408,10 @@ pub const EFFECT_FIELDS: &[FieldSpec] = &[
 	FieldSpec::new("relation_change", ValueSpec::pair(ValueType::Str, ValueType::Int), "关系变化", FieldCategory::Effect),
 	FieldSpec::new("relation_set", ValueSpec::pair(ValueType::Str, ValueType::Int), "设置关系值", FieldCategory::Effect),
 	FieldSpec::new("remove_alliance", ValueSpec::single(ValueType::Int), "移除联盟", FieldCategory::Effect),
-	FieldSpec::new("change_law", ValueSpec::single(ValueType::Int), "改变法律", FieldCategory::Effect),
+	FieldSpec::new("change_law", ValueSpec::pair(ValueType::Str, ValueType::Str), "改变法律（法律名/编号=选项值）", FieldCategory::Effect),
 	FieldSpec::new("change_law2", ValueSpec::single(ValueType::Int), "改变法律2", FieldCategory::Effect),
 	FieldSpec::new("change_religion", ValueSpec::single(ValueType::Int), "改变宗教", FieldCategory::Effect),
-	FieldSpec::new("change_religion_civ", ValueSpec::pair(ValueType::Str, ValueType::Int), "改变某文明宗教", FieldCategory::Effect),
+	FieldSpec::new("change_religion_civ", ValueSpec::pair(ValueType::Int, ValueType::Str), "改变某文明宗教（宗教编号=文明标签）", FieldCategory::Effect),
 	FieldSpec::new("switch_ability", ValueSpec::single(ValueType::Str), "切换能力", FieldCategory::Effect),
 	FieldSpec::new("add_variable", ValueSpec::single(ValueType::Str), "添加变量", FieldCategory::Effect),
 	FieldSpec::new("add_variable_civ", ValueSpec::pair(ValueType::Str, ValueType::Str), "为某文明添加变量", FieldCategory::Effect),
@@ -357,17 +436,17 @@ pub const EFFECT_FIELDS: &[FieldSpec] = &[
 	FieldSpec::new("province_devastation_all", ValueSpec::single(ValueType::Int), "全境破坏", FieldCategory::Effect),
 	FieldSpec::new("province_devastation_capital", ValueSpec::single(ValueType::Int), "首都破坏", FieldCategory::Effect),
 	FieldSpec::new("province_devastation_id", ValueSpec::pair(ValueType::Int, ValueType::Int), "指定省份破坏", FieldCategory::Effect),
-	FieldSpec::new("province_manpower", ValueSpec::single(ValueType::Int), "省份人力", FieldCategory::Effect),
-	FieldSpec::new("province_manpower_all", ValueSpec::single(ValueType::Int), "全境人力", FieldCategory::Effect),
-	FieldSpec::new("province_manpower_capital", ValueSpec::single(ValueType::Int), "首都人力", FieldCategory::Effect),
+	FieldSpec::new("province_manpower", ValueSpec::single(ValueType::Float), "省份人力", FieldCategory::Effect),
+	FieldSpec::new("province_manpower_all", ValueSpec::single(ValueType::Float), "全境人力", FieldCategory::Effect),
+	FieldSpec::new("province_manpower_capital", ValueSpec::single(ValueType::Float), "首都人力", FieldCategory::Effect),
 	FieldSpec::new("province_population", ValueSpec::single(ValueType::Int), "省份人口", FieldCategory::Effect),
 	FieldSpec::new("province_population_capital", ValueSpec::single(ValueType::Int), "首都人口", FieldCategory::Effect),
-	FieldSpec::new("province_tax_efficiency", ValueSpec::single(ValueType::Int), "省份税收效率", FieldCategory::Effect),
-	FieldSpec::new("province_tax_efficiency_all", ValueSpec::single(ValueType::Int), "全境税收效率", FieldCategory::Effect),
+	FieldSpec::new("province_tax_efficiency", ValueSpec::single(ValueType::Float), "省份税收效率", FieldCategory::Effect),
+	FieldSpec::new("province_tax_efficiency_all", ValueSpec::single(ValueType::Float), "全境税收效率", FieldCategory::Effect),
 	FieldSpec::new("province_id_build_add", ValueSpec::pair(ValueType::Int, ValueType::Int), "指定省份添加建筑", FieldCategory::Effect),
 	FieldSpec::new("province_id_build_remove", ValueSpec::pair(ValueType::Int, ValueType::Int), "指定省份移除建筑", FieldCategory::Effect),
-	FieldSpec::new("province_id_core_add", ValueSpec::pair(ValueType::Int, ValueType::Int), "指定省份添加核心", FieldCategory::Effect),
-	FieldSpec::new("province_id_core_remove", ValueSpec::pair(ValueType::Int, ValueType::Int), "指定省份移除核心", FieldCategory::Effect),
+	FieldSpec::new("province_id_core_add", ValueSpec::pair(ValueType::Int, ValueType::Str), "指定省份添加核心（省份ID=文明ID）", FieldCategory::Effect),
+	FieldSpec::new("province_id_core_remove", ValueSpec::pair(ValueType::Int, ValueType::Str), "指定省份移除核心（省份ID=文明ID）", FieldCategory::Effect),
 	FieldSpec::new("province_id_nuke", ValueSpec::single(ValueType::Int), "核打击省份", FieldCategory::Effect),
 	FieldSpec::new("province_id_pop_set", ValueSpec::pair(ValueType::Int, ValueType::Int), "设置省份人口", FieldCategory::Effect),
 	FieldSpec::new("province_id_spread_disease", ValueSpec::pair(ValueType::Int, ValueType::Int), "省份传播疾病", FieldCategory::Effect),
@@ -381,51 +460,115 @@ pub const EFFECT_FIELDS: &[FieldSpec] = &[
 	FieldSpec::new("annex_provinces", ValueSpec::single(ValueType::Int), "吞并省份", FieldCategory::Effect),
 	FieldSpec::new("annex_provinces_from_civ", ValueSpec::pair(ValueType::Str, ValueType::Int), "从某文明吞并省份", FieldCategory::Effect),
 	FieldSpec::new("capital_city_level", ValueSpec::single(ValueType::Int), "首都城市等级", FieldCategory::Effect),
-	FieldSpec::new("explode", ValueSpec::single(ValueType::Int), "爆炸效果", FieldCategory::Effect),
-	FieldSpec::new("inflation", ValueSpec::single(ValueType::Int), "通货膨胀", FieldCategory::Effect),
+	FieldSpec::new("explode", ValueSpec::single(ValueType::Str), "解体（文明标签，如 ger、hun）", FieldCategory::Effect),
+	FieldSpec::new("inflation", ValueSpec::single(ValueType::Float), "通货膨胀", FieldCategory::Effect),
 	FieldSpec::new("nuclear_reactor", ValueSpec::single(ValueType::Int), "核反应堆", FieldCategory::Effect),
 	FieldSpec::new("play_music", ValueSpec::single(ValueType::Str), "播放音乐", FieldCategory::Effect),
 	FieldSpec::new("run_script", ValueSpec::single(ValueType::Str), "运行脚本", FieldCategory::Effect),
 	FieldSpec::new("skip_focus", ValueSpec::single(ValueType::Int), "跳过焦点", FieldCategory::Effect),
-	FieldSpec::new("skip_goal", ValueSpec::single(ValueType::Int), "跳过目标", FieldCategory::Effect),
+	FieldSpec::new("skip_goal", ValueSpec::single(ValueType::Str), "跳过目标（目标 ID；可 `目标=序号`）", FieldCategory::Effect),
 	FieldSpec::new("military_academy_for_generals", ValueSpec::single(ValueType::Int), "将领军事学院", FieldCategory::Effect),
-	FieldSpec::new("white_peace2", ValueSpec::pair(ValueType::Str, ValueType::Str), "白和平2（文明A=文明B，可空段）", FieldCategory::Effect),
-	FieldSpec::new("bonus_advisor_cost", ValueSpec::single(ValueType::Int), "顾问成本加成", FieldCategory::Effect),
-	FieldSpec::new("bonus_advisor_max_level", ValueSpec::single(ValueType::Int), "顾问最大等级加成", FieldCategory::Effect),
-	FieldSpec::new("bonus_aggressive_expansion", ValueSpec::single(ValueType::Int), "侵略扩张加成", FieldCategory::Effect),
-	FieldSpec::new("bonus_all_characters_life_expectancy", ValueSpec::single(ValueType::Int), "所有角色寿命加成", FieldCategory::Effect),
-	FieldSpec::new("bonus_battle_width", ValueSpec::single(ValueType::Int), "战斗宽度加成", FieldCategory::Effect),
-	FieldSpec::new("bonus_core_cost", ValueSpec::single(ValueType::Int), "核心成本加成", FieldCategory::Effect),
-	FieldSpec::new("bonus_corruption", ValueSpec::single(ValueType::Int), "腐败加成", FieldCategory::Effect),
-	FieldSpec::new("bonus_develop_infrastructure_cost", ValueSpec::single(ValueType::Int), "发展基建成本加成", FieldCategory::Effect),
-	FieldSpec::new("bonus_diplomacy_points", ValueSpec::single(ValueType::Int), "外交点数加成", FieldCategory::Effect),
-	FieldSpec::new("bonus_disease_death_rate", ValueSpec::single(ValueType::Int), "疾病死亡率加成", FieldCategory::Effect),
-	FieldSpec::new("bonus_growth_rate", ValueSpec::single(ValueType::Int), "增长率加成", FieldCategory::Effect),
-	FieldSpec::new("bonus_improve_relations_modifier", ValueSpec::single(ValueType::Int), "改善关系修正加成", FieldCategory::Effect),
-	FieldSpec::new("bonus_income_economy", ValueSpec::single(ValueType::Int), "经济收入加成", FieldCategory::Effect),
-	FieldSpec::new("bonus_income_from_vassals", ValueSpec::single(ValueType::Int), "附庸收入加成", FieldCategory::Effect),
-	FieldSpec::new("bonus_income_taxation", ValueSpec::single(ValueType::Int), "税收收入加成", FieldCategory::Effect),
-	FieldSpec::new("bonus_increase_growth_rate_cost", ValueSpec::single(ValueType::Int), "增加增长率成本加成", FieldCategory::Effect),
-	FieldSpec::new("bonus_increase_manpower_cost", ValueSpec::single(ValueType::Int), "增加人力成本加成", FieldCategory::Effect),
-	FieldSpec::new("bonus_increase_tax_efficiency_cost", ValueSpec::single(ValueType::Int), "增加税收效率成本加成", FieldCategory::Effect),
-	FieldSpec::new("bonus_inflation", ValueSpec::single(ValueType::Int), "通货膨胀加成", FieldCategory::Effect),
-	FieldSpec::new("bonus_invest_in_economy_cost", ValueSpec::single(ValueType::Int), "投资经济成本加成", FieldCategory::Effect),
-	FieldSpec::new("bonus_loan_interest", ValueSpec::single(ValueType::Int), "贷款利息加成", FieldCategory::Effect),
-	FieldSpec::new("bonus_maintenance_cost", ValueSpec::single(ValueType::Int), "维护成本加成", FieldCategory::Effect),
-	FieldSpec::new("bonus_manpower_recovery_from_a_disbanded_army", ValueSpec::single(ValueType::Int), "解散军队人力恢复加成", FieldCategory::Effect),
-	FieldSpec::new("bonus_max_morale", ValueSpec::single(ValueType::Int), "最大士气加成", FieldCategory::Effect),
-	FieldSpec::new("bonus_maximum_amount_of_gold", ValueSpec::single(ValueType::Int), "最大金币上限加成", FieldCategory::Effect),
+	FieldSpec::new("white_peace2", ValueSpec::single(ValueType::Str), "白和平2（文明标签；也支持 文明A=文明B）", FieldCategory::Effect),
+	FieldSpec::new("bonus_advisor_cost", ValueSpec::single(ValueType::Float), "顾问成本加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_advisor_max_level", ValueSpec::single(ValueType::Float), "顾问最大等级加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_aggressive_expansion", ValueSpec::single(ValueType::Float), "侵略扩张加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_all_characters_life_expectancy", ValueSpec::single(ValueType::Float), "所有角色寿命加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_battle_width", ValueSpec::single(ValueType::Float), "战斗宽度加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_core_cost", ValueSpec::single(ValueType::Float), "核心成本加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_corruption", ValueSpec::single(ValueType::Float), "腐败加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_develop_infrastructure_cost", ValueSpec::single(ValueType::Float), "发展基建成本加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_diplomacy_points", ValueSpec::single(ValueType::Float), "外交点数加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_disease_death_rate", ValueSpec::single(ValueType::Float), "疾病死亡率加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_growth_rate", ValueSpec::single(ValueType::Float), "增长率加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_improve_relations_modifier", ValueSpec::single(ValueType::Float), "改善关系修正加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_income_economy", ValueSpec::single(ValueType::Float), "经济收入加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_income_from_vassals", ValueSpec::single(ValueType::Float), "附庸收入加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_income_taxation", ValueSpec::single(ValueType::Float), "税收收入加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_increase_growth_rate_cost", ValueSpec::single(ValueType::Float), "增加增长率成本加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_increase_manpower_cost", ValueSpec::single(ValueType::Float), "增加人力成本加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_increase_tax_efficiency_cost", ValueSpec::single(ValueType::Float), "增加税收效率成本加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_inflation", ValueSpec::single(ValueType::Float), "通货膨胀加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_invest_in_economy_cost", ValueSpec::single(ValueType::Float), "投资经济成本加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_loan_interest", ValueSpec::single(ValueType::Float), "贷款利息加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_maintenance_cost", ValueSpec::single(ValueType::Float), "维护成本加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_manpower_recovery_from_a_disbanded_army", ValueSpec::single(ValueType::Float), "解散军队人力恢复加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_max_morale", ValueSpec::single(ValueType::Float), "最大士气加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_maximum_amount_of_gold", ValueSpec::single(ValueType::Float), "最大金币上限加成", FieldCategory::Effect),
 	FieldSpec::new("bonus_monthly_legacy_perc", ValueSpec::single(ValueType::Float), "每月威望百分比加成", FieldCategory::Effect),
-	FieldSpec::new("bonus_regiments_limit", ValueSpec::single(ValueType::Int), "军团上限加成", FieldCategory::Effect),
-	FieldSpec::new("bonus_religion_cost", ValueSpec::single(ValueType::Int), "宗教成本加成", FieldCategory::Effect),
-	FieldSpec::new("bonus_revolutionary_risk", ValueSpec::single(ValueType::Int), "革命风险加成", FieldCategory::Effect),
-	FieldSpec::new("bonus_siege_effectiveness", ValueSpec::single(ValueType::Int), "围困效率加成", FieldCategory::Effect),
-	FieldSpec::new("bonus_war_score_cost", ValueSpec::single(ValueType::Int), "战争分数成本加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_regiments_limit", ValueSpec::single(ValueType::Float), "军团上限加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_religion_cost", ValueSpec::single(ValueType::Float), "宗教成本加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_revolutionary_risk", ValueSpec::single(ValueType::Float), "革命风险加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_siege_effectiveness", ValueSpec::single(ValueType::Float), "围困效率加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_war_score_cost", ValueSpec::single(ValueType::Float), "战争分数成本加成", FieldCategory::Effect),
+	// 实测模组常见键（GameCivs 五模组统计后注册）
+	FieldSpec::new("add_military_access", ValueSpec::pair(ValueType::Str, ValueType::Str), "军事通行权（给予方=获得方）", FieldCategory::Effect),
+	FieldSpec::new("add_alliance", ValueSpec::pair(ValueType::Str, ValueType::Str), "加入联盟（如 roc=xib）", FieldCategory::Effect),
+	FieldSpec::new("add_non_aggression", ValueSpec::single(ValueType::Str), "互不侵犯条约", FieldCategory::Effect),
+	FieldSpec::new("add_variable2", ValueSpec::single(ValueType::Str), "添加变量（第二版）", FieldCategory::Effect),
+	FieldSpec::new("annex_civ2", ValueSpec::single(ValueType::Str), "吞并某文明（第二版，可多次使用）", FieldCategory::Effect),
+	FieldSpec::new("annexed_by_civ2", ValueSpec::single(ValueType::Str), "被某文明吞并（第二版）", FieldCategory::Effect),
+	FieldSpec::new("annex_by_civ_from_civ2", ValueSpec::triple(ValueType::Str, ValueType::Str, ValueType::Str), "从某文明吞并给另一文明（第二版）", FieldCategory::Effect),
+	FieldSpec::new("province_remove_core_civ", ValueSpec::lambda(ValueType::Int, ValueType::Str, ValueType::Str), "移除核心省份（`省份列表;=文明标签`）", FieldCategory::Effect),
+	FieldSpec::new("province_growth_rate_id", ValueSpec::lambda(ValueType::Int, ValueType::Float, ValueType::Float), "指定省份增长率（`省份=数值` 或 `省份列表;=数值`）", FieldCategory::Effect),
+	FieldSpec::new("province_unrest_capital", ValueSpec::single(ValueType::Float), "首都动荡变化", FieldCategory::Effect),
+	FieldSpec::new("province_production_efficiency_all", ValueSpec::single(ValueType::Float), "全境生产效率", FieldCategory::Effect),
+	FieldSpec::new("gold_monthly_income", ValueSpec::single(ValueType::Float), "每月收入加成", FieldCategory::Effect),
+	FieldSpec::new("legacy_monthly", ValueSpec::single(ValueType::Float), "每月威望加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_monthly_research", ValueSpec::single(ValueType::Float), "每月科研加成", FieldCategory::Effect),
+	FieldSpec::new("military_academy_generals", ValueSpec::single(ValueType::Int), "将领军事学院", FieldCategory::Effect),
+	FieldSpec::new("relations_set", ValueSpec::triple(ValueType::Str, ValueType::Str, ValueType::Int), "设置关系值（`文明A=文明B=数值`，模组复数写法）", FieldCategory::Effect),
+	FieldSpec::new("relations_change", ValueSpec::triple(ValueType::Str, ValueType::Str, ValueType::Int), "关系变化（`文明A=文明B=数值`，模组复数写法）", FieldCategory::Effect),
+	FieldSpec::new("set_civ_tag_reset2", ValueSpec::single(ValueType::Str), "重置文明标签（第二版）", FieldCategory::Effect),
+	FieldSpec::new("add_advisor2", ValueSpec::single(ValueType::Str), "添加顾问（第二版）", FieldCategory::Effect),
+	FieldSpec::new("add_general3", ValueSpec::single(ValueType::Str), "添加将领（第三版）", FieldCategory::Effect),
+	// 实测模组常见键（第二批）
+	FieldSpec::new("annex_from_civ", ValueSpec::pair(ValueType::Str, ValueType::Str), "从某文明吞并省份（文明=省份列表）", FieldCategory::Effect),
+	FieldSpec::new("research", ValueSpec::single(ValueType::Int), "研究点数（旧写法，同 bonus_research_points）", FieldCategory::Effect),
+	FieldSpec::new("Research", ValueSpec::single(ValueType::Int), "研究点数（大写写法）", FieldCategory::Effect),
+	FieldSpec::new("Discipline", ValueSpec::single(ValueType::Float), "纪律加成（大写写法，同 bonus_discipline）", FieldCategory::Effect),
+	FieldSpec::new("bonus_monthly_legacy_percentage", ValueSpec::single(ValueType::Float), "每月威望百分比加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_general_cost", ValueSpec::single(ValueType::Float), "将领成本加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_infrastructure_efficiency", ValueSpec::single(ValueType::Float), "基建效率加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_research_cost", ValueSpec::single(ValueType::Float), "科研成本加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_research_efficiency", ValueSpec::single(ValueType::Float), "科研效率加成", FieldCategory::Effect),
+	FieldSpec::new("bonus_unlocked_legacies", ValueSpec::single(ValueType::Float), "已解锁遗产数加成", FieldCategory::Effect),
+	FieldSpec::new("province_growth_rate_capital", ValueSpec::single(ValueType::Float), "首都增长率", FieldCategory::Effect),
+	FieldSpec::new("province_infrastructure_capital", ValueSpec::single(ValueType::Int), "首都基础设施", FieldCategory::Effect),
+	FieldSpec::new("province_tax_efficiency_capital", ValueSpec::single(ValueType::Float), "首都税收效率", FieldCategory::Effect),
+	FieldSpec::new("province_tax_efficiency_id", ValueSpec::lambda(ValueType::Int, ValueType::Float, ValueType::Float), "指定省份税收效率（`省份=数值` 或 `省份列表;=数值`）", FieldCategory::Effect),
+	FieldSpec::new("province_nuke", ValueSpec::lambda(ValueType::Int, ValueType::Str, ValueType::Str), "核打击省份（`省份列表;=文明标签`；同 province_id_nuke 的单值写法）", FieldCategory::Effect),
+	FieldSpec::new("option_end", ValueSpec::single(ValueType::Str), "选项块结束行（出现在块外时原样保留）", FieldCategory::Effect),
 ];
 
 /// 常见的拼写错误键 → 正确键名提示（编辑器诊断用）。
+/// 条目来自 GameCivs 五模组真实事件文件的统计（部分行是被截断/漏敲的键名）。
 pub const KNOWN_TYPOS: &[(&str, &str)] = &[
 	("leagcy", "legacy"),
+	("legcy", "legacy"),
+	("lagacy", "legacy"),
+	("laegacy", "legacy"),
+	("laegcy", "legacy"),
+	("dsec", "desc"),
+	("missions_desc", "mission_desc"),
+	("ser_civ_tag2", "set_civ_tag2"),
+	("has_bariable_not", "has_variable_not"),
+	("has_varia", "has_variable"),
+	("existis_any_not", "exists_any_not"),
+	("annex_by_civ_fro", "annex_by_civ_from_civ"),
+	("annex_ci", "annex_civ"),
+	("annexed_", "annexed_by_civ"),
+	("annexed_by", "annexed_by_civ"),
+	("annexed_by_c", "annexed_by_civ"),
+	("change_ideolog", "change_ideology"),
+	("civ_capital_unrest_ove", "civ_capital_unrest_over"),
+	("whit", "white_peace"),
+	("white_pe", "white_peace"),
+	("white_pea", "white_peace"),
+	("white_peac", "white_peace"),
+	("add_ru", "add_ruler"),
+	("add_rule", "add_ruler"),
+	("add_defencive_pact", "add_defensive_pact"),
+	("is_palyer", "is_player"),
 ];
 
 /// 遍历全部已注册的键位。
@@ -438,18 +581,28 @@ pub fn all_specs() -> impl Iterator<Item = &'static FieldSpec> {
 		.chain(EFFECT_FIELDS)
 }
 
-/// 按键名查注册信息。
+/// 按键名查注册信息（忽略键首尾空白：解析器为逐字节保真会保留行首空格/`key = value` 形式的空格）。
 pub fn lookup(key: &str) -> Option<&'static FieldSpec> {
-	all_specs().find(|spec| spec.key == key)
+	all_specs().find(|spec| spec.key == key.trim())
 }
 
 /// 类型语法诊断：判断 `value` 是否符合 `spec` 描述的语法。
-/// 空值视为合法（允许留空）。
+/// 空值视为合法（允许留空）；先按原值校验，失败后再尝试去掉尾随 `=`
+/// （`2=`、`a=b=`、`3=0=…=0=` 是模组脚本里的常见写法，相当于省略尾段）。
 pub fn is_valid_value(spec: ValueSpec, value: &str) -> bool {
 	let value = value.trim();
 	if value.is_empty() {
 		return true;
 	}
+	if spec_matches(spec, value) {
+		return true;
+	}
+	let stripped = value.trim_end_matches('=');
+	stripped != value && (stripped.is_empty() || spec_matches(spec, stripped))
+}
+
+/// 不带容错的语法匹配（[`is_valid_value`] 的主体）。
+fn spec_matches(spec: ValueSpec, value: &str) -> bool {
 	match spec {
 		ValueSpec::Single(value_type) => value_type.accepts(value),
 		ValueSpec::OneOf(first, second) => first.accepts(value) || second.accepts(value),
@@ -469,17 +622,16 @@ pub fn is_valid_value(spec: ValueSpec, value: &str) -> bool {
 			.filter(|part| !part.trim().is_empty())
 			.all(|part| value_type.accepts(part)),
 		ValueSpec::Sequence(first, second) => {
+			// 允许奇数段（模组里常以孤立的类型段收尾，如 `0=0=…=0`）。
 			let parts: Vec<_> = value.split('=').collect();
-			if parts.len() < 2 || parts.len() % 2 != 0 {
-				return false;
-			}
-			parts.iter().enumerate().all(|(index, part)| {
-				if index % 2 == 0 {
-					first.accepts(part)
-				} else {
-					second.accepts(part)
-				}
-			})
+			parts.len() >= 2
+				&& parts.iter().enumerate().all(|(index, part)| {
+					if index % 2 == 0 {
+						first.accepts(part)
+					} else {
+						second.accepts(part)
+					}
+				})
 		}
 		ValueSpec::Lambda(first, second, third) => {
 			let Some((left, right)) = value.split_once('=') else {
@@ -489,11 +641,21 @@ pub fn is_valid_value(spec: ValueSpec, value: &str) -> bool {
 				.split(';')
 				.filter(|part| !part.trim().is_empty())
 				.all(|part| first.accepts(part));
-			let pair_parts: Vec<_> = right.split('=').collect();
-			list_ok
-				&& pair_parts.len() == 2
-				&& second.accepts(pair_parts[0])
-				&& third.accepts(pair_parts[1])
+			if !list_ok {
+				return false;
+			}
+			// 右段既可以是 `a=b` 两段（如 `3994;=6=0`），
+			// 也可以是单段（如 `4381;…;=ANF6_Anfu`、`…;=15.0`）。
+			let mut parts = right.split('=');
+			let head = parts.next().unwrap_or_default();
+			match parts.next() {
+				None => second.accepts(head),
+				Some(tail) => {
+					parts.next().is_none()
+						&& second.accepts(head)
+						&& third.accepts(tail)
+				}
+			}
 		}
 	}
 }
@@ -512,6 +674,9 @@ mod tests {
 		);
 		assert_eq!(lookup("legacy").unwrap().category, FieldCategory::Effect);
 		assert!(lookup("leagcy").is_none());
+		// 键首尾空白（行首缩进 / `key = value` 写法）按去空白匹配。
+		assert!(lookup(" legacy").is_some());
+		assert!(lookup("annex_by_civ_from_civ ").is_some());
 	}
 
 	#[test]
@@ -544,9 +709,14 @@ mod tests {
 			ValueSpec::sequence(ValueType::Int, ValueType::Int),
 			"1=100=2=200"
 		));
-		assert!(!is_valid_value(
+		// 奇数段（末尾只剩类型）在模组里同样出现，视为合法。
+		assert!(is_valid_value(
 			ValueSpec::sequence(ValueType::Int, ValueType::Int),
 			"1=100=2"
+		));
+		assert!(!is_valid_value(
+			ValueSpec::sequence(ValueType::Int, ValueType::Int),
+			"1=100=abc"
 		));
 		assert!(is_valid_value(
 			ValueSpec::lambda(ValueType::Int, ValueType::Int, ValueType::Int),
@@ -558,5 +728,104 @@ mod tests {
 	fn empty_values_are_valid() {
 		assert!(is_valid_value(ValueSpec::single(ValueType::Int), ""));
 		assert!(is_valid_value(ValueSpec::pair(ValueType::Str, ValueType::Str), ""));
+	}
+
+	/// 尾随 `=`（省略尾段）与 `列表;=单值` 的容错（真实模组数据驱动）。
+	#[test]
+	fn tolerates_trailing_equals_and_single_tail_lambda() {
+		assert!(is_valid_value(ValueSpec::single(ValueType::Float), "2="));
+		assert!(is_valid_value(ValueSpec::single(ValueType::Int), "100="));
+		assert!(is_valid_value(
+			ValueSpec::pair(ValueType::Str, ValueType::Str),
+			"nejd=bedo2="
+		));
+		assert!(is_valid_value(
+			ValueSpec::sequence(ValueType::Int, ValueType::Int),
+			"3=0=5=0="
+		));
+		assert!(is_valid_value(
+			ValueSpec::triple(ValueType::Int, ValueType::Int, ValueType::Int),
+			"=="
+		));
+		// `省份列表;=文明标签` / `省份=数值`（右段单值）
+		assert!(is_valid_value(
+			ValueSpec::lambda(ValueType::Int, ValueType::Str, ValueType::Str),
+			"4381;4877;=ANF6_Anfu"
+		));
+		assert!(is_valid_value(
+			ValueSpec::lambda(ValueType::Int, ValueType::Float, ValueType::Float),
+			"3475=100"
+		));
+		assert!(is_valid_value(
+			ValueSpec::lambda(ValueType::Int, ValueType::Float, ValueType::Float),
+			"5220;2952;=15.0"
+		));
+	}
+
+	/// 注册表按真实模组数据逐条核对（值均取自 GameCivs 五个模组实测）。
+	#[test]
+	fn registered_specs_accept_real_mod_values() {
+		let cases = [
+			("province_is_occupied", "1123"),
+			("province_is_occupied", "true"),
+			("province_is_under_siege", "352"),
+			("white_peace2", "GUO_kleft"),
+			("annex", "404;409;"),
+			("annex", "217"),
+			("province_add_core_civ", "4381;4877;=ANF6_Anfu"),
+			("change_ideology_civ", "0=LRF"),
+			("change_ideology_civ", "="),
+			("change_law", "ecun=un1"),
+			("change_law", "8=1"),
+			("skip_goal", "FNG1917_zhangshi=0"),
+			("skip_goal", "rrus89"),
+			("bonus_duration", "0.3"),
+			("bonus_monthly_income", "0.5"),
+			("bonus_province_maintenance", "-0.8"),
+			("bonus_max_morale", "2.5"),
+			("province_growth_rate", "2.0"),
+			("province_manpower", "3.0"),
+			("province_growth_rate_all", "1.5"),
+			("set_counter", "neu=安福国会蒙藏院=$安福国会蒙藏院+10"),
+			("set_counter", "neu=天下"),
+			("unlock_tech", "JAP=95"),
+			("unlock_tech", "132"),
+			("change_religion_civ", "5=RUS2"),
+			("province_manpower_id", "5220;2952;=15.0"),
+			("province_economy_id", "2855=45"),
+			("explode", "hun"),
+			("add_new_army", "3=0=5=0=3=0="),
+			("declare_war2", "nejd=bedo2="),
+			("bonus_manpower_recovery_speed", "12.5"),
+			("legacy", "100="),
+			("legacy", "7.5"),
+			("tooltip", "false="),
+			("annex_by_civ_from_civ", "bah=ger="),
+			("annex_by_civ_from_civ", "JEH_Wanxi=ANF6_Anfu="),
+			("declare_war2", "spa_b="),
+			("set_civ_tag2", "alb="),
+			("has_variable_civ", "反清复明运动"),
+			("add_new_army", "0=0=0=0=0=0=0=0=0=0=0=0=0=0=0"),
+			("relations_set", "ANF=CHI=-15"),
+			("relations_change", "ANF5_Anfu=ZHL2_Baoding=-25"),
+			("if_counter", "$东北现代化点数>19"),
+			("if_counter", "$亲日立场<4"),
+			("capital_building_level", "0=1"),
+			("civ_capital_has_building", "9=0"),
+			("civ_capital_has_building", "6"),
+			("province_nuke", "1;2;3;4;=neu"),
+			("annex_from_civ", "CXL_chuan=1567;9497;4369;"),
+			("province_civ_has_core", "3994=CFT_zhangshi"),
+			("random_chance", "20.0"),
+			("ui_type", "6"),
+			("music_file", "［俄罗斯电台］四年战争"),
+		];
+		for (key, value) in cases {
+			let spec = lookup(key).unwrap_or_else(|| panic!("缺少键 {key}"));
+			assert!(
+				is_valid_value(spec.spec, value),
+				"{key}={value} 应视为合法"
+			);
+		}
 	}
 }

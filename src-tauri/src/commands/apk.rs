@@ -163,9 +163,10 @@ pub async fn extract_apk_to_workspace<R: tauri::Runtime>(
     })
 }
 
-/// 「从 apk 中导入」：只解压 `assets/game/missions/` 与 `assets/map/Earth3/scenarios/`
-/// 两个版块到工作区（目录保留完整路径，落点与整体解压一致：`<工作区>/<APK 名称>/`），
-/// 其余条目静默跳过；进度经 `apk-progress` 事件上报（单位：files）。
+/// 「从 apk 中导入」：解压全局国策（`assets/game/missions/`）与全部剧本目录
+/// （`assets/map/<地图>/scenarios/<剧本>/`——地图 / 剧本目录名按 APK 实际结构
+/// 自动识别，适配各模组自定义命名）到工作区（目录保留完整路径，落点与整体解压
+/// 一致：`<工作区>/<APK 名称>/`），其余条目静默跳过；进度经 `apk-progress` 事件上报（单位：files）。
 #[tauri::command]
 pub async fn import_apk_sections<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
@@ -200,41 +201,35 @@ pub async fn import_apk_sections<R: tauri::Runtime>(
 
     let outcome = tauri::async_runtime::spawn_blocking(move || {
         #[cfg(target_os = "android")]
-        {
+        let file = {
             use tauri_plugin_android_fs::{AndroidFsExt, FsUri};
             let uri = if apk_path.contains("://") {
                 FsUri::from_uri(apk_path.clone())
             } else {
                 FsUri::from_path(Path::new(&apk_path))
             };
-            let file = app
-                .android_fs()
+            app.android_fs()
                 .open_file_readable(&uri)
                 .map_err(|error| {
                     format!("打开 APK 失败（若 APK 位于云盘等虚拟目录，请先下载到设备本地）：{error}")
-                })?;
-            let emitter = ProgressEmitter::new(app, "import");
-            crate::apk_extract::extract_selected_from_file(
-                &file,
-                &destination,
-                &crate::apk_update::APK_SECTION_PREFIXES,
-                &|completed, total| {
-                    emitter.emit("正在从 APK 导入 missions/scenarios", "files", completed, total)
-                },
-            )
-        }
+                })?
+        };
         #[cfg(not(target_os = "android"))]
-        {
-            let emitter = ProgressEmitter::new(app, "import");
-            crate::apk_extract::extract_apk_sections_with_progress(
-                Path::new(&apk_path),
-                &destination,
-                &crate::apk_update::APK_SECTION_PREFIXES,
-                &|completed, total| {
-                    emitter.emit("正在从 APK 导入 missions/scenarios", "files", completed, total)
-                },
-            )
-        }
+        let file = std::fs::File::open(Path::new(&apk_path))
+            .map_err(|error| format!("打开 APK 失败 {apk_path}：{error}"))?;
+
+        // 版块前缀按 APK 实际目录结构识别（自适应各模组自定义的地图 / 剧本目录名）。
+        let prefixes = crate::apk_extract::discover_section_prefixes(&file)?;
+        let prefix_refs: Vec<&str> = prefixes.iter().map(String::as_str).collect();
+        let emitter = ProgressEmitter::new(app, "import");
+        crate::apk_extract::extract_selected_from_file(
+            &file,
+            &destination,
+            &prefix_refs,
+            &|completed, total| {
+                emitter.emit("正在从 APK 导入 missions/scenarios", "files", completed, total)
+            },
+        )
     })
     .await
     .map_err(|error| format!("导入任务失败：{error}"))??;
@@ -254,9 +249,10 @@ pub async fn import_apk_sections<R: tauri::Runtime>(
     })
 }
 
-/// 「导出到 apk」：把工作区 `<APK 名称>/` 下的 missions 与 Earth3/scenarios 版块
-/// 以更新替换式覆盖写回 APK——工作区存在、APK 中没有的文件追加为新增条目，
-/// 其余原条目保留不变；进度经 `apk-progress` 事件上报（单位：files）。
+/// 「导出到 apk」：把工作区 `<APK 名称>/` 下的全局国策与各剧本版块
+/// （`assets/game/missions/` 与 `assets/map/<地图>/scenarios/<剧本>/`，目录名按
+/// 工作区实际结构自动识别）以更新替换式覆盖写回 APK——工作区存在、APK 中没有的
+/// 文件追加为新增条目，其余原条目保留不变；进度经 `apk-progress` 事件上报（单位：files）。
 #[tauri::command]
 pub async fn export_apk_sections<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
@@ -288,6 +284,9 @@ pub async fn export_apk_sections<R: tauri::Runtime>(
     let apk_location = apk_path.clone();
 
     let outcome = tauri::async_runtime::spawn_blocking(move || {
+        // 版块前缀按工作区实际目录识别（自适应各模组自定义的地图 / 剧本目录名）。
+        let prefixes = crate::apk_update::discover_workspace_section_prefixes(&source_root);
+        let prefix_refs: Vec<&str> = prefixes.iter().map(String::as_str).collect();
         #[cfg(target_os = "android")]
         {
             use tauri_plugin_android_fs::{AndroidFsExt, FileAccessMode, FsUri};
@@ -308,7 +307,7 @@ pub async fn export_apk_sections<R: tauri::Runtime>(
             crate::apk_update::update_apk_sections(
                 &mut file,
                 &source_root,
-                &crate::apk_update::APK_SECTION_PREFIXES,
+                &prefix_refs,
                 &|completed, total| {
                     emitter.emit("正在导出到 APK（更新替换）", "files", completed, total)
                 },
@@ -329,7 +328,7 @@ pub async fn export_apk_sections<R: tauri::Runtime>(
             crate::apk_update::update_apk_sections(
                 &mut file,
                 &source_root,
-                &crate::apk_update::APK_SECTION_PREFIXES,
+                &prefix_refs,
                 &|completed, total| {
                     emitter.emit("正在导出到 APK（更新替换）", "files", completed, total)
                 },
