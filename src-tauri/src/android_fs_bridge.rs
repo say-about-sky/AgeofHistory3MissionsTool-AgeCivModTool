@@ -15,6 +15,7 @@ use serde::Serialize;
 use tauri_plugin_android_fs::api::api_async::AndroidFs;
 use tauri_plugin_android_fs::{AndroidFsExt, FileAccessMode, FsUri};
 
+use crate::commands::workspace::{FileOpProgress, FileOpSink};
 use crate::models::{FocusIcon, ScannedEntry};
 
 type Api<'a, R> = &'a AndroidFs<R>;
@@ -421,6 +422,8 @@ pub async fn remove_file<R: tauri::Runtime>(
 }
 
 /// 删除工作区相对路径下的目录（`recursive` 为 true 时连同内容删除）。
+/// 递归删除按「后序」手工逐项删除（目录在内容清空后再删），并上报逐条目进度：
+/// 插件自带的 `removeDirAll` 无进度且大目录会长时间无反馈。
 pub async fn remove_dir<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     folder_id: &str,
@@ -430,12 +433,56 @@ pub async fn remove_dir<R: tauri::Runtime>(
     let api = app.android_fs_async();
     let root = root_uri(folder_id);
     let dir = resolve_dir(api, &root, path).await?;
-    let result = if recursive {
-        api.remove_dir_all(&dir).await
-    } else {
-        api.remove_dir(&dir).await
-    };
-    result.map_err(|error| describe(error, "删除目录失败"))
+    if !recursive {
+        return api
+            .remove_dir(&dir)
+            .await
+            .map_err(|error| describe(error, "删除目录失败"));
+    }
+
+    enum Task {
+        Enter(FsUri),
+        DeleteFile(FsUri),
+        DeleteDir(FsUri),
+    }
+    let progress = FileOpProgress::new(app.clone(), "delete");
+    progress.emit("正在删除文件...", 0, 0);
+    let mut completed = 0_u64;
+    let mut stack = vec![Task::Enter(dir)];
+    while let Some(task) = stack.pop() {
+        match task {
+            Task::Enter(directory) => {
+                // 先压入目录自身的删除（在内容之后执行），再逆序压入子项。
+                stack.push(Task::DeleteDir(directory.clone()));
+                let entries = api
+                    .read_dir(&directory)
+                    .await
+                    .map_err(|error| describe(error, "读取目录失败"))?;
+                for entry in entries.iter().rev() {
+                    if entry.is_dir() {
+                        stack.push(Task::Enter(entry.uri().clone()));
+                    } else {
+                        stack.push(Task::DeleteFile(entry.uri().clone()));
+                    }
+                }
+            }
+            Task::DeleteFile(uri) => {
+                api.remove_file(&uri)
+                    .await
+                    .map_err(|error| describe(error, "删除文件失败"))?;
+                completed += 1;
+                progress.emit("正在删除文件...", completed, 0);
+            }
+            Task::DeleteDir(uri) => {
+                api.remove_dir(&uri)
+                    .await
+                    .map_err(|error| describe(error, "删除目录失败"))?;
+                completed += 1;
+                progress.emit("正在删除文件...", completed, 0);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// 递归复制（文件或目录）到目标相对路径（可跨 folder_id）。
@@ -457,6 +504,9 @@ pub async fn copy_item<R: tauri::Runtime>(
     }
 
     // 迭代遍历（避免 async 递归）：队列元素为（源相对路径，目标相对路径）。
+    let progress = FileOpProgress::new(app.clone(), "copy");
+    progress.emit("正在复制文件...", 0, 0);
+    let mut completed = 0_u64;
     let mut queue: Vec<(String, String)> = vec![(from_rel, to_rel)];
     while let Some((from_rel, to_rel)) = queue.pop() {
         if let Ok(source) = api.resolve_file_uri(&from_root, &from_rel).await {
@@ -482,6 +532,8 @@ pub async fn copy_item<R: tauri::Runtime>(
             api.copy(&source, &target)
                 .await
                 .map_err(|error| describe(error, &format!("复制失败（{to_rel}）")))?;
+            completed += 1;
+            progress.emit("正在复制文件...", completed, 0);
             continue;
         }
 
@@ -489,6 +541,8 @@ pub async fn copy_item<R: tauri::Runtime>(
             .await
             .map_err(|_| format!("源不存在：{from_rel}"))?;
         ensure_dir(api, &to_root, &to_rel).await?;
+        completed += 1;
+        progress.emit("正在复制文件...", completed, 0);
         for entry in api
             .read_dir(&source_dir)
             .await
@@ -535,10 +589,8 @@ pub async fn move_item<R: tauri::Runtime>(
             .await
             .map_err(|error| describe(error, "删除源文件失败"))?;
     } else {
-        let dir = resolve_dir(api, &from_root, &from_rel).await?;
-        api.remove_dir_all(&dir)
-            .await
-            .map_err(|error| describe(error, "删除源目录失败"))?;
+        // 跨目录移动的收尾删除：复用带进度的递归删除。
+        remove_dir(app, from_folder_id, &from_rel, true).await?;
     }
     Ok(())
 }

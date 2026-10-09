@@ -76,6 +76,7 @@ pub fn run() {
             commands::missions::save_missions,
             commands::missions::load_missions_file,
             commands::missions::save_missions_file,
+            commands::missions::find_unused_event_scripts,
             commands::icons::load_mission_icons,
             commands::events::load_mission_event,
             commands::events::save_mission_event,

@@ -1,6 +1,8 @@
 //! APK/zip 打包：流式写入 zip32（Stored / Deflated）。
 //!
-//! - 压缩阶段使用 rayon 多线程、按批次（限制内存占用）并行压缩；
+//! - 收集阶段并行读取目录与元数据（每个条目仅一次 `symlink_metadata`，同时得到类型与大小）；
+//! - 压缩阶段使用 rayon 多线程、按批次（限制内存占用）并行压缩，
+//!   并与顺序写出流水线重叠（压缩后续批次的同时写出已完成的批次）；
 //! - `resources.arsc` 不压缩并对齐 4 字节；`lib/*.so` 不压缩并对齐 16 KiB
 //!   （通过本地头扩展字段填充实现，兼容 Android 10+ 与 16KB 页设备）；
 //! - 支持字节级进度回调（打包命令用于进度条）；
@@ -102,21 +104,16 @@ pub fn package_workspace(
     output: &Path,
     on_progress: PackProgress<'_>,
 ) -> Result<u64, String> {
-    // 1. 收集文件、排序（保证输出稳定），并统计元数据。
-    let mut relative_files = Vec::new();
-    collect_files(work_directory, "", &mut relative_files)?;
-    relative_files.sort();
+    // 1. 并行收集文件（单次 symlink_metadata 同时得到类型与大小），排序保证输出稳定。
+    let mut collected = collect_files_parallel(work_directory)?;
+    collected.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let mut planned: Vec<PlannedEntry> = Vec::with_capacity(relative_files.len());
+    let mut planned: Vec<PlannedEntry> = Vec::with_capacity(collected.len());
     let mut total_bytes = 0_u64;
-    for relative in relative_files {
+    for (relative, source, size) in collected {
         if should_skip_apk_entry(&relative) {
             continue;
         }
-        let source = work_directory.join(&relative);
-        let size = fs::metadata(&source)
-            .map_err(|error| format!("读取文件失败 {}：{error}", source.display()))?
-            .len();
         let (method, align) = classify_entry(&relative);
         total_bytes += size;
         planned.push(PlannedEntry {
@@ -140,32 +137,58 @@ pub fn package_workspace(
     let completed = AtomicU64::new(0);
     on_progress(0, total_bytes);
 
-    // 3. 分批并行压缩 → 顺序写入。
-    let mut batch: Vec<PlannedEntry> = Vec::new();
-    let mut batch_bytes = 0_u64;
-    for entry in planned {
-        if !batch.is_empty() && batch_bytes + entry.size > BATCH_BYTES {
-            flush_batch(
-                &mut batch,
-                &mut out,
-                &mut central,
-                &completed,
-                total_bytes,
-                on_progress,
-            )?;
-            batch_bytes = 0;
-        }
-        batch_bytes += entry.size;
-        batch.push(entry);
+    // 3. 分批并行压缩 → 顺序写入（流水线：rayon 工作线程压缩后续批次的同时，
+    //    当前线程顺序写出已完成批次，压缩与磁盘写入重叠）。
+    let batches = split_batches(planned);
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<
+        Result<(Vec<PlannedEntry>, Vec<CompressedEntry>), String>,
+    >(1);
+    let write_error: Option<String> = {
+        let out = &mut out;
+        let central = &mut central;
+        let completed = &completed;
+        // `rayon::scope` 闭包需 Send：以 move 捕获引用（receiver 不能被共享引用）。
+        rayon::scope(move |scope| {
+            scope.spawn(move |_| {
+                for batch in batches {
+                    let compressed: Result<Vec<CompressedEntry>, String> =
+                        batch.par_iter().map(compress_entry).collect();
+                    let message = compressed.map(|compressed| (batch, compressed));
+                    if sender.send(message).is_err() {
+                        // 消费者已退出（写出错）：停止压缩。
+                        break;
+                    }
+                }
+            });
+            let mut write_error: Option<String> = None;
+            while let Ok(message) = receiver.recv() {
+                if write_error.is_some() {
+                    // 写出已失败：继续排空通道，避免生产端阻塞在 send 上。
+                    continue;
+                }
+                match message {
+                    Ok((batch, compressed)) => {
+                        if let Err(error) = write_batch(
+                            out,
+                            central,
+                            &batch,
+                            &compressed,
+                            completed,
+                            total_bytes,
+                            on_progress,
+                        ) {
+                            write_error = Some(error);
+                        }
+                    }
+                    Err(error) => write_error = Some(error),
+                }
+            }
+            write_error
+        })
+    };
+    if let Some(error) = write_error {
+        return Err(error);
     }
-    flush_batch(
-        &mut batch,
-        &mut out,
-        &mut central,
-        &completed,
-        total_bytes,
-        on_progress,
-    )?;
 
     // 4. 中央目录与 EOCD。
     let cd_offset = out.pos;
@@ -190,31 +213,43 @@ pub fn package_workspace(
     Ok(total_entries)
 }
 
-/// 一个批次：批内 rayon 并行压缩，随后按原顺序写入输出流。
-fn flush_batch(
-    batch: &mut Vec<PlannedEntry>,
+/// 按 `BATCH_BYTES` 把计划条目切成批次（单条目超限时独占一批）。
+fn split_batches(planned: Vec<PlannedEntry>) -> Vec<Vec<PlannedEntry>> {
+    let mut batches: Vec<Vec<PlannedEntry>> = Vec::new();
+    let mut batch: Vec<PlannedEntry> = Vec::new();
+    let mut batch_bytes = 0_u64;
+    for entry in planned {
+        if !batch.is_empty() && batch_bytes + entry.size > BATCH_BYTES {
+            batches.push(std::mem::take(&mut batch));
+            batch_bytes = 0;
+        }
+        batch_bytes += entry.size;
+        batch.push(entry);
+    }
+    if !batch.is_empty() {
+        batches.push(batch);
+    }
+    batches
+}
+
+/// 顺序写出一个已压缩批次：本地头 + 数据 + 中央目录记录（含进度回调）。
+fn write_batch(
     out: &mut ZipOutput,
     central: &mut Vec<CentralRecord>,
+    batch: &[PlannedEntry],
+    compressed: &[CompressedEntry],
     completed: &AtomicU64,
     total_bytes: u64,
     on_progress: PackProgress<'_>,
 ) -> Result<(), String> {
-    if batch.is_empty() {
-        return Ok(());
-    }
-    let compressed: Vec<Result<CompressedEntry, String>> = batch
-        .par_iter()
-        .map(compress_entry)
-        .collect();
-    for (entry, result) in batch.iter().zip(compressed) {
-        let compressed = result?;
+    for (entry, compressed) in batch.iter().zip(compressed) {
         let flags = if entry.relative.is_ascii() {
             0
         } else {
             FLAG_UTF8
         };
         let lfh_offset = out.pos;
-        write_local_header(out, entry, &compressed, flags)?;
+        write_local_header(out, entry, compressed, flags)?;
         out.write_bytes(&compressed.compressed)?;
         central.push(CentralRecord {
             name: entry.relative.clone(),
@@ -228,7 +263,6 @@ fn flush_batch(
         let done = completed.fetch_add(entry.size, Ordering::Relaxed) + entry.size;
         on_progress(done.min(total_bytes), total_bytes);
     }
-    batch.clear();
     Ok(())
 }
 
@@ -341,38 +375,83 @@ fn classify_entry(relative: &str) -> (u16, u64) {
     }
 }
 
-/// 递归收集工作区内的文件（相对路径，`/` 分隔；符号链接等特殊类型跳过）。
-fn collect_files(root: &Path, relative: &str, files: &mut Vec<String>) -> Result<(), String> {
-    let directory = if relative.is_empty() {
-        root.to_path_buf()
-    } else {
-        root.join(relative)
-    };
-    let mut children: Vec<PathBuf> = fs::read_dir(&directory)
-        .map_err(|error| format!("读取目录失败 {}：{error}", directory.display()))?
-        .map(|entry| entry.map(|entry| entry.path()))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| error.to_string())?;
-    children.sort();
-    for child in children {
-        let name = child
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default()
-            .to_string();
-        let child_relative = if relative.is_empty() {
-            name
-        } else {
-            format!("{relative}/{name}")
-        };
-        let file_type = fs::symlink_metadata(&child)
-            .map_err(|error| error.to_string())?
-            .file_type();
-        if file_type.is_dir() {
-            collect_files(root, &child_relative, files)?;
-        } else if file_type.is_file() {
-            files.push(child_relative);
+/// 并行递归收集目录内文件：返回（相对路径（`/` 分隔）、绝对路径、文件大小）。
+/// 每个条目只做一次 `symlink_metadata`（同时得到类型与大小），
+/// 目录读取与元数据获取都会并行——安卓 FUSE 存储上大量小文件时明显更快。
+pub(crate) fn collect_files_parallel(
+    root: &Path,
+) -> Result<Vec<(String, PathBuf, u64)>, String> {
+    let mut files = Vec::new();
+    walk_directory_parallel(root.to_path_buf(), String::new(), &mut files)?;
+    Ok(files)
+}
+
+/// 单个目录：并行取元数据分类（目录下钻 / 文件收集 / 特殊类型跳过），
+/// 随后并行递归子目录（rayon 嵌套并行自动调度）。
+fn walk_directory_parallel(
+    directory: PathBuf,
+    relative: String,
+    files: &mut Vec<(String, PathBuf, u64)>,
+) -> Result<(), String> {
+    enum Item {
+        Directory(PathBuf, String),
+        File(String, PathBuf, u64),
+    }
+    let entries = fs::read_dir(&directory)
+        .map_err(|error| format!("读取目录失败 {}：{error}", directory.display()))?;
+    let children: Vec<(PathBuf, String)> = entries
+        .map(|entry| {
+            let entry = entry.map_err(|error| error.to_string())?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let child_relative = if relative.is_empty() {
+                name
+            } else {
+                format!("{relative}/{name}")
+            };
+            Ok((entry.path(), child_relative))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let items: Vec<Result<Option<Item>, String>> = children
+        .into_par_iter()
+        .map(|(path, child_relative)| {
+            let metadata = fs::symlink_metadata(&path)
+                .map_err(|error| format!("读取文件失败 {}：{error}", path.display()))?;
+            let file_type = metadata.file_type();
+            if file_type.is_dir() {
+                return Ok(Some(Item::Directory(path, child_relative)));
+            }
+            if file_type.is_file() {
+                return Ok(Some(Item::File(
+                    child_relative,
+                    path,
+                    metadata.len(),
+                )));
+            }
+            Ok(None) // 符号链接等特殊类型跳过。
+        })
+        .collect();
+    let mut subdirectories: Vec<(PathBuf, String)> = Vec::new();
+    for item in items {
+        match item? {
+            Some(Item::Directory(path, child_relative)) => {
+                subdirectories.push((path, child_relative));
+            }
+            Some(Item::File(child_relative, path, size)) => {
+                files.push((child_relative, path, size));
+            }
+            None => {}
         }
+    }
+    let collected: Vec<Result<Vec<(String, PathBuf, u64)>, String>> = subdirectories
+        .into_par_iter()
+        .map(|(path, child_relative)| {
+            let mut local = Vec::new();
+            walk_directory_parallel(path, child_relative, &mut local)?;
+            Ok(local)
+        })
+        .collect();
+    for local in collected {
+        files.extend(local?);
     }
     Ok(())
 }

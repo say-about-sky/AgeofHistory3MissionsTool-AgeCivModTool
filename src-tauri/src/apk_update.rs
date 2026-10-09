@@ -9,7 +9,8 @@
 //! 位置之后，随后重建中央目录与 EOCD 并截断文件。好处：
 //! - 未改动条目（含 `lib/*.so` 等对齐敏感项）的偏移完全不变，天然保持 zipalign；
 //! - 磁盘写入量 ≈ 版块数据量（几百 KB~几 MB），与 APK 总体积无关；
-//! - 全部新数据先在内存中构建完成，之后才动目标文件，尽量避免中途失败损坏原文件。
+//! - 全部新数据先并行构建（rayon 多线程读取 + 压缩）完成，之后才顺序组装并写目标文件，
+//!   尽量避免中途失败损坏原文件；写出走 1MB 缓冲成批写。
 //!
 //! # 语义
 //! - 工作区存在的文件 → 替换 APK 中同名条目（记录保留原时间/日期）；
@@ -21,11 +22,13 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use flate2::write::DeflateEncoder;
 use flate2::Compression;
+use rayon::prelude::*;
 
 use crate::apk_extract::ExtractProgress;
 
@@ -90,10 +93,18 @@ pub struct SectionUpdateOutcome {
     pub kept: u64,
 }
 
-/// 构建完成的单个新条目：数据块（本地头 + 压缩数据）与中央目录记录。
+/// 构建完成的单个新条目：本地头、压缩数据与中央目录记录（分开存放，写出时避免再拷贝）。
 struct BuiltEntry {
-    blob: Vec<u8>,
+    header: Vec<u8>,
+    data: Vec<u8>,
     record: Vec<u8>,
+}
+
+impl BuiltEntry {
+    /// 写入后的字节数（本地头 + 数据）。
+    fn byte_len(&self) -> u64 {
+        (self.header.len() + self.data.len()) as u64
+    }
 }
 
 /// 以更新替换方式把 `source_root` 中的版块文件写回 `apk`（需同时具备读写权限）。
@@ -103,7 +114,7 @@ pub fn update_apk_sections(
     prefixes: &[&str],
     on_progress: ExtractProgress<'_>,
 ) -> Result<SectionUpdateOutcome, String> {
-    let (source_files, missing_dirs) = collect_section_files(source_root, prefixes);
+    let (source_files, missing_dirs) = collect_section_files(source_root, prefixes)?;
     if source_files.is_empty() && missing_dirs == prefixes.len() as u64 {
         return Err(
             "工作区中未找到国策版块（assets/game/missions、assets/map/*/scenarios/*）\
@@ -145,31 +156,41 @@ pub fn update_apk_sections(
     let total_work = (replaced_names.len() + added_names.len()) as u64;
     on_progress(0, total_work);
 
-    // 1) 先在内存中构建全部新条目（压缩是耗时步骤；此阶段不写目标文件）。
-    let mut built: HashMap<String, BuiltEntry> = HashMap::new();
+    // 1) 并行读取 + 压缩全部新条目（压缩是耗时步骤；此阶段不写目标文件）。
+    let names_in_order: Vec<String> = replaced_names
+        .iter()
+        .chain(added_names.iter())
+        .cloned()
+        .collect();
+    let completed = AtomicU64::new(0);
+    let compressed: Vec<Result<CompressedData, String>> = names_in_order
+        .par_iter()
+        .map(|name| {
+            let result = compress_source(&source_map[name.as_str()], name);
+            let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+            on_progress(done, total_work);
+            result
+        })
+        .collect();
+
+    // 2) 顺序计算偏移并组装（仅构建头部/记录与引用数据，很轻量）。
+    let mut built: HashMap<String, BuiltEntry> = HashMap::with_capacity(names_in_order.len());
     let mut cursor = central.cd_start; // 模拟写入偏移（用于本地头偏移字段）
-    let mut done = 0_u64;
-    for name in replaced_names.iter().chain(added_names.iter()) {
+    for (name, result) in names_in_order.iter().zip(compressed) {
+        let compressed = result?;
         let (time, date) = if existing.contains(name.as_str()) {
             original_time_date(&central, name)
         } else {
             (DOS_TIME, DOS_DATE)
         };
-        let entry = build_entry(&source_map[name], name, cursor, time, date)?;
-        cursor += entry.blob.len() as u64;
+        let entry = assemble_entry(compressed, name, cursor, time, date)?;
+        cursor += entry.byte_len();
         built.insert(name.clone(), entry);
-        done += 1;
-        on_progress(done, total_work);
     }
 
-    // 2) 写入：新数据追加在原中央目录起点处，随后重建中央目录与 EOCD，最后截断。
+    // 3) 写入：新数据追加在原中央目录起点处，随后重建中央目录与 EOCD，最后截断。
     apk.seek(SeekFrom::Start(central.cd_start))
         .map_err(|error| format!("定位 APK 写入位置失败：{error}"))?;
-    for name in replaced_names.iter().chain(added_names.iter()) {
-        apk.write_all(&built[name].blob)
-            .map_err(|error| format!("写入 APK 失败：{error}"))?;
-    }
-
     let cd_offset = cursor;
     let mut cd_size = 0_u64;
     for entry in &central.entries {
@@ -177,32 +198,57 @@ pub fn update_apk_sections(
             Some(built_entry) => built_entry.record.as_slice(),
             None => entry.raw.as_slice(),
         };
-        apk.write_all(bytes)
-            .map_err(|error| format!("写入中央目录失败：{error}"))?;
         cd_size += bytes.len() as u64;
     }
     for name in &added_names {
-        let bytes = built[name].record.as_slice();
-        apk.write_all(bytes)
-            .map_err(|error| format!("写入中央目录失败：{error}"))?;
-        cd_size += bytes.len() as u64;
+        cd_size += built[name].record.len() as u64;
     }
-
     let end = cd_offset + cd_size + 22;
     if cd_offset > ZIP32_LIMIT || cd_size > ZIP32_LIMIT || end > ZIP32_LIMIT {
         return Err("更新后文件超出 zip32 限制（4GB）".to_string());
     }
-    let mut eocd = Vec::with_capacity(22);
-    eocd.extend_from_slice(&EOCD_SIG.to_le_bytes());
-    eocd.extend_from_slice(&0u16.to_le_bytes()); // 磁盘号
-    eocd.extend_from_slice(&0u16.to_le_bytes()); // 中央目录起始磁盘
-    eocd.extend_from_slice(&(total_entries as u16).to_le_bytes());
-    eocd.extend_from_slice(&(total_entries as u16).to_le_bytes());
-    eocd.extend_from_slice(&(cd_size as u32).to_le_bytes());
-    eocd.extend_from_slice(&(cd_offset as u32).to_le_bytes());
-    eocd.extend_from_slice(&0u16.to_le_bytes()); // 注释长度
-    apk.write_all(&eocd)
-        .map_err(|error| format!("写入目录结尾失败：{error}"))?;
+    {
+        // 缓冲写出：中央目录可能有数万条小记录，成批写减少系统调用。
+        let mut writer = BufWriter::with_capacity(1024 * 1024, &mut *apk);
+        for name in replaced_names.iter().chain(added_names.iter()) {
+            let built_entry = &built[name];
+            writer
+                .write_all(&built_entry.header)
+                .map_err(|error| format!("写入 APK 失败：{error}"))?;
+            writer
+                .write_all(&built_entry.data)
+                .map_err(|error| format!("写入 APK 失败：{error}"))?;
+        }
+        for entry in &central.entries {
+            let bytes = match built.get(&entry.name) {
+                Some(built_entry) => built_entry.record.as_slice(),
+                None => entry.raw.as_slice(),
+            };
+            writer
+                .write_all(bytes)
+                .map_err(|error| format!("写入中央目录失败：{error}"))?;
+        }
+        for name in &added_names {
+            writer
+                .write_all(&built[name].record)
+                .map_err(|error| format!("写入中央目录失败：{error}"))?;
+        }
+        let mut eocd = Vec::with_capacity(22);
+        eocd.extend_from_slice(&EOCD_SIG.to_le_bytes());
+        eocd.extend_from_slice(&0u16.to_le_bytes()); // 磁盘号
+        eocd.extend_from_slice(&0u16.to_le_bytes()); // 中央目录起始磁盘
+        eocd.extend_from_slice(&(total_entries as u16).to_le_bytes());
+        eocd.extend_from_slice(&(total_entries as u16).to_le_bytes());
+        eocd.extend_from_slice(&(cd_size as u32).to_le_bytes());
+        eocd.extend_from_slice(&(cd_offset as u32).to_le_bytes());
+        eocd.extend_from_slice(&0u16.to_le_bytes()); // 注释长度
+        writer
+            .write_all(&eocd)
+            .map_err(|error| format!("写入目录结尾失败：{error}"))?;
+        writer
+            .flush()
+            .map_err(|error| format!("写入 APK 失败：{error}"))?;
+    }
     apk.set_len(end)
         .map_err(|error| format!("截断 APK 失败：{error}"))?;
 
@@ -219,7 +265,11 @@ pub fn update_apk_sections(
 }
 
 /// 收集版块内的全部文件：返回（完整相对路径（`/` 分隔），绝对路径）与缺失的版块目录数。
-fn collect_section_files(root: &Path, prefixes: &[&str]) -> (Vec<(String, PathBuf)>, u64) {
+/// 目录遍历与元数据获取走并行收集（`apk_pack::collect_files_parallel`）。
+fn collect_section_files(
+    root: &Path,
+    prefixes: &[&str],
+) -> Result<(Vec<(String, PathBuf)>, u64), String> {
     let mut files = Vec::new();
     let mut missing = 0_u64;
     for prefix in prefixes {
@@ -228,35 +278,11 @@ fn collect_section_files(root: &Path, prefixes: &[&str]) -> (Vec<(String, PathBu
             missing += 1;
             continue;
         }
-        walk_files(&dir, &mut |relative, path| {
-            files.push((format!("{prefix}{relative}"), path.to_path_buf()));
-        });
-    }
-    (files, missing)
-}
-
-/// 迭代递归收集目录内文件（相对路径用 `/` 分隔）。
-fn walk_files(dir: &Path, collect: &mut impl FnMut(&str, &Path)) {
-    let mut stack: Vec<(PathBuf, String)> = vec![(dir.to_path_buf(), String::new())];
-    while let Some((current, relative)) = stack.pop() {
-        let Ok(entries) = fs::read_dir(&current) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let child_relative = if relative.is_empty() {
-                name
-            } else {
-                format!("{relative}/{name}")
-            };
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push((path, child_relative));
-            } else if path.is_file() {
-                collect(&child_relative, &path);
-            }
+        for (relative, path, _size) in crate::apk_pack::collect_files_parallel(&dir)? {
+            files.push((format!("{prefix}{relative}"), path));
         }
     }
+    Ok((files, missing))
 }
 
 /// 从原始中央目录记录中取（时间, 日期）字段；找不到时回退固定时间戳。
@@ -269,17 +295,16 @@ fn original_time_date(central: &crate::apk_extract::RawCentralDirectory, name: &
     (time, date)
 }
 
-/// 压缩并构建单个新条目（本地头 + 数据、中央目录记录）。
-fn build_entry(
-    source: &Path,
-    name: &str,
-    lfh_offset: u64,
-    time: u16,
-    date: u16,
-) -> Result<BuiltEntry, String> {
-    if lfh_offset > ZIP32_LIMIT {
-        return Err("更新后偏移超出 zip32 限制（4GB）".to_string());
-    }
+/// 并行压缩阶段的产物：压缩方式 / CRC / 原始大小 / 数据（与偏移无关）。
+struct CompressedData {
+    method: u16,
+    crc: u32,
+    uncompressed_size: u64,
+    data: Vec<u8>,
+}
+
+/// 读取并压缩单个文件（在并行 map 中调用）；自动在 Deflated / Stored 中取更小者。
+fn compress_source(source: &Path, name: &str) -> Result<CompressedData, String> {
     let mut raw = Vec::new();
     File::open(source)
         .and_then(|mut file| file.read_to_end(&mut raw))
@@ -301,24 +326,47 @@ fn build_entry(
     if data.len() as u64 > ZIP32_LIMIT || uncompressed_size > ZIP32_LIMIT {
         return Err(format!("文件过大，超出 zip32 限制：{name}"));
     }
+    Ok(CompressedData {
+        method,
+        crc,
+        uncompressed_size,
+        data,
+    })
+}
 
+/// 顺序组装单个新条目：本地头（含偏移）+ 中央目录记录（数据直接引用，避免再拷贝）。
+fn assemble_entry(
+    compressed: CompressedData,
+    name: &str,
+    lfh_offset: u64,
+    time: u16,
+    date: u16,
+) -> Result<BuiltEntry, String> {
+    if lfh_offset > ZIP32_LIMIT {
+        return Err("更新后偏移超出 zip32 限制（4GB）".to_string());
+    }
+    let CompressedData {
+        method,
+        crc,
+        uncompressed_size,
+        data,
+    } = compressed;
     let name_bytes = name.as_bytes();
     let flags = if name.is_ascii() { 0 } else { FLAG_UTF8 };
 
-    let mut blob = Vec::with_capacity(30 + name_bytes.len() + data.len());
-    blob.extend_from_slice(&LFH_SIG.to_le_bytes());
-    blob.extend_from_slice(&VERSION_NEEDED.to_le_bytes());
-    blob.extend_from_slice(&flags.to_le_bytes());
-    blob.extend_from_slice(&method.to_le_bytes());
-    blob.extend_from_slice(&time.to_le_bytes());
-    blob.extend_from_slice(&date.to_le_bytes());
-    blob.extend_from_slice(&crc.to_le_bytes());
-    blob.extend_from_slice(&(data.len() as u32).to_le_bytes());
-    blob.extend_from_slice(&(uncompressed_size as u32).to_le_bytes());
-    blob.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
-    blob.extend_from_slice(&0u16.to_le_bytes()); // 扩展字段长度
-    blob.extend_from_slice(name_bytes);
-    blob.extend_from_slice(&data);
+    let mut header = Vec::with_capacity(30 + name_bytes.len());
+    header.extend_from_slice(&LFH_SIG.to_le_bytes());
+    header.extend_from_slice(&VERSION_NEEDED.to_le_bytes());
+    header.extend_from_slice(&flags.to_le_bytes());
+    header.extend_from_slice(&method.to_le_bytes());
+    header.extend_from_slice(&time.to_le_bytes());
+    header.extend_from_slice(&date.to_le_bytes());
+    header.extend_from_slice(&crc.to_le_bytes());
+    header.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    header.extend_from_slice(&(uncompressed_size as u32).to_le_bytes());
+    header.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+    header.extend_from_slice(&0u16.to_le_bytes()); // 扩展字段长度
+    header.extend_from_slice(name_bytes);
 
     let mut record = Vec::with_capacity(46 + name_bytes.len());
     record.extend_from_slice(&CDFH_SIG.to_le_bytes());
@@ -340,7 +388,11 @@ fn build_entry(
     record.extend_from_slice(&(lfh_offset as u32).to_le_bytes());
     record.extend_from_slice(name_bytes);
 
-    Ok(BuiltEntry { blob, record })
+    Ok(BuiltEntry {
+        header,
+        data,
+        record,
+    })
 }
 
 #[cfg(test)]
@@ -491,6 +543,42 @@ mod tests {
                 "assets/map/Earth3/scenarios/TheGreatWar/".to_string(),
             ]
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 实测「导出到 APK」速度（忽略）：复制真实 APK 后执行更新（不改原文件）。
+    /// `cargo test --release -p age_civ_mod_tool --lib benchmark_update_real_apk -- --ignored --nocapture`
+    #[test]
+    #[ignore = "需要真实数据 A:\\android\\GameCivs\\暮色黄昏_世界大战0.25.1(.apk)"]
+    fn benchmark_update_real_apk() {
+        let apk_source = Path::new(r"A:\android\GameCivs\暮色黄昏_世界大战0.25.1.apk");
+        let workspace = Path::new(r"A:\android\GameCivs\暮色黄昏_世界大战0.25.1");
+        if !apk_source.is_file() || !workspace.is_dir() {
+            println!("未找到真实 APK / 工作区，跳过");
+            return;
+        }
+        let dir = temp_dir("bench-update");
+        let apk = dir.join("bench.apk");
+        let started = std::time::Instant::now();
+        fs::copy(apk_source, &apk).unwrap();
+        println!("BENCH copy: {:?}", started.elapsed());
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&apk)
+            .unwrap();
+        let prefixes = discover_workspace_section_prefixes(workspace);
+        let refs: Vec<&str> = prefixes.iter().map(String::as_str).collect();
+        let started = std::time::Instant::now();
+        let outcome = update_apk_sections(&mut file, workspace, &refs, &|_, _| {}).unwrap();
+        println!(
+            "BENCH update: replaced={} added={} kept={} in {:?}",
+            outcome.replaced,
+            outcome.added,
+            outcome.kept,
+            started.elapsed()
+        );
+        drop(file);
         let _ = fs::remove_dir_all(&dir);
     }
 }

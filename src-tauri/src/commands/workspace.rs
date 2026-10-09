@@ -1,9 +1,16 @@
 //! 工作区文件管理命令：列举、复制、移动、删除与在文件管理器中定位。
+//!
+//! 复制/移动/删除大目录可能耗时数秒到数分钟：命令统一为 async 并在
+//! `spawn_blocking` 中执行（同步命令会阻塞主线程导致界面卡死），同时通过
+//! `file-op-progress` 事件上报逐条目进度，前端在浮动进度卡中展示。
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
+use tauri::Emitter;
 
 use crate::paths::workspace_abs_path;
 
@@ -17,7 +24,8 @@ pub struct WorkspaceFile {
 }
 
 /// 递归列举工作目录下的全部文件/文件夹（相对路径统一用 `/` 分隔）。
-#[tauri::command]
+/// 大工作区（数万文件）的目录扫描同样在后台线程执行，避免卡住界面。
+#[tauri::command(async)]
 pub fn list_workspace_files(work_directory: String) -> Result<Vec<WorkspaceFile>, String> {
     let root = PathBuf::from(work_directory);
     if !root.is_dir() {
@@ -81,9 +89,120 @@ fn append_workspace_entries(
     Ok(())
 }
 
-/// 递归复制目录及其内容。
-fn copy_dir_recursive(from: &Path, to: &Path) -> Result<(), String> {
-    fs::create_dir_all(to).map_err(|error| error.to_string())?;
+/// 文件操作进度事件（前端监听 `file-op-progress`）：单位为「文件/目录条目数」，
+/// `total = 0` 表示总量未知（SAF 模式不做预统计），前端改用不确定进度条。
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FileOpProgressEvent {
+    kind: &'static str,
+    stage: &'static str,
+    completed: u64,
+    total: u64,
+}
+
+/// 进度接收端：复制/删除遍历过程中把进度报告给调用方。
+/// 生产环境由 `FileOpProgress` 转成 Tauri 事件；测试中用记录型实现断言统计口径。
+pub(crate) trait FileOpSink {
+    fn emit(&self, stage: &'static str, completed: u64, total: u64);
+}
+
+/// 文件操作进度发送器：按时间节流（约 80ms 一条），避免事件洪水拖慢前端。
+pub(crate) struct FileOpProgress<R: tauri::Runtime> {
+    app: tauri::AppHandle<R>,
+    kind: &'static str,
+    last: Mutex<Instant>,
+}
+
+impl<R: tauri::Runtime> FileOpProgress<R> {
+    pub(crate) fn new(app: tauri::AppHandle<R>, kind: &'static str) -> Self {
+        Self {
+            app,
+            kind,
+            last: Mutex::new(Instant::now() - Duration::from_millis(200)),
+        }
+    }
+}
+
+impl<R: tauri::Runtime> FileOpSink for FileOpProgress<R> {
+    fn emit(&self, stage: &'static str, completed: u64, total: u64) {
+        {
+            let mut last = self.last.lock().unwrap();
+            // total = 0 表示未知总量（SAF 模式）：只按时间节流。
+            let due = (total > 0 && completed >= total)
+                || last.elapsed() >= Duration::from_millis(80);
+            if !due {
+                return;
+            }
+            *last = Instant::now();
+        }
+        let _ = self.app.emit(
+            "file-op-progress",
+            FileOpProgressEvent {
+                kind: self.kind,
+                stage,
+                completed,
+                total,
+            },
+        );
+    }
+}
+
+/// 统计目录树内的全部子条目数（文件+目录；符号链接按文件计入、不跟随）。
+pub(crate) fn count_entries(path: &Path) -> u64 {
+    let mut total = 0_u64;
+    let mut pending = vec![path.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            total += 1;
+            let Ok(metadata) = fs::symlink_metadata(entry.path()) else {
+                continue;
+            };
+            if metadata.file_type().is_dir() {
+                pending.push(entry.path());
+            }
+        }
+    }
+    total
+}
+
+/// 递归复制（带进度）：`from` 为文件或目录，目标必须不存在。
+pub(crate) fn copy_path(sink: &dyn FileOpSink, from: &Path, to: &Path) -> Result<(), String> {
+    if !from.exists() {
+        return Err(format!("源不存在：{}", from.display()));
+    }
+    if to.exists() {
+        return Err(format!("目标已存在：{}", to.display()));
+    }
+    if let Some(parent) = to.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    if from.is_dir() {
+        // 先统计总量再复制，进度条为确定型（大目录统计只是一次廉价遍历）。
+        let total = count_entries(from);
+        sink.emit("正在复制文件...", 0, total);
+        fs::create_dir_all(to).map_err(|error| error.to_string())?;
+        let mut completed = 0_u64;
+        copy_dir_contents(sink, from, to, &mut completed, total)?;
+        sink.emit("正在复制文件...", completed, total);
+        Ok(())
+    } else {
+        sink.emit("正在复制文件...", 0, 1);
+        fs::copy(from, to).map_err(|error| format!("复制失败 {}：{error}", from.display()))?;
+        sink.emit("正在复制文件...", 1, 1);
+        Ok(())
+    }
+}
+
+fn copy_dir_contents(
+    sink: &dyn FileOpSink,
+    from: &Path,
+    to: &Path,
+    completed: &mut u64,
+    total: u64,
+) -> Result<(), String> {
     let children = fs::read_dir(from)
         .map_err(|error| error.to_string())?
         .map(|entry| entry.map(|entry| entry.path()))
@@ -95,72 +214,155 @@ fn copy_dir_recursive(from: &Path, to: &Path) -> Result<(), String> {
             .ok_or_else(|| format!("无效路径：{}", path.display()))?;
         let target = to.join(name);
         if path.is_dir() {
-            copy_dir_recursive(&path, &target)?;
+            fs::create_dir_all(&target).map_err(|error| error.to_string())?;
+            *completed += 1;
+            sink.emit("正在复制文件...", *completed, total);
+            copy_dir_contents(sink, &path, &target, completed, total)?;
         } else {
             fs::copy(&path, &target)
                 .map_err(|error| format!("复制失败 {}：{error}", path.display()))?;
+            *completed += 1;
+            sink.emit("正在复制文件...", *completed, total);
         }
     }
     Ok(())
 }
 
-/// 复制工作区内的文件/文件夹到新位置（目标已存在时报错）。
-#[tauri::command]
-pub fn copy_workspace_item(
-    work_directory: String,
-    source: String,
-    target: String,
+/// 删除文件（Windows 只读文件先清除只读属性再重试）。
+fn remove_file_robust(path: &Path) -> std::io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(first) => {
+            if let Ok(metadata) = fs::metadata(path) {
+                let mut permissions = metadata.permissions();
+                if permissions.readonly() {
+                    #[allow(clippy::permissions_set_readonly_false)]
+                    permissions.set_readonly(false);
+                    let _ = fs::set_permissions(path, permissions);
+                    return fs::remove_file(path);
+                }
+            }
+            Err(first)
+        }
+    }
+}
+
+/// 递归删除（带进度）：`path` 为文件或目录。
+pub(crate) fn delete_path(sink: &dyn FileOpSink, path: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("目标不存在：{}（{error}）", path.display()))?;
+    if metadata.file_type().is_dir() {
+        let total = count_entries(path);
+        sink.emit("正在删除文件...", 0, total);
+        let mut completed = 0_u64;
+        remove_dir_contents(sink, path, &mut completed, total)?;
+        fs::remove_dir(path).map_err(|error| error.to_string())?;
+        sink.emit("正在删除文件...", completed, total);
+        Ok(())
+    } else {
+        sink.emit("正在删除文件...", 0, 1);
+        remove_file_robust(path).map_err(|error| error.to_string())?;
+        sink.emit("正在删除文件...", 1, 1);
+        Ok(())
+    }
+}
+
+fn remove_dir_contents(
+    sink: &dyn FileOpSink,
+    directory: &Path,
+    completed: &mut u64,
+    total: u64,
 ) -> Result<(), String> {
-    let from = workspace_abs_path(&work_directory, &source)?;
-    let to = workspace_abs_path(&work_directory, &target)?;
+    let children = fs::read_dir(directory)
+        .map_err(|error| error.to_string())?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    for path in children {
+        let metadata = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+        if metadata.file_type().is_dir() {
+            // 目录最后删除：先清空内容再删目录本身。
+            remove_dir_contents(sink, &path, completed, total)?;
+            fs::remove_dir(&path).map_err(|error| error.to_string())?;
+        } else {
+            remove_file_robust(&path).map_err(|error| error.to_string())?;
+        }
+        *completed += 1;
+        sink.emit("正在删除文件...", *completed, total);
+    }
+    Ok(())
+}
+
+/// 移动（带进度）：优先单次 `rename`（同卷瞬时完成）；失败（跨卷等）退回「复制 + 删除」。
+/// 目标已存在时报错（大小写改名视为同一目标放行）。
+pub(crate) fn move_path(sink: &dyn FileOpSink, from: &Path, to: &Path) -> Result<(), String> {
     if !from.exists() {
         return Err(format!("源不存在：{}", from.display()));
     }
     if to.exists() {
-        return Err(format!("目标已存在：{}", to.display()));
+        let same_file = from
+            .canonicalize()
+            .ok()
+            .is_some_and(|source| to.canonicalize().ok() == Some(source));
+        if !same_file {
+            return Err(format!("目标已存在：{}", to.display()));
+        }
     }
     if let Some(parent) = to.parent() {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
-    if from.is_dir() {
-        copy_dir_recursive(&from, &to)
-    } else {
-        fs::copy(&from, &to)
-            .map(|_| ())
-            .map_err(|error| format!("复制失败 {}：{error}", from.display()))
+    if fs::rename(from, to).is_ok() {
+        // 重命名瞬时完成：无需进度事件，命令返回即结束。
+        return Ok(());
     }
+    copy_path(sink, from, to)?;
+    delete_path(sink, from)
 }
 
-/// 移动工作区内的文件/文件夹到新位置。
+/// 复制工作区内的文件/文件夹到新位置（目标已存在时报错；后台线程执行并上报进度）。
 #[tauri::command]
-pub fn move_workspace_item(
+pub async fn copy_workspace_item<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     work_directory: String,
     source: String,
     target: String,
 ) -> Result<(), String> {
     let from = workspace_abs_path(&work_directory, &source)?;
     let to = workspace_abs_path(&work_directory, &target)?;
-    if !from.exists() {
-        return Err(format!("源不存在：{}", from.display()));
-    }
-    if let Some(parent) = to.parent() {
-        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    }
-    fs::rename(&from, &to).map_err(|error| format!("移动失败 {}：{error}", from.display()))
+    let progress = FileOpProgress::new(app, "copy");
+    tauri::async_runtime::spawn_blocking(move || copy_path(&progress, &from, &to))
+        .await
+        .map_err(|error| format!("复制任务失败：{error}"))?
 }
 
-/// 删除工作区内的文件/文件夹（文件夹递归删除）。
+/// 移动工作区内的文件/文件夹到新位置（后台线程执行并上报进度）。
 #[tauri::command]
-pub fn delete_workspace_item(work_directory: String, target: String) -> Result<(), String> {
+pub async fn move_workspace_item<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    work_directory: String,
+    source: String,
+    target: String,
+) -> Result<(), String> {
+    let from = workspace_abs_path(&work_directory, &source)?;
+    let to = workspace_abs_path(&work_directory, &target)?;
+    let progress = FileOpProgress::new(app, "move");
+    tauri::async_runtime::spawn_blocking(move || move_path(&progress, &from, &to))
+        .await
+        .map_err(|error| format!("移动任务失败：{error}"))?
+}
+
+/// 删除工作区内的文件/文件夹（文件夹递归删除；后台线程执行并上报进度）。
+#[tauri::command]
+pub async fn delete_workspace_item<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    work_directory: String,
+    target: String,
+) -> Result<(), String> {
     let path = workspace_abs_path(&work_directory, &target)?;
-    if !path.exists() {
-        return Err(format!("目标不存在：{}", path.display()));
-    }
-    if path.is_dir() {
-        fs::remove_dir_all(&path).map_err(|error| error.to_string())
-    } else {
-        fs::remove_file(&path).map_err(|error| error.to_string())
-    }
+    let progress = FileOpProgress::new(app, "delete");
+    tauri::async_runtime::spawn_blocking(move || delete_path(&progress, &path))
+        .await
+        .map_err(|error| format!("删除任务失败：{error}"))?
 }
 
 /// 打开文件位置：桌面端在系统文件管理器中选中条目（Windows 经 SHOpenFolderAndSelectItems，
@@ -252,6 +454,78 @@ mod tests {
                 "Apple.json",
             ]
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 记录进度事件（不含节流），验证统计口径闭合。
+    #[derive(Default)]
+    struct RecordingSink {
+        events: Mutex<Vec<(u64, u64)>>,
+    }
+
+    impl FileOpSink for RecordingSink {
+        fn emit(&self, _stage: &'static str, completed: u64, total: u64) {
+            self.events.lock().unwrap().push((completed, total));
+        }
+    }
+
+    impl RecordingSink {
+        fn last(&self) -> (u64, u64) {
+            *self.events.lock().unwrap().last().unwrap()
+        }
+    }
+
+    /// 复制与删除的进度总量口径一致：结尾事件都是「(总量, 总量)」，
+    /// 且删除完成后目录彻底清空、复制内容逐字节一致。
+    #[test]
+    fn copy_and_delete_report_matching_totals() {
+        let dir = temp_dir("progress");
+        let source = dir.join("source");
+        fs::create_dir_all(source.join("nested/deeper")).unwrap();
+        fs::write(source.join("a.txt"), "alpha").unwrap();
+        fs::write(source.join("nested/b.txt"), "beta").unwrap();
+        fs::write(source.join("nested/deeper/c.txt"), "gamma").unwrap();
+        // 条目数：nested、nested/b.txt、nested/deeper、nested/deeper/c.txt、a.txt = 5。
+        assert_eq!(count_entries(&source), 5);
+
+        let target = dir.join("target");
+        let sink = RecordingSink::default();
+        copy_path(&sink, &source, &target).unwrap();
+        assert_eq!(sink.last(), (5, 5));
+        assert_eq!(fs::read_to_string(target.join("nested/deeper/c.txt")).unwrap(), "gamma");
+
+        // 目标已存在：报错而不是静默覆盖。
+        assert!(copy_path(&sink, &source, &target).is_err());
+
+        let delete_sink = RecordingSink::default();
+        delete_path(&delete_sink, &target).unwrap();
+        assert_eq!(delete_sink.last(), (5, 5));
+        assert!(!target.exists());
+
+        // 文件级：单个文件一次事件。
+        let single_sink = RecordingSink::default();
+        delete_path(&single_sink, &source.join("a.txt")).unwrap();
+        assert_eq!(single_sink.last(), (1, 1));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 移动的「快速路径」：同卷改名瞬时完成且不产生进度事件；
+    /// 目标已存在（且非大小写改名）时报错。
+    #[test]
+    fn move_renames_in_place_and_rejects_existing_target() {
+        let dir = temp_dir("move");
+        fs::write(dir.join("from.txt"), "x").unwrap();
+        fs::write(dir.join("other.txt"), "y").unwrap();
+
+        let sink = RecordingSink::default();
+        assert!(move_path(&sink, &dir.join("from.txt"), &dir.join("other.txt")).is_err());
+
+        move_path(&sink, &dir.join("from.txt"), &dir.join("to.txt")).unwrap();
+        assert!(dir.join("to.txt").exists());
+        assert!(!dir.join("from.txt").exists());
+        assert!(sink.events.lock().unwrap().is_empty());
+
         let _ = fs::remove_dir_all(&dir);
     }
 }

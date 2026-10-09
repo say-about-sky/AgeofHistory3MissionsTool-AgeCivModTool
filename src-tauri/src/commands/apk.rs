@@ -39,14 +39,15 @@ struct ApkProgressEvent {
 }
 
 /// 进度事件发送器：按时间节流（约 80ms 一条），避免事件洪水拖慢前端。
-struct ProgressEmitter<R: tauri::Runtime> {
+/// `pub(crate)`：供其他命令复用（如 missions 的未使用脚本扫描）。
+pub(crate) struct ProgressEmitter<R: tauri::Runtime> {
     app: tauri::AppHandle<R>,
     kind: &'static str,
     last: Mutex<Instant>,
 }
 
 impl<R: tauri::Runtime> ProgressEmitter<R> {
-    fn new(app: tauri::AppHandle<R>, kind: &'static str) -> Self {
+    pub(crate) fn new(app: tauri::AppHandle<R>, kind: &'static str) -> Self {
         Self {
             app,
             kind,
@@ -54,7 +55,7 @@ impl<R: tauri::Runtime> ProgressEmitter<R> {
         }
     }
 
-    fn emit(&self, stage: &'static str, unit: &'static str, completed: u64, total: u64) {
+    pub(crate) fn emit(&self, stage: &'static str, unit: &'static str, completed: u64, total: u64) {
         {
             let mut last = self.last.lock().unwrap();
             let due = completed >= total || last.elapsed() >= Duration::from_millis(80);
@@ -850,6 +851,33 @@ mod tests {
         fs::write(&bom_path, b"\xEF\xBB\xBFPEM".to_vec()).unwrap();
         assert_eq!(read_pem_text(&bom_path).unwrap(), "PEM");
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 实测打包速度（忽略）：对已解包的真实模组目录执行 APK 打包并计时。
+    /// `cargo test --release -p age_civ_mod_tool --lib benchmark_pack_real_workspace -- --ignored --nocapture`
+    #[test]
+    #[ignore = "需要真实工作区 A:\\android\\GameCivs\\暮色黄昏_世界大战0.25.1"]
+    fn benchmark_pack_real_workspace() {
+        let workspace = PathBuf::from(r"A:\android\GameCivs\暮色黄昏_世界大战0.25.1");
+        if !workspace.is_dir() {
+            println!("未找到工作区，跳过");
+            return;
+        }
+        let dir = temp_dir("bench-pack");
+        let output = dir.join("pack-bench.apk");
+        let started = Instant::now();
+        let entries =
+            crate::apk_pack::package_workspace(&workspace, &output, &|_, _| {}).unwrap();
+        let elapsed = started.elapsed();
+        let size = fs::metadata(&output)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        println!(
+            "BENCH pack: entries={entries} size={:.1}MB in {:?}",
+            size as f64 / 1_048_576.0,
+            elapsed
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

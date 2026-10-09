@@ -13,7 +13,7 @@ pub struct WorkspaceFile {
 }
 
 /// 资源管理器操作命令。命令元组的第二个元素语义：
-/// - Cut/Copy/Delete/Reveal/Sign：操作对象的相对路径；
+/// - Cut/Copy/Delete/Rename/Reveal/Sign：操作对象的相对路径；
 /// - Paste：粘贴目标目录（空串表示工作区根）。
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ExplorerCommand {
@@ -21,6 +21,8 @@ pub enum ExplorerCommand {
 	Copy,
 	Paste,
 	Delete,
+	/// 就地重命名（同目录改名；由 Work 弹出名称输入框）。
+	Rename,
 	Reveal,
 	/// 对所选 APK 就地执行 v1+v2+v3 签名。
 	Sign,
@@ -105,6 +107,11 @@ fn ExplorerContextMenu(
                 disabled: !clipboard_ready,
                 onclick: move |_| dispatch.call(ExplorerCommand::Paste),
                 "粘贴"
+            }
+            button {
+                r#type: "button",
+                onclick: move |_| dispatch.call(ExplorerCommand::Rename),
+                "重命名"
             }
             if is_apk_file {
                 button {

@@ -706,6 +706,32 @@ body {
   gap: 8px;
 }
 
+/* 资源管理器文件操作（复制/移动/删除大文件夹）的浮动进度卡：
+   不遮挡工作区，位于右下角、状态栏上方。 */
+.file-op-panel {
+  position: fixed;
+  right: 16px;
+  bottom: 48px;
+  z-index: 23;
+  display: flex;
+  width: min(320px, calc(100vw - 32px));
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: 0 8px 24px rgb(20 35 60 / 22%);
+}
+
+.file-op-panel .loading-stage {
+  max-width: 100%;
+}
+
+.file-op-panel .loading-progress {
+  width: 100%;
+}
+
 .mind-history-buttons {
   position: absolute;
   left: 12px;
@@ -1266,6 +1292,30 @@ body {
   cursor: default;
 }
 
+/* 危险操作按钮（如未使用脚本副本删除）：与全局粉色调同款（同菜单栏 --pink-deep）。 */
+.event-delete {
+  min-height: 30px;
+  padding: 0 12px;
+  border: 1px solid var(--pink-deep);
+  border-radius: 3px;
+  box-shadow: none;
+  color: #ffffff;
+  background: var(--pink-deep);
+  font-size: 12px;
+}
+
+.event-delete:hover {
+  border-color: #b56483;
+  background: #b56483;
+}
+
+.event-delete:disabled {
+  border-color: transparent;
+  color: #fbf1f5;
+  background: #d7a5b7;
+  cursor: default;
+}
+
 .event-status {
   min-width: 0;
   overflow: hidden;
@@ -1329,6 +1379,126 @@ body {
   flex: 1 1 0;
 }
 
+/* `add_ruler` 专用复合编辑器：字段语义藏在输入框占位提示里（名字 / 姓氏 / 头像 /
+   出生[日·月·年]），界面不出现 `=` 分隔符；写回文件时仍拼回
+   `名字=姓氏=头像=日=月=年`。字段宽度自适应：窄面板逐字段换行、不溢出单元格。 */
+.event-ruler-input {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 6px;
+  width: 100%;
+  min-width: 0;
+}
+
+.event-ruler-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: 1 1 84px;
+  min-width: 64px;
+  /* 兜底：任何情况下不得超出单元格宽度。 */
+  max-width: 100%;
+}
+
+/* 头像与名字 / 姓氏共用同一套弹性规则（同拉伸、同收缩，跟随面板宽度自适应）。 */
+
+/* 注意 `width: 100%`（勿改回 `auto`）：名字 / 姓氏的输入框是 flex 子级、由 flex
+   分配宽度，但**安卓端头像走自绘下拉、多包一层 `.suggest-wrap`（非 flex 容器）**，
+   `width: auto` 会让输入框退回默认固有宽度（约 134px），在窄单元格里向右溢出。 */
+.event-value-parts .event-ruler-input .event-cell-input {
+  flex: 1 1 0;
+  width: 100%;
+  min-width: 0;
+}
+
+.event-value-parts .event-ruler-input .suggest-wrap {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+/* 出生日 / 月 / 年：三个窄输入固定为一组（可整体换行，不逐字折行）。 */
+.event-ruler-field-birth {
+  flex: 0 1 auto;
+  flex-wrap: wrap;
+}
+
+.event-ruler-num {
+  box-sizing: border-box;
+  width: 42px;
+  height: 26px;
+  min-width: 0;
+  padding: 0 4px;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  color: #eef4ff;
+  background: #16304f;
+  font-size: 11px;
+  text-align: center;
+}
+
+.event-ruler-num:focus {
+  border-color: var(--blue);
+  background: #1a385c;
+}
+
+.event-cell-input::placeholder,
+.event-ruler-num::placeholder {
+  color: #7f93b3;
+}
+
+.event-ruler-input.invalid .event-cell-input,
+.event-ruler-input.invalid .event-ruler-num {
+  border-color: #e0738f;
+  background: #4a2331;
+}
+
+/* `add_new_army` 专用成对编辑器：每行一对（兵种 / 型号两个输入框 + 行尾删除），
+   底部「＋ 添加一对」追加；输入框宽度与 `.event-ruler-*` 同一套弹性规则
+   （`width: 100%` 见上方注释：安卓端自绘下拉多包一层 `.suggest-wrap`）。 */
+.event-army-input {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 100%;
+  min-width: 0;
+}
+
+.event-army-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+  min-width: 0;
+}
+
+.event-value-parts .event-army-input .event-cell-input {
+  flex: 1 1 0;
+  width: 100%;
+  min-width: 0;
+}
+
+.event-value-parts .event-army-input .suggest-wrap {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+.event-army-del {
+  flex: 0 0 auto;
+}
+
+.event-army-add {
+  flex: 0 0 auto;
+  width: auto;
+  align-self: flex-start;
+  padding: 0 6px;
+}
+
+.event-army-input.invalid .event-cell-input {
+  border-color: #e0738f;
+  background: #4a2331;
+}
+
 /* 自绘下拉需要越过分区圆角裁剪（仅自绘模式启用，不影响桌面端原生模式）。 */
 .event-grid.suggest-overlay .event-section {
   overflow: visible;
@@ -1346,6 +1516,8 @@ body {
   flex-direction: column;
   overflow-y: auto;
   overscroll-behavior: contain;
+  /* 虚拟滚动关键（同 .file-list）：禁用滚动锚定，占位块增删时浏览器不得自作主张修正 scrollTop。 */
+  overflow-anchor: none;
   /* 垂直拖动明确交给列表滚动（配合松手位移判定，避免轻触即选）。 */
   touch-action: pan-y;
   padding: 2px;
@@ -1353,6 +1525,12 @@ body {
   border-radius: 4px;
   background: #10294a;
   box-shadow: 0 8px 20px rgba(0, 0, 0, 0.5);
+}
+
+/* 虚拟滚动的行与占位块固定不收缩（flex 列内默认 flex-shrink:1 会压扁行、打乱行高换算）。 */
+.suggest-list>* {
+  flex: none;
+  overflow-anchor: none;
 }
 
 /* 下方空间不足时向上展开（方向与限高由 SuggestInput 实测后控制）。 */
@@ -1364,8 +1542,12 @@ body {
 .suggest-item {
   display: flex;
   flex-direction: column;
+  justify-content: center;
   gap: 1px;
-  padding: 5px 6px;
+  /* 虚拟滚动：行高固定（与 event_grid::SUGGEST_ROW_HEIGHT 一致），勿改回多行换行。 */
+  height: 34px;
+  box-sizing: border-box;
+  padding: 3px 6px;
   border-radius: 3px;
   cursor: pointer;
 }
@@ -1378,14 +1560,19 @@ body {
 .suggest-item-value {
   color: #eef4ff;
   font-size: 11px;
-  overflow-wrap: anywhere;
+  line-height: 1.25;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .suggest-item-label {
   color: #9fb4d6;
   font-size: 10px;
-  line-height: 1.35;
-  overflow-wrap: anywhere;
+  line-height: 1.3;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .editor-main {

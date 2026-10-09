@@ -10,7 +10,7 @@ pub mod event_parser;
 pub mod event_schema;
 pub mod game_text;
 pub mod missions_roots;
-pub use mind::{FocusIcon, FocusTarget, MindMapCanvas, MissionRecord, Shared};
+pub use mind::{FocusIcon, FocusTarget, MindClipboard, MindMapCanvas, MissionRecord, Shared};
 pub use work::Work;
 
 /// 已打开的工作区信息，供各组件访问文件时使用。

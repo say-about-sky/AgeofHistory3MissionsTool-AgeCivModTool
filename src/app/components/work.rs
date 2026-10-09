@@ -6,7 +6,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 
 use super::{
-	FocusIcon, FocusTarget, MindMapCanvas, MissionRecord, Shared, WorkDirectory,
+	FocusIcon, FocusTarget, MindClipboard, MindMapCanvas, MissionRecord, Shared, WorkDirectory,
 	event::{delete_event_text, rename_event_text, save_event_text, EventPanel},
 	files::{ExplorerClipboard, ExplorerCommand, Files, WorkspaceFile},
 	frame::Frame,
@@ -18,7 +18,10 @@ use super::{
 		UndoScope, UndoZone, UNDO_LIMIT, UNDO_MERGE_WINDOW_MS,
 	},
 };
-use crate::app::tauri_bridge::{invoke, listen_apk_progress, listen_workspace_changed, open_dialog, sleep_ms};
+use crate::app::tauri_bridge::{
+	invoke, listen_apk_progress, listen_file_op_progress, listen_workspace_changed, open_dialog,
+	sleep_ms,
+};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -357,6 +360,93 @@ fn join_rel_path(parent: &str, name: &str) -> String {
 		name.to_string()
 	} else {
 		format!("{parent}/{name}")
+	}
+}
+
+/// 资源管理器文件操作进度（浮动进度卡的数据；`total = 0` 表示总量未知）。
+#[derive(Clone)]
+struct FileOpProgressView {
+	stage: String,
+	completed: u64,
+	total: u64,
+}
+
+/// 执行资源管理器文件操作（复制/移动/删除）并维护浮动进度卡：
+/// 操作计数归零时由最后一个结束的操作清除卡片（并行操作不会互相清除对方仍在显示的内容）。
+async fn run_file_op<T>(
+	mut active: Signal<usize>,
+	mut progress: Signal<Option<FileOpProgressView>>,
+	future: impl std::future::Future<Output = T>,
+) -> T {
+	active.with_mut(|count| *count += 1);
+	let result = future.await;
+	active.with_mut(|count| *count = count.saturating_sub(1));
+	let remaining = *active.peek();
+	if remaining == 0 {
+		progress.set(None);
+	}
+	result
+}
+
+/// 重命名条目后计算「条目本身或其后代」迁移到的新相对路径。
+fn moved_path(path: &str, from: &str, to: &str) -> Option<String> {
+	if path == from {
+		return Some(to.to_string());
+	}
+	let rest = path.strip_prefix(from).filter(|rest| rest.starts_with('/'))?;
+	Some(format!("{to}{rest}"))
+}
+
+/// 重命名（同目录移动）成功后的编辑器同步：选中行、国策树标签页路径、
+/// 事件面板根目录跟随改名；事件脚本改名时通知事件面板；
+/// 最后重载文件列表并剪除失效标签页（标签页路径已先行更新，不会误剪）。
+async fn sync_after_rename(
+	directory: &WorkDirectory,
+	from: &str,
+	to: &str,
+	is_directory: bool,
+	mut workspace_files: Signal<Vec<WorkspaceFile>>,
+	mut selected_file: Signal<Option<String>>,
+	mut open_tabs: Signal<Vec<TreeTab>>,
+	mut events_root: Signal<Option<String>>,
+	mut rename_event_request: Signal<Option<(String, String)>>,
+	prune_tabs: EventHandler<Vec<WorkspaceFile>>,
+) {
+	// 先快照再写入：读守卫需先释放（直接在 if let 判定里 read 会与后续 set 冲突）。
+	let selected_snapshot = selected_file.read().clone();
+	if let Some(selected) = selected_snapshot {
+		if let Some(moved) = moved_path(&selected, from, to) {
+			selected_file.set(Some(moved));
+		}
+	}
+	open_tabs.with_mut(|tabs| {
+		for tab in tabs.iter_mut() {
+			if let Some(moved) = moved_path(&tab.json_path, from, to) {
+				tab.json_path = moved.clone();
+				tab.title = tree_tab_title(&moved);
+			}
+		}
+	});
+	let root_snapshot = events_root.peek().clone();
+	if let Some(root) = root_snapshot {
+		if let Some(moved) = moved_path(&root, from, to) {
+			events_root.set(Some(moved));
+		}
+	}
+	// 事件脚本文件本身改名：通知事件面板跟随（正在编辑且未修改时自动切换）。
+	if !is_directory {
+		if let (Some((_, old_name)), Some((_, new_name))) = (
+			missions_subfile(from, "missionsEvents"),
+			missions_subfile(to, "missionsEvents"),
+		) {
+			if !old_name.contains('/') && !new_name.contains('/') {
+				rename_event_request.set(Some((old_name, new_name)));
+			}
+		}
+	}
+	if let Ok(files) = reload_file_list(directory).await {
+		workspace_files.set(files.clone());
+		prune_tabs.call(files);
 	}
 }
 
@@ -972,6 +1062,207 @@ async fn package_workspace_apk(
 	Ok(summary.message)
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UnusedScriptsArgs {
+	work_directory: String,
+	scope: String,
+}
+
+/// 打包 / 导出前「未使用脚本副本」确认后要继续执行的操作。
+#[derive(Clone)]
+enum PendingApkOperation {
+	/// 导出到 APK：目标路径与显示名。
+	Export { apk_path: String, apk_name: Option<String> },
+	/// 打包 APK：源目录（工作区相对路径，空串 = 工作区根）。
+	Package { source_directory: String },
+}
+
+/// 检查工作区（或指定子目录）内 `missionsEvents` 中未被引用的脚本副本（返回相对路径列表）。
+async fn find_unused_event_scripts(
+	directory: &WorkDirectory,
+	scope: &str,
+) -> Result<Vec<String>, String> {
+	let args = serde_wasm_bindgen::to_value(&UnusedScriptsArgs {
+		work_directory: directory.root_path.clone(),
+		scope: scope.to_string(),
+	})
+	.map_err(|error| error.to_string())?;
+	let value = JsFuture::from(invoke("find_unused_event_scripts", args))
+		.await
+		.map_err(|error| format!("检查未使用脚本失败：{error:?}"))?;
+	serde_wasm_bindgen::from_value(value).map_err(|error| format!("检查结果格式错误：{error}"))
+}
+
+/// 执行打包 / 导出（「未使用脚本副本」对话框确认后调用）：进度与状态写入传入信号。
+async fn perform_apk_operation(
+	directory: &WorkDirectory,
+	operation: PendingApkOperation,
+	mut loading: Signal<bool>,
+	mut load_progress: Signal<Option<LoadProgress>>,
+	mut progress_counter: Signal<Option<String>>,
+	mut apk_status: Signal<String>,
+	mut load_error: Signal<String>,
+	mut workspace_files: Signal<Vec<WorkspaceFile>>,
+) {
+	loading.set(true);
+	match operation {
+		PendingApkOperation::Package { source_directory } => {
+			apk_status.set("正在打包 APK...".to_string());
+			progress_counter.set(None);
+			load_progress.set(Some(LoadProgress {
+				stage: "正在打包 APK...".to_string(),
+				completed: 0,
+				total: 0,
+			}));
+			match package_workspace_apk(&directory.root_path, &source_directory).await {
+				Ok(message) => apk_status.set(message),
+				Err(error) => apk_status.set(error),
+			}
+		}
+		PendingApkOperation::Export { apk_path, apk_name } => {
+			load_error.set(String::new());
+			apk_status.set("正在导出到 APK（更新替换）...".to_string());
+			progress_counter.set(None);
+			load_progress.set(Some(LoadProgress {
+				stage: "正在导出到 APK（更新替换）...".to_string(),
+				completed: 0,
+				total: 0,
+			}));
+			match export_apk_sections_to_apk(&directory.root_path, &apk_path, apk_name.as_deref())
+				.await
+			{
+				Ok(message) => {
+					apk_status.set(message);
+					if let Ok(files) = load_workspace_files(directory).await {
+						workspace_files.set(files);
+					}
+				}
+				Err(error) => apk_status.set(error),
+			}
+		}
+	}
+	loading.set(false);
+	load_progress.set(None);
+	progress_counter.set(None);
+}
+
+/// 「未使用脚本副本」列表行高（px；必须与行内样式的 height 匹配，虚拟滚动按行高换算窗口）。
+const UNUSED_ROW_HEIGHT: f64 = 32.0;
+/// 虚拟滚动：可视区域行数估算（列表容器 max-height 180px / 行高 32px）。
+const UNUSED_VIEWPORT_ROWS: usize = 6;
+/// 虚拟滚动：可视区上下各保留的缓冲行数（快速滚动与节流滞后时不露白）。
+const UNUSED_BUFFER_ROWS: usize = 24;
+
+#[derive(Props, Clone, PartialEq)]
+struct UnusedScriptsListProps {
+	/// 待处理脚本快照（工作区相对路径，已按时间排序；父层删除后重新传入）。
+	scripts: Vec<String>,
+	/// 勾选状态：行点击/全选切换；父层删除按钮点击时读取。
+	checked: Signal<Vec<String>>,
+}
+
+/// 「未使用脚本副本」对话框中的勾选列表。
+/// 安卓优化：虚拟滚动——只渲染可视窗口 ± 缓冲行（上千条目也能瞬时弹出）；
+/// 勾选/滚动信号都在本组件内读取，切换勾选只重渲染本列表，不重渲染整个工作区。
+#[component]
+fn UnusedScriptsList(props: UnusedScriptsListProps) -> Element {
+	let scripts = props.scripts;
+	let checked = props.checked;
+	let mut list_scroll_top = use_signal(|| 0.0_f64);
+	let checked_snapshot = checked.read().clone();
+	let total = scripts.len();
+	let checked_count = checked_snapshot.len();
+	let all_selected = total > 0 && checked_count == total;
+	let scripts_for_toggle = scripts.clone();
+	// 虚拟滚动窗口：仅渲染可视区域及上下缓冲行。
+	let scroll_top = *list_scroll_top.read();
+	let max_start = total.saturating_sub(1);
+	let start_offset =
+		((scroll_top / UNUSED_ROW_HEIGHT).floor().max(0.0) as usize).min(max_start);
+	let window_start = start_offset.saturating_sub(UNUSED_BUFFER_ROWS);
+	let window_end = (window_start + UNUSED_VIEWPORT_ROWS + UNUSED_BUFFER_ROWS * 2).min(total);
+	let top_spacer = window_start as f64 * UNUSED_ROW_HEIGHT;
+	let bottom_spacer = (total - window_end) as f64 * UNUSED_ROW_HEIGHT;
+	// 列表变短（删除后停留）时滚动信号可能超出内容高度，回夹防窗口空白。
+	let max_scroll = total as f64 * UNUSED_ROW_HEIGHT;
+	if scroll_top > max_scroll {
+		list_scroll_top.set(max_scroll);
+	}
+	rsx! {
+        div { style: "display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 0 0 4px; font-size: 12px;",
+            span { style: "opacity: 0.75;", "已选 {checked_count} / {total} 项" }
+            button {
+                class: "event-revert",
+                r#type: "button",
+                style: "font-size: 12px; padding: 1px 8px; line-height: 1.6;",
+                onclick: move |_| {
+                    let mut checked = checked;
+                    if all_selected {
+                        checked.set(Vec::new());
+                    } else {
+                        checked.set(scripts_for_toggle.clone());
+                    }
+                },
+                if all_selected {
+                    "全不选"
+                } else {
+                    "全选"
+                }
+            }
+        }
+        div {
+            style: "max-height: 180px; overflow-y: auto; overscroll-behavior: contain; overflow-anchor: none; margin: 0 0 12px; padding: 6px 8px; border-radius: 4px; background: var(--surface-blue); font-size: 12px;",
+            onscroll: move |evt: Event<ScrollData>| {
+                let top = evt.scroll_top();
+                let mut list_scroll_top = list_scroll_top;
+                // 按 4 行节流：窗口带上下缓冲，无需跟随每个像素重渲染。
+                if (top - list_scroll_top.cloned()).abs() >= UNUSED_ROW_HEIGHT * 4.0 {
+                    list_scroll_top.set(top);
+                }
+            },
+            if top_spacer > 0.0 {
+                div { style: "height: {top_spacer}px;", aria_hidden: "true" }
+            }
+            for script_index in window_start..window_end {
+                {
+                    let script_name = scripts[script_index].clone();
+                    let click_name = script_name.clone();
+                    let is_checked = checked_snapshot.contains(&scripts[script_index]);
+                    rsx! {
+                        div {
+                            style: "display: flex; align-items: flex-start; gap: 6px; cursor: pointer; height: {UNUSED_ROW_HEIGHT}px; overflow: hidden; user-select: none;",
+                            onclick: move |_| {
+                                let mut checked = checked;
+                                let mut current = checked.read().clone();
+                                if let Some(index) = current.iter().position(|item| item == &click_name) {
+                                    current.remove(index);
+                                } else {
+                                    current.push(click_name.clone());
+                                }
+                                checked.set(current);
+                            },
+                            span { style: "flex: 0 0 auto; line-height: 16px;",
+                                if is_checked {
+                                    "☑"
+                                } else {
+                                    "☐"
+                                }
+                            }
+                            span { style: "flex: 1 1 auto; word-break: break-all; line-height: 16px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; text-overflow: ellipsis;",
+                                "{script_name}"
+                            }
+                        }
+                    }
+                }
+            }
+            if bottom_spacer > 0.0 {
+                div { style: "height: {bottom_spacer}px;", aria_hidden: "true" }
+            }
+        }
+    }
+}
+
 /// 对选中的 APK 就地签名（v1+v2+v3）。
 /// `relative_path` 可为工作区内相对路径（资源管理器选中）或桌面端文件选择器返回的绝对路径。
 async fn sign_workspace_apk(work_directory: &str, relative_path: &str) -> Result<String, String> {
@@ -1325,6 +1616,11 @@ fn TreeCanvas(
 	save_status: String,
 	focus_request: Signal<Option<(FocusTarget, u64)>>,
 	pending_icon: Signal<Option<(String, FocusIcon)>>,
+	// 画布卡片剪贴板（跨标签页复制/粘贴）。
+	mind_clipboard: Signal<Option<MindClipboard>>,
+	// 粘贴事件脚本（空白菜单「粘贴国策+事件」/ 卡片菜单「粘贴事件」共用）：
+	// 把源事件脚本复制到目标资源根下的新脚本。
+	on_copy_event_script: EventHandler<(String, String, String, String)>,
 	on_undo_push: EventHandler<UndoRegistration>,
 	on_save: EventHandler<(String, Vec<MissionRecord>)>,
 	on_edit_event: EventHandler<(String, String)>,
@@ -1355,6 +1651,8 @@ fn TreeCanvas(
                 missions: tab.missions.clone(),
                 missions_root: tab_missions_root.clone(),
                 event_files: event_files.clone(),
+                clipboard: mind_clipboard,
+                on_copy_event_script,
                 active_tab_id,
                 tab_id: canvas_tab_id,
                 on_save: move |records| on_save.call((save_tab_id.clone(), records)),
@@ -1433,6 +1731,10 @@ pub fn Work() -> Element {
 	let progress_counter = use_signal(|| None::<String>);
 	// 多个“APK 内容目录”并存时的打包选择对话框选项。
 	let mut pack_choice = use_signal(|| None::<Vec<String>>);
+	// 打包/导出前发现的「未使用脚本副本」：Some((相对路径列表, 用户确认后继续的操作))。
+	let unused_scripts_prompt = use_signal(|| None::<(Vec<String>, PendingApkOperation)>);
+	// 「未使用脚本副本」对话框中已勾选的脚本（空 = 未选择；点「删除」时未选择 = 全部删除）。
+	let unused_scripts_checked = use_signal(Vec::<String>::new);
 	// BKS 密钥库密码输入：Some(key_path) 时显示密码对话框。
 	let mut signing_key_prompt = use_signal(|| None::<String>);
 	let mut signing_key_password = use_signal(String::new);
@@ -1444,6 +1746,16 @@ pub fn Work() -> Element {
 	let rename_event_request = use_signal(|| None::<(String, String)>);
 	let mut selected_file = use_signal(|| None::<String>);
 	let explorer_clipboard = use_signal(|| None::<ExplorerClipboard>);
+	// 资源管理器文件操作（复制/移动/删除）的浮动进度卡：
+	// active 为并发操作计数，归零时清空 progress。
+	let file_op_active = use_signal(|| 0_usize);
+	let file_op_progress = use_signal(|| None::<FileOpProgressView>);
+	// 资源管理器「重命名」对话框：(相对路径, 是否目录)。
+	let mut rename_prompt = use_signal(|| None::<(String, bool)>);
+	let mut rename_value = use_signal(String::new);
+	let mut rename_error = use_signal(String::new);
+	// 画布卡片剪贴板（跨标签页复制/粘贴：含图标数据与事件脚本引用）。
+	let mind_clipboard = use_signal(|| None::<MindClipboard>);
 	let mut mind_node_names = use_signal(Vec::<String>::new);
 	let mut mind_node_images = use_signal(Vec::<String>::new);
 	let mut delete_prompt = use_signal(|| None::<(String, String)>);
@@ -1598,6 +1910,19 @@ pub fn Work() -> Element {
 				stage: payload.stage,
 				completed: completed as usize,
 				total: total as usize,
+			}));
+		});
+	});
+
+	// 监听资源管理器文件操作进度（复制/移动/删除大文件夹），驱动浮动进度卡。
+	// 同样处于 dioxus 作用域之外：回调内只置信号。
+	use_hook(move || {
+		let mut file_op_progress = file_op_progress;
+		listen_file_op_progress(move |payload| {
+			file_op_progress.set(Some(FileOpProgressView {
+				stage: payload.stage,
+				completed: payload.completed,
+				total: payload.total,
 			}));
 		});
 	});
@@ -2050,12 +2375,14 @@ pub fn Work() -> Element {
 	// 以更新替换方式把工作区版块写回（APK 中多余条目保留，不清空）。
 	let on_export_apk = EventHandler::new(move |_: ()| {
 		let work_directory = work_directory;
-		let mut workspace_files = workspace_files;
+		let workspace_files = workspace_files;
 		let mut loading = loading;
 		let mut load_progress = load_progress;
 		let mut progress_counter = progress_counter;
 		let mut load_error = load_error;
 		let mut apk_status = apk_status;
+		let unused_scripts_prompt = unused_scripts_prompt;
+		let unused_scripts_checked = unused_scripts_checked;
 		let selected = selected_file.read().clone();
 		spawn(async move {
 			let Some(directory) = work_directory.read().clone() else {
@@ -2077,29 +2404,57 @@ pub fn Work() -> Element {
 					return;
 				}
 			}
-			loading.set(true);
-			load_error.set(String::new());
-			apk_status.set("正在导出到 APK（更新替换）...".to_string());
-			progress_counter.set(None);
-			load_progress.set(Some(LoadProgress {
-				stage: "正在导出到 APK（更新替换）...".to_string(),
-				completed: 0,
-				total: 0,
-			}));
-			match export_apk_sections_to_apk(&directory.root_path, &apk_path, apk_name.as_deref())
-				.await
-			{
-				Ok(message) => {
-					apk_status.set(message);
-					if let Ok(files) = load_workspace_files(&directory).await {
-						workspace_files.set(files);
+			// 导出前检查：missionsEvents 内未被国策引用的脚本副本，交给用户处理后再继续。
+			let mut unused_scripts_prompt = unused_scripts_prompt;
+			let mut unused_scripts_checked = unused_scripts_checked;
+			let scan_note = if directory.folder_id.is_some() {
+				// SAF 模式导出本身会失败；检查也依赖真实路径，跳过。
+				None
+			} else {
+				// 检查期间显示加载进度（后端通过 apk-progress 事件上报扫描进度）。
+				loading.set(true);
+				load_error.set(String::new());
+				apk_status.set("正在检查未使用脚本...".to_string());
+				progress_counter.set(None);
+				load_progress.set(Some(LoadProgress {
+					stage: "正在检查未使用脚本...".to_string(),
+					completed: 0,
+					total: 0,
+				}));
+				let scan_result = find_unused_event_scripts(&directory, "").await;
+				loading.set(false);
+				load_progress.set(None);
+				progress_counter.set(None);
+				match scan_result {
+					Ok(scripts) if !scripts.is_empty() => {
+						unused_scripts_checked.set(Vec::new());
+						unused_scripts_prompt.set(Some((
+							scripts,
+							PendingApkOperation::Export {
+								apk_path: apk_path.clone(),
+								apk_name: apk_name.clone(),
+							},
+						)));
+						return;
 					}
+					Ok(_) => None,
+					Err(error) => Some(format!("未使用脚本检查失败：{error}")),
 				}
-				Err(error) => apk_status.set(error),
+			};
+			perform_apk_operation(
+				&directory,
+				PendingApkOperation::Export { apk_path, apk_name },
+				loading,
+				load_progress,
+				progress_counter,
+				apk_status,
+				load_error,
+				workspace_files,
+			)
+			.await;
+			if let Some(note) = scan_note {
+				apk_status.with_mut(|status| *status = format!("{status}（{note}）"));
 			}
-			loading.set(false);
-			load_progress.set(None);
-			progress_counter.set(None);
 		});
 	});
 
@@ -2149,10 +2504,14 @@ pub fn Work() -> Element {
 
 	let run_package_apk = EventHandler::new(move |source_directory: Option<String>| {
 		let work_directory = work_directory;
+		let workspace_files = workspace_files;
 		let mut loading = loading;
 		let mut load_progress = load_progress;
 		let mut progress_counter = progress_counter;
+		let mut load_error = load_error;
 		let mut apk_status = apk_status;
+		let unused_scripts_prompt = unused_scripts_prompt;
+		let unused_scripts_checked = unused_scripts_checked;
 		spawn(async move {
 			let Some(directory) = work_directory.read().clone() else {
 				apk_status.set("打包失败：请先打开工作区".to_string());
@@ -2165,22 +2524,54 @@ pub fn Work() -> Element {
 				);
 				return;
 			}
+			let source = source_directory.unwrap_or_default();
+			// 打包前检查：打包范围（源目录子树）内未被国策引用的脚本副本，交给用户处理后再继续。
+			let mut unused_scripts_prompt = unused_scripts_prompt;
+			let mut unused_scripts_checked = unused_scripts_checked;
+			// 检查期间显示加载进度（后端通过 apk-progress 事件上报扫描进度）。
 			loading.set(true);
-			apk_status.set("正在打包 APK...".to_string());
+			load_error.set(String::new());
+			apk_status.set("正在检查未使用脚本...".to_string());
 			progress_counter.set(None);
 			load_progress.set(Some(LoadProgress {
-				stage: "正在打包 APK...".to_string(),
+				stage: "正在检查未使用脚本...".to_string(),
 				completed: 0,
 				total: 0,
 			}));
-			let source = source_directory.unwrap_or_default();
-			match package_workspace_apk(&directory.root_path, &source).await {
-				Ok(message) => apk_status.set(message),
-				Err(error) => apk_status.set(error),
-			}
+			let scan_result = find_unused_event_scripts(&directory, &source).await;
 			loading.set(false);
 			load_progress.set(None);
 			progress_counter.set(None);
+			let scan_note = match scan_result {
+				Ok(scripts) if !scripts.is_empty() => {
+					unused_scripts_checked.set(Vec::new());
+					unused_scripts_prompt.set(Some((
+						scripts,
+						PendingApkOperation::Package {
+							source_directory: source.clone(),
+						},
+					)));
+					return;
+				}
+				Ok(_) => None,
+				Err(error) => Some(format!("未使用脚本检查失败：{error}")),
+			};
+			perform_apk_operation(
+				&directory,
+				PendingApkOperation::Package {
+					source_directory: source,
+				},
+				loading,
+				load_progress,
+				progress_counter,
+				apk_status,
+				load_error,
+				workspace_files,
+			)
+			.await;
+			if let Some(note) = scan_note {
+				apk_status.with_mut(|status| *status = format!("{status}（{note}）"));
+			}
 		});
 	});
 
@@ -2698,6 +3089,192 @@ pub fn Work() -> Element {
 			});
 		};
 
+	// 画布粘贴事件脚本（「粘贴国策+事件」/「粘贴事件」共用）：复制到目标树资源根下的新脚本
+	//（文件名已由画布按计数后缀生成，如 事件脚本.txt → 事件脚本0.txt → 事件脚本1.txt）。
+	let on_copy_event_script = EventHandler::new(
+		move |(source_root, source_file, target_root, target_file): (String, String, String, String)| {
+			let Some(directory) = work_directory.read().clone() else {
+				return;
+			};
+			let mut load_error = load_error;
+			let mut workspace_files = workspace_files;
+			let source_path = format!("{source_root}/missionsEvents/{source_file}");
+			let target_path = format!("{target_root}/missionsEvents/{target_file}");
+			spawn(async move {
+				// 目标条目先登记：连续粘贴的计数命名据此避开已占用的名字。
+				let mut registered = false;
+				workspace_files.with_mut(|files| {
+					if !files.iter().any(|file| file.relative_path == target_path) {
+						files.push(WorkspaceFile {
+							name: target_file.clone(),
+							relative_path: target_path.clone(),
+							is_directory: false,
+						});
+						registered = true;
+					}
+				});
+				if !workspace_files
+					.read()
+					.iter()
+					.any(|file| file.relative_path == source_path)
+				{
+					load_error.set(format!("复制事件脚本失败：源脚本不存在（{source_file}）"));
+					if registered {
+						workspace_files.with_mut(|files| {
+							files.retain(|file| file.relative_path != target_path);
+						});
+					}
+					return;
+				}
+				let result = run_file_op(
+					file_op_active,
+					file_op_progress,
+					copy_item(&directory, &source_path, &target_path),
+				)
+				.await;
+				if let Err(error) = result {
+					load_error.set(format!("复制事件脚本失败：{error}"));
+					if registered {
+						workspace_files.with_mut(|files| {
+							files.retain(|file| file.relative_path != target_path);
+						});
+					}
+				}
+			});
+		},
+	);
+
+	// 资源管理器「重命名」：同目录改名（复用移动通道，重名在提交前拦截），
+	// 成功后同步标签页/事件面板路径并登记撤销（撤销 = 改回原名）。
+	let run_rename = EventHandler::new(move |_: ()| {
+		let Some((path, is_directory)) = rename_prompt.read().clone() else {
+			return;
+		};
+		let new_name = rename_value.read().trim().to_string();
+		if new_name.is_empty()
+			|| new_name.contains('/')
+			|| new_name.contains('\\')
+			|| new_name == "."
+			|| new_name == ".."
+		{
+			rename_error.set("名称无效：不能为空，也不能包含 / \\ 等字符".to_string());
+			return;
+		}
+		let parent = path.rsplit_once('/').map(|(parent, _)| parent).unwrap_or("");
+		let target = join_rel_path(parent, &new_name);
+		if target == path {
+			rename_prompt.set(None);
+			return;
+		}
+		if workspace_files
+			.read()
+			.iter()
+			.any(|file| file.relative_path == target)
+		{
+			rename_error.set(format!("已存在同名条目：{new_name}"));
+			return;
+		}
+		let Some(directory) = work_directory.read().clone() else {
+			return;
+		};
+		rename_prompt.set(None);
+		rename_error.set(String::new());
+		let mut load_error = load_error;
+		let workspace_files = workspace_files;
+		let selected_file = selected_file;
+		let open_tabs = open_tabs;
+		let events_root = events_root;
+		let rename_event_request = rename_event_request;
+		spawn(async move {
+			match move_item(&directory, &path, &target).await {
+				Ok(()) => {
+					sync_after_rename(
+						&directory,
+						&path,
+						&target,
+						is_directory,
+						workspace_files,
+						selected_file,
+						open_tabs,
+						events_root,
+						rename_event_request,
+						prune_tabs,
+					)
+					.await;
+					// 撤销/重做 = 反向/正向再执行一次改名。
+					let directory_undo = directory.clone();
+					let target_undo = target.clone();
+					let original_undo = path.clone();
+					let workspace_files_undo = workspace_files;
+					let selected_file_undo = selected_file;
+					let open_tabs_undo = open_tabs;
+					let events_root_undo = events_root;
+					let rename_request_undo = rename_event_request;
+					let undo = EventHandler::new(move |_: ()| {
+						let directory = directory_undo.clone();
+						let target = target_undo.clone();
+						let original = original_undo.clone();
+						spawn(async move {
+							match move_item(&directory, &target, &original).await {
+								Ok(()) => {
+									sync_after_rename(
+										&directory,
+										&target,
+										&original,
+										is_directory,
+										workspace_files_undo,
+										selected_file_undo,
+										open_tabs_undo,
+										events_root_undo,
+										rename_request_undo,
+										prune_tabs,
+									)
+									.await;
+								}
+								Err(error) => load_error.set(format!("撤销重命名失败：{error}")),
+							}
+						});
+					});
+					let directory_redo = directory.clone();
+					let target_redo = target.clone();
+					let original_redo = path.clone();
+					let workspace_files_redo = workspace_files;
+					let selected_file_redo = selected_file;
+					let open_tabs_redo = open_tabs;
+					let events_root_redo = events_root;
+					let rename_request_redo = rename_event_request;
+					let redo = EventHandler::new(move |_: ()| {
+						let directory = directory_redo.clone();
+						let target = target_redo.clone();
+						let original = original_redo.clone();
+						spawn(async move {
+							match move_item(&directory, &original, &target).await {
+								Ok(()) => {
+									sync_after_rename(
+										&directory,
+										&original,
+										&target,
+										is_directory,
+										workspace_files_redo,
+										selected_file_redo,
+										open_tabs_redo,
+										events_root_redo,
+										rename_request_redo,
+										prune_tabs,
+									)
+									.await;
+								}
+								Err(error) => load_error.set(format!("重做重命名失败：{error}")),
+							}
+						});
+					});
+					on_undo_push.call((UndoScope::Explorer, undo, redo));
+				}
+				Err(error) => load_error.set(format!("重命名失败：{error}")),
+			}
+		});
+	});
+
 	// 事件面板选中文件变化 → 资源管理器定位并高亮。
 	// use_callback 保持稳定身份：Work 重渲染时事件面板与资源管理器可记忆化跳过。
 	let on_file_selected = use_callback(move |path: Option<String>| {
@@ -2849,15 +3426,18 @@ pub fn Work() -> Element {
 						};
 					}
 					let target_path = join_rel_path(&target_dir, &target_name);
-					let result = if is_cut {
-						if source_path == target_path {
-							Ok(())
+					let result = run_file_op(file_op_active, file_op_progress, async {
+						if is_cut {
+							if source_path == target_path {
+								Ok(())
+							} else {
+								move_item(&directory, &source_path, &target_path).await
+							}
 						} else {
-							move_item(&directory, &source_path, &target_path).await
+							copy_item(&directory, &source_path, &target_path).await
 						}
-					} else {
-						copy_item(&directory, &source_path, &target_path).await
-					};
+					})
+					.await;
 					match result {
 						Ok(()) => {
 							if is_cut {
@@ -2879,11 +3459,18 @@ pub fn Work() -> Element {
 										let source = source.clone();
 										let target = target.clone();
 										spawn(async move {
-											let result = if is_cut {
-												move_item(&directory, &target, &source).await
-											} else {
-												delete_item(&directory, &target, is_directory).await
-											};
+											let result = run_file_op(
+												file_op_active,
+												file_op_progress,
+												async {
+													if is_cut {
+														move_item(&directory, &target, &source).await
+													} else {
+														delete_item(&directory, &target, is_directory).await
+													}
+												},
+											)
+											.await;
 											match result {
 												Ok(()) => {
 													if let Ok(files) = reload_file_list(&directory).await {
@@ -2909,11 +3496,18 @@ pub fn Work() -> Element {
 										let source = source.clone();
 										let target = target.clone();
 										spawn(async move {
-											let result = if is_cut {
-												move_item(&directory, &source, &target).await
-											} else {
-												copy_item(&directory, &source, &target).await
-											};
+											let result = run_file_op(
+												file_op_active,
+												file_op_progress,
+												async {
+													if is_cut {
+														move_item(&directory, &source, &target).await
+													} else {
+														copy_item(&directory, &source, &target).await
+													}
+												},
+											)
+											.await;
 											match result {
 												Ok(()) => {
 													if let Ok(files) = reload_file_list(&directory).await {
@@ -2958,10 +3552,10 @@ pub fn Work() -> Element {
 					warning = "该文件已作为国策树在标签页中打开，删除后对应标签页将关闭。".to_string();
 				} else if is_events && mind_node_names.read().contains(&stem) {
 					warning = format!(
-						"该脚本正被国策卡片「{stem}」使用，删除后对应国策将没有事件脚本。"
+						"该脚本正被国策「{stem}」使用，删除后对应国策将没有事件脚本。"
 					);
 				} else if is_image && mind_node_images.read().contains(&name) {
-					warning = format!("该图标正被国策卡片使用，删除后卡片图标将无法显示。");
+					warning = format!("该图标正被国策使用，删除后对应国策将无法显示图标。");
 				}
 				let message = if warning.is_empty() {
 					format!("确定删除 {name} 吗？此操作不可恢复。")
@@ -2970,6 +3564,22 @@ pub fn Work() -> Element {
 				};
 				let mut delete_prompt = delete_prompt;
 				delete_prompt.set(Some((argument, message)));
+			}
+			ExplorerCommand::Rename => {
+				let Some(entry) = workspace_files
+					.read()
+					.iter()
+					.find(|file| file.relative_path == argument)
+					.cloned()
+				else {
+					return;
+				};
+				let mut rename_prompt = rename_prompt;
+				let mut rename_value = rename_value;
+				let mut rename_error = rename_error;
+				rename_prompt.set(Some((entry.relative_path, entry.is_directory)));
+				rename_value.set(entry.name);
+				rename_error.set(String::new());
 			}
 			ExplorerCommand::Reveal => {
 				let Some(directory) = work_directory.read().clone() else {
@@ -3049,6 +3659,18 @@ pub fn Work() -> Element {
 		None => ("正在准备...".to_string(), None, None),
 	};
 	let loading_counter = progress_counter.read().clone().or(default_counter);
+	// 资源管理器文件操作进度卡快照（复制/移动/删除大文件夹时显示）。
+	let file_op_view = file_op_progress.read().clone();
+	let file_op_percent = file_op_view
+		.as_ref()
+		.map(|view| {
+			if view.total > 0 {
+				(view.completed as f64 / view.total as f64 * 100.0).clamp(0.0, 100.0)
+			} else {
+				0.0
+			}
+		})
+		.unwrap_or(0.0);
 	let tab_close_prompt_data = tab_close_prompt.read().clone().map(|tab_id| {
 		let title = open_tabs
 			.read()
@@ -3183,10 +3805,10 @@ pub fn Work() -> Element {
                 is_android: *android_platform.read(),
                 all_files_access_granted: *all_files_access_granted.read(),
                 tabs: open_tabs
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        .read()
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        .iter()
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        .map(|tab| (tab.id.clone(), tab.title.clone()))
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        .collect(),
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        .read()
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        .iter()
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        .map(|tab| (tab.id.clone(), tab.title.clone()))
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        .collect(),
                 active_tab_id: active_tab_id.read().clone(),
                 on_select_tab,
                 on_close_tab: on_close_tab_requested,
@@ -3295,6 +3917,8 @@ pub fn Work() -> Element {
                                     save_status: save_status.read().clone(),
                                     focus_request: mind_focus_request,
                                     pending_icon,
+                                    mind_clipboard,
+                                    on_copy_event_script,
                                     on_undo_push,
                                     on_save: on_save_tab,
                                     on_edit_event,
@@ -3424,6 +4048,38 @@ pub fn Work() -> Element {
                         "{permission_error.read()}"
                     }
                 }
+                if !load_error.read().is_empty() {
+                    span {
+                        class: "status-error",
+                        role: "alert",
+                        title: "{load_error.read()}",
+                        "{load_error.read()}"
+                    }
+                }
+            }
+            if let Some(view) = file_op_view {
+                div { class: "file-op-panel", role: "status",
+                    div { class: "loading-stage", "{view.stage}" }
+                    if view.total > 0 {
+                        div {
+                            class: "loading-progress",
+                            role: "progressbar",
+                            aria_valuemin: "0",
+                            aria_valuemax: "{view.total}",
+                            aria_valuenow: "{view.completed}",
+                            div {
+                                class: "loading-progress-fill",
+                                style: "width: {file_op_percent:.1}%;",
+                            }
+                        }
+                        div { class: "loading-progress-text", "{view.completed} / {view.total}" }
+                    } else {
+                        div { class: "loading-progress indeterminate",
+                            div { class: "loading-progress-fill" }
+                        }
+                        div { class: "loading-progress-text", "已处理 {view.completed} 项" }
+                    }
+                }
             }
             if let Some((path, message)) = delete_prompt.read().clone() {
                 div {
@@ -3452,7 +4108,13 @@ pub fn Work() -> Element {
                                     spawn(async move {
                                         let mut load_error = load_error;
                                         let mut workspace_files = workspace_files;
-                                        match delete_item(&directory, &path, is_directory).await {
+                                        let result = run_file_op(
+                                                file_op_active,
+                                                file_op_progress,
+                                                delete_item(&directory, &path, is_directory),
+                                            )
+                                            .await;
+                                        match result {
                                             Ok(()) => {
                                                 if let Ok(files) = reload_file_list(&directory).await {
                                                     workspace_files.set(files.clone());
@@ -3471,6 +4133,216 @@ pub fn Work() -> Element {
                             r#type: "button",
                             onclick: move |_| delete_prompt.set(None),
                             "取消"
+                        }
+                    }
+                }
+            }
+            if let Some((path, _is_directory)) = rename_prompt.read().clone() {
+                {
+                    let current_name = path.rsplit('/').next().unwrap_or(&path).to_string();
+                    rsx! {
+                        div {
+                            class: "menu-dismiss",
+                            style: "z-index: 55;",
+                            aria_hidden: "true",
+                            onclick: move |_| {
+                                rename_prompt.set(None);
+                                rename_error.set(String::new());
+                            },
+                        }
+                        div { class: "confirm-dialog", role: "alertdialog",
+                            p { class: "confirm-message", "重命名「{current_name}」为：" }
+                            input {
+                                r#type: "text",
+                                value: "{rename_value}",
+                                spellcheck: "false",
+                                autocomplete: "off",
+                                "data-native-undo": "true",
+                                aria_label: "新名称",
+                                style: "width: 100%; box-sizing: border-box; padding: 6px 10px; margin: 0 0 10px; background: var(--input-bg, #26262e); color: inherit; border: 1px solid #4a4a55; border-radius: 4px;",
+                                oninput: move |evt: FormEvent| rename_value.set(evt.value()),
+                                onkeydown: move |evt: Event<KeyboardData>| {
+                                    if evt.data().key().to_string() == "Enter" {
+                                        evt.prevent_default();
+                                        run_rename.call(());
+                                    }
+                                },
+                            }
+                            if !rename_error.read().is_empty() {
+                                p { class: "confirm-message", style: "color: #ff8a8a;", "{rename_error}" }
+                            }
+                            div { class: "confirm-actions",
+                                button {
+                                    class: "event-save",
+                                    r#type: "button",
+                                    onclick: move |_| run_rename.call(()),
+                                    "确定"
+                                }
+                                button {
+                                    class: "event-revert",
+                                    r#type: "button",
+                                    onclick: move |_| {
+                                        rename_prompt.set(None);
+                                        rename_error.set(String::new());
+                                    },
+                                    "取消"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some((unused_scripts, pending_operation)) = unused_scripts_prompt.read().clone() {
+                {
+                    let unused_count = unused_scripts.len();
+                    let file_op_busy = *file_op_active.read() > 0;
+                    rsx! {
+                        div { class: "menu-dismiss", style: "z-index: 55;", aria_hidden: "true" }
+                        div { class: "confirm-dialog", role: "alertdialog",
+                            p { class: "confirm-message",
+                                "检测到 {unused_count} 个未被任何国策引用的脚本副本（missionsEvents，按创建/修改时间从新到旧排列）："
+                            }
+                            UnusedScriptsList { scripts: unused_scripts, checked: unused_scripts_checked }
+                            p { class: "confirm-message", style: "font-size: 12px; opacity: 0.75;",
+                                "「删除」只删除选中项（未选择任何项时 = 全部删除）；未删完时停留本界面，全部删完后自动继续，或点「继续」直接继续打包/导出；「取消」取消本次操作。"
+                            }
+                            div { class: "confirm-actions",
+                                button {
+                                    class: "event-delete",
+                                    r#type: "button",
+                                    disabled: file_op_busy,
+                                    onclick: move |_| {
+                                        let Some(directory) = work_directory.read().clone() else {
+                                            return;
+                                        };
+                                        // 点击时取最新列表与待继续操作（停留期间列表会随删除更新）。
+                                        let Some((all_scripts, operation)) =
+                                            unused_scripts_prompt.read().clone()
+                                        else {
+                                            return;
+                                        };
+                                        let checked = unused_scripts_checked.read().clone();
+                                        // 未选择任何项时 = 全部删除。
+                                        let scripts = if checked.is_empty() { all_scripts.clone() } else { checked };
+                                        spawn(async move {
+                                            let mut unused_scripts_prompt = unused_scripts_prompt;
+                                            let mut unused_scripts_checked = unused_scripts_checked;
+                                            let mut apk_status = apk_status;
+                                            let mut workspace_files = workspace_files;
+                                            // 批量删除（包一层进度计数；单个失败不中断）；记录失败项用于计算剩余列表。
+                                            let failed_scripts = run_file_op(
+                                                    file_op_active,
+                                                    file_op_progress,
+                                                    async {
+                                                        let mut failed_scripts = Vec::<String>::new();
+                                                        for script in &scripts {
+                                                            if delete_item(&directory, script, false)
+                                                                .await
+                                                                .is_err()
+                                                            {
+                                                                failed_scripts.push(script.clone());
+                                                            }
+                                                        }
+                                                        failed_scripts
+                                                    },
+                                                )
+                                                .await;
+                                            if let Ok(files) = reload_file_list(&directory).await {
+                                                workspace_files.set(files);
+                                            }
+                                            // 剩余 = 原列表 − 成功删除项（失败项保留在列表内）。
+                                            let remaining: Vec<String> = all_scripts
+                                                .iter()
+                                                .filter(|script| {
+                                                    !scripts.contains(script)
+                                                        || failed_scripts.contains(script)
+                                                })
+                                                .cloned()
+                                                .collect();
+                                            unused_scripts_checked.set(Vec::new());
+                                            if remaining.is_empty() {
+                                                // 全部删除完成：关闭对话框并继续打包/导出。
+                                                unused_scripts_prompt.set(None);
+                                                perform_apk_operation(
+                                                        &directory,
+                                                        operation,
+                                                        loading,
+                                                        load_progress,
+                                                        progress_counter,
+                                                        apk_status,
+                                                        load_error,
+                                                        workspace_files,
+                                                    )
+                                                    .await;
+                                                if !failed_scripts.is_empty() {
+                                                    let failed = failed_scripts.len();
+                                                    apk_status
+                                                        .with_mut(|status| {
+                                                            *status = format!(
+                                                                "{status}（有 {failed} 个脚本副本删除失败）",
+                                                            );
+                                                        });
+                                                }
+                                            } else {
+                                                // 未删完：停留在对话框等待用户处理；全部删完或点「继续」才执行打包/导出。
+                                                let deleted = all_scripts.len() - remaining.len();
+                                                let note = if failed_scripts.is_empty() {
+                                                    format!(
+                                                        "已删除 {deleted} 个脚本副本，还有 {} 个未删除；可继续选择删除，或点「继续」直接打包/导出",
+                                                        remaining.len(),
+                                                    )
+                                                } else {
+                                                    format!(
+                                                        "已删除 {deleted} 个脚本副本（有 {} 个删除失败），还有 {} 个未删除；可继续选择删除，或点「继续」直接打包/导出",
+                                                        failed_scripts.len(),
+                                                        remaining.len(),
+                                                    )
+                                                };
+                                                apk_status.set(note);
+                                                unused_scripts_prompt.set(Some((remaining, operation)));
+                                            }
+                                        });
+                                    },
+                                    "删除"
+                                }
+                                button {
+                                    class: "event-save",
+                                    r#type: "button",
+                                    disabled: file_op_busy,
+                                    onclick: move |_| {
+                                        let mut unused_scripts_prompt = unused_scripts_prompt;
+                                        unused_scripts_prompt.set(None);
+                                        let Some(directory) = work_directory.read().clone() else {
+                                            return;
+                                        };
+                                        let operation = pending_operation.clone();
+                                        spawn(async move {
+                                            perform_apk_operation(
+                                                    &directory,
+                                                    operation,
+                                                    loading,
+                                                    load_progress,
+                                                    progress_counter,
+                                                    apk_status,
+                                                    load_error,
+                                                    workspace_files,
+                                                )
+                                                .await;
+                                        });
+                                    },
+                                    "继续"
+                                }
+                                button {
+                                    class: "event-revert",
+                                    r#type: "button",
+                                    disabled: file_op_busy,
+                                    onclick: move |_| {
+                                        let mut unused_scripts_prompt = unused_scripts_prompt;
+                                        unused_scripts_prompt.set(None);
+                                    },
+                                    "取消"
+                                }
+                            }
                         }
                     }
                 }

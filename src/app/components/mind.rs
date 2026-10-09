@@ -204,6 +204,51 @@ fn mission_event_file(mission_event: &str, name: &str) -> String {
     }
 }
 
+/// 画布卡片剪贴板：跨标签页可用。图标数据随剪贴板携带，
+/// 粘贴到其它画布时按 image_name 匹配已有图标，缺失时并入目标画布图标库。
+#[derive(Clone, PartialEq, Debug)]
+pub struct MindClipboard {
+    pub text: String,
+    pub image_name: String,
+    pub icon_name: String,
+    pub icon_data_url: String,
+    pub ai: i32,
+    pub event_file: String,
+    pub missions_root: String,
+}
+
+/// 「粘贴事件」的新脚本名：在原文件名主干后追加递增计数（从 0 开始取第一个
+/// 不冲突的名字），扩展名保持不变。例：事件脚本.txt → 事件脚本0.txt → 事件脚本1.txt。
+fn next_numbered_script_name(original: &str, is_taken: impl Fn(&str) -> bool) -> String {
+    let (stem, extension) = match original.rsplit_once('.') {
+        Some((stem, extension)) if !stem.is_empty() => {
+            (stem.to_string(), format!(".{extension}"))
+        }
+        _ => (original.to_string(), String::new()),
+    };
+    let mut index = 0_u64;
+    loop {
+        let candidate = format!("{stem}{index}{extension}");
+        if !is_taken(&candidate) {
+            return candidate;
+        }
+        index += 1;
+    }
+}
+
+/// 「粘贴国策」的新标题：保留来源标题并追加递增计数（从 0 开始取第一个未占用的标题）。
+/// 例：「甲」→「甲0」→「甲1」；与事件脚本的计数命名（`甲0.txt`）对齐。
+fn next_numbered_title(original: &str, is_taken: impl Fn(&str) -> bool) -> String {
+    let mut index = 0_u64;
+    loop {
+        let candidate = format!("{original}{index}");
+        if !is_taken(&candidate) {
+            return candidate;
+        }
+        index += 1;
+    }
+}
+
 /// 保存时把引用旧节点编号的 ID 列表重映射为新的节点下标；引用了已删除节点的
 /// 条目被丢弃，重映射后为空时返回 `None`（不产生空数组字段）。
 fn remap_id_list(ids: Option<&[i64]>, remap: &HashMap<i64, i64>) -> Option<Vec<i64>> {
@@ -396,6 +441,11 @@ pub fn MindMapCanvas(
     missions_root: String,
     // 工作区现有事件脚本的相对路径（判断「空国策」并提供 新建事件 / 链接事件）。
     event_files: Shared<Vec<String>>,
+    // 画布卡片剪贴板（跨标签页复制/粘贴）。
+    clipboard: Signal<Option<MindClipboard>>,
+    // 「粘贴国策+事件」/「粘贴事件」：把源事件脚本复制到目标资源根下的新脚本
+    // （source_root, source_file, target_root, target_file）。
+    on_copy_event_script: EventHandler<(String, String, String, String)>,
     active_tab_id: Signal<Option<String>>,
     tab_id: String,
     on_save: EventHandler<Vec<MissionRecord>>,
@@ -440,6 +490,8 @@ pub fn MindMapCanvas(
     let mut icon_picker_open = use_signal(|| false);
     // 「链接事件」选择器：为没有事件的空国策列出本资源根下现有的事件脚本。
     let mut linking_event_open = use_signal(|| false);
+    // 「粘贴」子菜单：空白位置 = 粘贴国策 / 粘贴国策+事件；国策上 = 粘贴国策 / 粘贴事件（只应用到该卡）。
+    let mut paste_open = use_signal(|| false);
     let mut editing_node = use_signal(|| None::<usize>);
     let mut confirming_delete = use_signal(|| None::<usize>);
     let mut new_node_column = use_signal(|| 0_u32);
@@ -853,6 +905,7 @@ pub fn MindMapCanvas(
         selected_icon.set(0);
         icon_picker_open.set(false);
         linking_event_open.set(false);
+        paste_open.set(false);
         editing_node.set(None);
         confirming_delete.set(None);
         new_node_column.set(column);
@@ -870,10 +923,170 @@ pub fn MindMapCanvas(
         new_node_text.set("新国策".to_string());
         icon_picker_open.set(false);
         linking_event_open.set(false);
+        paste_open.set(false);
         editing_node.set(None);
         confirming_delete.set(None);
         context_menu.set(Some((screen_x, screen_y, Some(node_id))));
     });
+
+    // 画布粘贴（两个菜单的「粘贴国策」与空白菜单的「粘贴国策+事件」共用）：
+    // 只用剪贴板的图标新建一张国策——标题按「来源标题+递增计数」命名（如 甲 → 甲0 → 甲1），
+    // 不复制来源的 AI 与事件引用；`with_event = true`（粘贴国策+事件）再把来源事件脚本
+    // 复制为带计数的新文件供新卡使用。
+    // 注 1：闭包内对信号先重绑定为 mut 局部，保持整体为 Fn 以便多个按钮复用。
+    // 注 2：本闭包按值捕获资源根与事件脚本清单的克隆，后续代码仍使用原绑定。
+    let paste_event_files = event_files.clone();
+    let paste_missions_root = missions_root.clone();
+    // 卡片菜单「粘贴事件」的独立克隆（上面的克隆已移入粘贴闭包）。
+    let paste_event_files_for_node = paste_event_files.clone();
+    let paste_missions_root_for_node = paste_missions_root.clone();
+    let paste_from_clipboard = move |with_event: bool| {
+        let Some(clip) = clipboard.read().clone() else {
+            return;
+        };
+        let mut icons = icons;
+        let mut state = state;
+        let mut context_menu = context_menu;
+        let mut paste_open = paste_open;
+        // 标题与事件脚本共用同一套编号占用判断：编号被现有国策标题占用、
+        // 或该编号的事件脚本已存在，都算已占用——保证粘贴标题的计数连续，
+        // 且「粘贴国策+事件」的脚本编号与标题对齐（甲1 ↔ 甲1.txt）。
+        let prefix = format!("{paste_missions_root}/missionsEvents/");
+        let (text, event_file) = {
+            let current = state.peek();
+            let is_taken = |stem: &str| {
+                current.nodes.iter().any(|node| node.text == stem)
+                    || paste_event_files
+                        .iter()
+                        .any(|existing| existing == &format!("{prefix}{stem}.txt"))
+            };
+            // 新卡的事件脚本：默认不关联（保存时按「<标题>.txt」回退），
+            // 仅「粘贴国策+事件」指向复制出来的编号副本。
+            let event_file = if with_event {
+                next_numbered_script_name(&clip.event_file, |candidate| {
+                    is_taken(candidate.strip_suffix(".txt").unwrap_or(candidate))
+                })
+            } else {
+                String::new()
+            };
+            let base_title = if clip.text.trim().is_empty() {
+                "新国策".to_string()
+            } else {
+                clip.text.clone()
+            };
+            (next_numbered_title(&base_title, &is_taken), event_file)
+        };
+        // 图标：优先匹配本画布已载入的图标；跨标签页粘贴时把剪贴板图标并入本画布。
+        let mut icon_index = icons
+            .read()
+            .iter()
+            .position(|icon| format!("{}.png", icon.name) == clip.image_name)
+            .unwrap_or(usize::MAX);
+        if icon_index == usize::MAX && !clip.image_name.is_empty() && !clip.icon_data_url.is_empty()
+        {
+            let mut own = icons.write();
+            own.push(FocusIcon {
+                name: clip.icon_name.clone(),
+                data_url: clip.icon_data_url.clone(),
+            });
+            icon_index = own.len() - 1;
+        }
+        commit_history();
+        {
+            let mut current = state.write();
+            let id = current
+                .nodes
+                .iter()
+                .map(|node| node.id)
+                .max()
+                .map_or(0, |id| id + 1);
+            let (column, row) = nearest_free_grid_position(
+                &current.nodes,
+                *new_node_column.read(),
+                *new_node_row.read(),
+                None,
+            );
+            current.nodes.push(MindNode {
+                id,
+                // 标题保留来源 + 递增计数；不复制来源的 AI 权重。
+                text,
+                image_name: clip.image_name.clone(),
+                mission_event: event_file.clone(),
+                icon_index,
+                tree_column: column,
+                tree_row: row,
+                ai: 100,
+                children: Vec::new(),
+                // 粘贴的新卡片默认沿用标量写法（与新建卡片一致）。
+                scalar_style: true,
+                required_missions: None,
+                required_missions_or: None,
+                required_missions_or2: None,
+                required_missions_or3: None,
+                mutually_exclusive_missions: None,
+                extra: BTreeMap::new(),
+            });
+            current.connecting_from = None;
+        }
+        paste_open.set(false);
+        context_menu.set(None);
+        if with_event {
+            on_copy_event_script.call((
+                clip.missions_root.clone(),
+                clip.event_file.clone(),
+                paste_missions_root.clone(),
+                event_file,
+            ));
+        }
+    };
+    // 粘贴选项分别绑定到不同菜单按钮（闭包整体为 Fn，克隆后各自持有）。
+    let paste_policy_only = {
+        let paste = paste_from_clipboard.clone();
+        move || paste(false)
+    };
+    let paste_policy_with_event = {
+        let paste = paste_from_clipboard.clone();
+        move || paste(true)
+    };
+    // 「粘贴国策」在两个菜单都要用：再克隆一份供卡片菜单绑定。
+    let paste_policy_only_for_card = paste_policy_only.clone();
+
+    // 卡片菜单「粘贴事件」：只处理事件——把剪贴板来源脚本另存为带计数的新文件，
+    // 并应用到右键的那张国策（图标与标题不变）。源脚本不存在时不改动卡片，
+    // 复制请求照常发出（Work 端会在状态栏提示「源脚本不存在」）。
+    let paste_event_onto_node = move |node_id: usize| {
+        let Some(clip) = clipboard.read().clone() else {
+            return;
+        };
+        let prefix = format!("{paste_missions_root_for_node}/missionsEvents/");
+        let event_file = next_numbered_script_name(&clip.event_file, |candidate| {
+            paste_event_files_for_node
+                .iter()
+                .any(|existing| existing == &format!("{prefix}{candidate}"))
+        });
+        let source_path = format!("{}/missionsEvents/{}", clip.missions_root, clip.event_file);
+        let source_exists = paste_event_files_for_node
+            .iter()
+            .any(|existing| existing == &source_path);
+        let mut state = state;
+        let mut context_menu = context_menu;
+        let mut paste_open = paste_open;
+        if source_exists {
+            commit_history();
+            let mut current = state.write();
+            if let Some(node) = current.node_mut(node_id) {
+                node.mission_event = event_file.clone();
+            }
+        }
+        paste_open.set(false);
+        context_menu.set(None);
+        on_copy_event_script.call((
+            clip.missions_root.clone(),
+            clip.event_file.clone(),
+            paste_missions_root_for_node.clone(),
+            event_file,
+        ));
+    };
 
     let on_wheel = move |evt: Event<WheelData>| {
         let position = evt.client_coordinates();
@@ -1029,8 +1242,12 @@ pub fn MindMapCanvas(
         Vec::new()
     };
     let editing_node_id = *editing_node.read();
+    let paste_open_snapshot = *paste_open.read();
     let menu_max_height = if picker_open || linking_open {
         344
+    } else if paste_open_snapshot {
+        // 粘贴子菜单：返回 + 粘贴选项（两个菜单均 2 项，或空剪贴板提示）。
+        150
     } else if editing_node_id.is_some() {
         150
     } else if matches!(menu_position, Some((_, _, Some(_)))) {
@@ -1041,10 +1258,16 @@ pub fn MindMapCanvas(
             210
         }
     } else {
-        52
+        // 画布菜单：创建国策 + 粘贴。
+        86
     };
     let menu_vertical_offset = menu_max_height + 16;
     let is_connecting = state.read().connecting_from.is_some();
+    // 卡片菜单「复制」按钮按值捕获资源根，需独立克隆（粘贴闭包已持有自己的克隆）。
+    let copy_missions_root = missions_root.clone();
+    // 「保存标题」改名时检查旧脚本存在性（避免对无事件的国策报无意义的改名失败）的克隆。
+    let rename_event_files = event_files.clone();
+    let rename_missions_root = missions_root.clone();
     // 本组件不再自管撤销历史：所有编辑操作已注册到 Work 的全局撤销栈。
 
     let grid_x = -pan_x - GRID_COLUMN_STEP;
@@ -1124,7 +1347,7 @@ pub fn MindMapCanvas(
                     role: "status",
                     // 连接提示同样浮在所有面板之上，避免被资源管理器遮住。
                     style: "position: absolute; top: 12px; left: 12px; z-index: 25; display: flex; align-items: center; gap: 10px; padding: 8px 10px; background: white; border: 1px solid #80a6e6; border-radius: 6px; box-shadow: 0 2px 8px rgba(71, 98, 145, 0.12);",
-                    span { "连接模式：点击另一张卡片完成连线" }
+                    span { "连接模式：点击另一张国策完成连线" }
                     button {
                         r#type: "button",
                         onclick: move |_| state.write().connecting_from = None,
@@ -1147,7 +1370,7 @@ pub fn MindMapCanvas(
                         }
                         input {
                             value: "{node_text}",
-                            placeholder: "卡片标题（仅用于识别）",
+                            placeholder: "国策标题（仅用于识别）",
                             style: "width: 100%; min-width: 0; box-sizing: border-box;",
                             oninput: move |evt: FormEvent| new_node_text.set(evt.value()),
                         }
@@ -1296,10 +1519,49 @@ pub fn MindMapCanvas(
                                 }
                             }
                         }
+                    } else if paste_open_snapshot {
+                        button {
+                            r#type: "button",
+                            onclick: move |_| paste_open.set(false),
+                            "返回"
+                        }
+                        if clipboard.read().is_none() {
+                            span { style: "padding: 6px 4px; font-size: 11px; line-height: 1.4; text-align: center; opacity: 0.75;",
+                                "剪贴板为空：先右键国策选择「复制」"
+                            }
+                        } else if let Some(node_id) = target_node {
+                            // 卡片菜单：粘贴国策（只贴图标）/ 粘贴事件（只把事件复制粘贴到该卡）。
+                            button {
+                                r#type: "button",
+                                title: "只粘贴图标：以「来源标题+计数」新建一张国策（不关联事件）",
+                                onclick: move |_| paste_policy_only_for_card(),
+                                "粘贴国策"
+                            }
+                            button {
+                                r#type: "button",
+                                title: "把复制的事件脚本另存为带计数的新文件，并应用到这张国策（不涉及图标）",
+                                onclick: move |_| paste_event_onto_node(node_id),
+                                "粘贴事件"
+                            }
+                        } else {
+                            // 空白菜单：在点击位置新建国策。
+                            button {
+                                r#type: "button",
+                                title: "只粘贴图标：以「来源标题+计数」新建一张国策（不关联事件）",
+                                onclick: move |_| paste_policy_only(),
+                                "粘贴国策"
+                            }
+                            button {
+                                r#type: "button",
+                                title: "以「来源标题+计数」新建国策，并把事件脚本复制为带计数的新文件",
+                                onclick: move |_| paste_policy_with_event(),
+                                "粘贴国策+事件"
+                            }
+                        }
                     } else if let Some(edit_node_id) = editing_node_id {
                         input {
                             value: "{node_text}",
-                            placeholder: "卡片标题",
+                            placeholder: "国策标题",
                             style: "width: 100%; min-width: 0; box-sizing: border-box;",
                             oninput: move |evt: FormEvent| new_node_text.set(evt.value()),
                         }
@@ -1321,11 +1583,21 @@ pub fn MindMapCanvas(
                                                 node.text = text.clone();
                                                 node.mission_event = new_event_file.clone();
                                             }
-                                            on_rename_event_file
-                                                .call((
-                                                    mission_event_file(&old_event_file, &old_text),
-                                                    new_event_file,
-                                                ));
+                                            // 仅当旧脚本确实存在时才请求改名：对无事件的国策
+                                            //（如刚粘贴的图标卡）避免报出无意义的改名失败提示。
+                                            let old_file = mission_event_file(&old_event_file, &old_text);
+                                            let old_script_exists = rename_event_files
+                                                .iter()
+                                                .any(|existing| {
+                                                    existing
+                                                        == &format!(
+                                                            "{rename_missions_root}/missionsEvents/{old_file}",
+                                                        )
+                                                });
+                                            if old_script_exists {
+                                                on_rename_event_file
+                                                    .call((old_file, new_event_file));
+                                            }
                                         }
                                     }
                                 }
@@ -1359,7 +1631,7 @@ pub fn MindMapCanvas(
                                 confirming_delete.set(None);
                                 context_menu.set(None);
                             },
-                            "删除卡片"
+                            "删除国策"
                         }
                         // 仅删除事件脚本文件：保留卡片（卡片仍指向同名脚本）。
                         button {
@@ -1467,6 +1739,11 @@ pub fn MindMapCanvas(
                         }
                         button {
                             r#type: "button",
+                            onclick: move |_| paste_open.set(true),
+                            "粘贴"
+                        }
+                        button {
+                            r#type: "button",
                             onclick: move |_| {
                                 let mut current = state.write();
                                 current.connecting_from = Some(parent_id);
@@ -1478,7 +1755,7 @@ pub fn MindMapCanvas(
                         button {
                             r#type: "button",
                             disabled: !target_has_edges,
-                            title: "断开该卡片与其它卡片之间的全部依赖线，使其成为独立卡片",
+                            title: "断开该国策与其它国策之间的全部依赖线，使其成为独立国策",
                             onclick: move |_| {
                                 commit_history();
                                 let mut current = state.write();
@@ -1495,6 +1772,35 @@ pub fn MindMapCanvas(
                         }
                         button {
                             r#type: "button",
+                            title: "复制国策（含事件引用），供「粘贴」使用",
+                            onclick: move |_| {
+                                if let Some(node) = state.read().node(parent_id) {
+                                    let icon = icons.read().get(node.icon_index).cloned();
+                                    let mut clipboard = clipboard;
+                                    clipboard
+                                        .set(
+                                            Some(MindClipboard {
+                                                text: node.text.clone(),
+                                                image_name: node.image_name.clone(),
+                                                icon_name: icon
+                                                    .as_ref()
+                                                    .map(|icon| icon.name.clone())
+                                                    .unwrap_or_default(),
+                                                icon_data_url: icon
+                                                    .map(|icon| icon.data_url)
+                                                    .unwrap_or_default(),
+                                                ai: node.ai,
+                                                event_file: mission_event_file(&node.mission_event, &node.text),
+                                                missions_root: copy_missions_root.clone(),
+                                            }),
+                                        );
+                                }
+                                context_menu.set(None);
+                            },
+                            "复制"
+                        }
+                        button {
+                            r#type: "button",
                             onclick: move |_| {
                                 confirming_delete.set(Some(parent_id));
                             },
@@ -1507,6 +1813,11 @@ pub fn MindMapCanvas(
                                 icon_picker_open.set(true);
                             },
                             "创建国策"
+                        }
+                        button {
+                            r#type: "button",
+                            onclick: move |_| paste_open.set(true),
+                            "粘贴"
                         }
                     }
                 }
@@ -1701,5 +2012,33 @@ mod tests {
         assert_eq!(remap_id_list(Some(&[0, 1, 2][..]), &remap), Some(vec![0, 1]));
         assert_eq!(remap_id_list(Some(&[1][..]), &remap), None);
         assert_eq!(remap_id_list(None, &remap), None);
+    }
+
+    #[test]
+    fn paste_event_script_name_counts_from_zero() {
+        // 无冲突：事件脚本.txt → 事件脚本0.txt（首次粘贴）。
+        assert_eq!(next_numbered_script_name("事件脚本.txt", |_| false), "事件脚本0.txt");
+        // 已有 0、1：跳过占用，继续递增（第二次贴给 1 的例子对应只占用 0 的情形）。
+        let taken = ["事件脚本0.txt".to_string()];
+        assert_eq!(
+            next_numbered_script_name("事件脚本.txt", |name| taken.iter().any(|item| item == name)),
+            "事件脚本1.txt"
+        );
+        // 无扩展名 / 多点名称：只在主干后追加计数。
+        assert_eq!(next_numbered_script_name("script", |_| false), "script0");
+        assert_eq!(next_numbered_script_name("a.b.txt", |_| false), "a.b0.txt");
+    }
+
+    #[test]
+    fn paste_policy_title_keeps_source_and_counts() {
+        // 保留来源标题并追加计数：甲 → 甲0；再次粘贴（甲0 已占用）→ 甲1。
+        assert_eq!(next_numbered_title("甲", |_| false), "甲0");
+        let taken = ["甲0".to_string()];
+        assert_eq!(
+            next_numbered_title("甲", |name| taken.iter().any(|item| item == name)),
+            "甲1"
+        );
+        // 标题不拆分扩展名：带点 / 带数字的来源标题原样保留后再追加计数。
+        assert_eq!(next_numbered_title("甲v1.0", |_| false), "甲v1.00");
     }
 }

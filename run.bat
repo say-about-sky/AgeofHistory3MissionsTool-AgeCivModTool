@@ -1,12 +1,12 @@
-@REM  桌面窗口调试（默认）
-@REM  启动 Tauri 桌面窗口（自动运行 dx serve，端口 1420），前端改动热重载
-@REM  cargo tauri dev
-
 @REM  只打开web链接调试
 @REM  不启动桌面窗口，仅运行 Dioxus 开发服务器，浏览器打开 http://localhost:1420
 @REM  手机等局域网设备可访问 http://本机IP:1420（需放行防火墙 1420 端口）
 @REM  注意：纯浏览器环境没有 __TAURI__，文件读写/系统对话框等不可用，仅适合调试界面
 @REM  dx serve --addr 0.0.0.0 --port 1420 --interactive false
+
+@REM  桌面窗口调试
+@REM  启动 Tauri 桌面窗口（自动运行 dx serve，端口 1420），前端改动热重载
+@REM  cargo tauri dev
 
 @REM  前端检查（WASM 目标）
 @REM  cargo check --target wasm32-unknown-unknown

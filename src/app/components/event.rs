@@ -311,6 +311,9 @@ pub fn EventPanel(
 	let mut event_images = use_signal(|| Shared::new(Vec::<String>::new()));
 	let mut event_events = use_signal(|| Shared::new(Vec::<String>::new()));
 	let mut event_music = use_signal(|| Shared::new(Vec::<String>::new()));
+	// 逆向补全批次：统治者头像（add_ruler 第三段）与剧情特殊联盟名称。
+	let mut event_ruler_images = use_signal(|| Shared::new(Vec::<String>::new()));
+	let mut event_alliance_specials = use_signal(|| Shared::new(Vec::<String>::new()));
 	let mut assets_loaded_key = use_signal(|| None::<String>);
 	let mut assets_generation = use_signal(|| 0_u64);
 	let directory_for_assets = work_directory.clone();
@@ -347,6 +350,8 @@ pub fn EventPanel(
 			event_images.set(Shared::new(loaded.images));
 			event_events.set(Shared::new(loaded.events));
 			event_music.set(Shared::new(loaded.music));
+			event_ruler_images.set(Shared::new(loaded.ruler_images));
+			event_alliance_specials.set(Shared::new(loaded.alliance_specials));
 		});
 	});
 
@@ -576,6 +581,8 @@ pub fn EventPanel(
                             images: event_images.read().clone(),
                             events: event_events.read().clone(),
                             music: event_music.read().clone(),
+                            ruler_images: event_ruler_images.read().clone(),
+                            alliance_specials: event_alliance_specials.read().clone(),
                         }
                     } else if busy_now {
                         div { class: "event-grid-empty", "正在读取..." }

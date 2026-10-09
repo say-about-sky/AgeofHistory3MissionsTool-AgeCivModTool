@@ -62,7 +62,7 @@ const NATIONAL_SPIRIT_FILE: &str = "NationalSpirit.json";
 const TECHNOLOGIES_FILE: &str = "technologies/Technologies.json";
 /// 宗教定义（数组顺序即宗教 ID）。
 const RELIGIONS_FILE: &str = "Religions.json";
-/// 资源定义（`Name:` + `ID:` 行，供 `resource_price_change` 系列补全）。
+/// 资源定义（`Name:` + `ID:` 行，供 `price_change` 系列补全）。
 const RESOURCES_FILE: &str = "resources/Resources.json";
 /// 人物定义目录（`*.json` 含 `Name:`）。
 const CHARACTERS_DIR: &str = "characters";
@@ -70,6 +70,12 @@ const CHARACTERS_DIR: &str = "characters";
 const ROOT_BUNDLE_CN: &str = "languages/Bundle_cn_sp.properties";
 /// 根语言表（默认语言兜底）。
 const ROOT_BUNDLE: &str = "languages/Bundle.properties";
+/// 法令表（`Law` 数组顺序即组号，组内 `Law` 数组顺序即选项号；供 `change_law` 补全）。
+const LAWS_FILE: &str = "laws/Laws.json";
+/// 决议表（宽松 JSON，位于 assets 源下；供 `add_decision` / `taking_decision` 等补全）。
+const DECISIONS_FILE: &str = "rainfall/rfEvent_decision.json";
+/// 兵种索引（`Army:[{File, ID}]`；型号名为各兵种文件 `Army:[{Name}]` 的数组顺序；供 `add_new_army`）。
+const UNITS_FILE: &str = "units/Units.json";
 
 // ===== 移植：ScvGen lib.rs 基础解析 =====
 
@@ -119,6 +125,16 @@ pub fn parse_translations(content: &str) -> HashMap<String, String> {
         map.insert(key.to_string(), v.trim().to_string());
     }
     map
+}
+
+/// 用语言表把游戏内名称翻成显示名：命中且非空时用译文，否则保留原始名称
+/// （模组数据可能已是中文、或语言包没有对应键——都按原样展示）。
+fn translated_name(name: &str, translations: &HashMap<String, String>) -> String {
+    translations
+        .get(name)
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .unwrap_or_else(|| name.to_string())
 }
 
 /// 宽松 JSON 解析器（移植自 `parse_loose_json`）：
@@ -284,7 +300,8 @@ pub struct GovernmentEntry {
 /// 紧随其后的 `Extra_Tag:` 作为标记；没有 `Extra_Tag:` 的条目也照常保留（tag 为空），
 /// 避免跳过条目导致后续编号整体前移（旧版与上游 ScvGen 一致，会覆盖式丢弃这类条目）。
 /// 兼容带引号键写法（`"Name":` / `"Extra_Tag":`）与键名大小写差异（`name:` 等）。
-pub fn parse_governments(text: &str) -> Vec<GovernmentEntry> {
+/// `translations` 为根语言包（无对照时保留原始名称，如英文键 `Democracy` → `民主制`）。
+pub fn parse_governments(text: &str, translations: &HashMap<String, String>) -> Vec<GovernmentEntry> {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut entries: Vec<GovernmentEntry> = Vec::new();
     let mut current_name: Option<String> = None;
@@ -298,7 +315,7 @@ pub fn parse_governments(text: &str) -> Vec<GovernmentEntry> {
                     tag: String::new(),
                 });
             }
-            current_name = Some(name);
+            current_name = Some(translated_name(&name, translations));
         } else if let Some(tag) = line_scalar_field(line, "Extra_Tag") {
             if let Some(name) = current_name.take() {
                 entries.push(GovernmentEntry {
@@ -342,7 +359,7 @@ pub fn governments_csv(entries: &[GovernmentEntry]) -> String {
 pub fn generate_gov(input_path: &Path, output_path: &Path) -> Result<Vec<String>, String> {
     let text = fs::read_to_string(input_path)
         .map_err(|e| format!("读取 {} 失败: {e}", input_path.display()))?;
-    let entries = parse_governments(&text);
+    let entries = parse_governments(&text, &HashMap::new());
     fs::write(output_path, governments_csv(&entries))
         .map_err(|e| format!("写入 {} 失败: {e}", output_path.display()))?;
     Ok(vec![format!("共 {} 条记录", entries.len())])
@@ -619,27 +636,31 @@ pub fn parse_city_names(text: &str) -> Vec<(u32, String)> {
 }
 
 /// 解析 `buildings/Buildings.json`：`Name:` 数组按出现顺序即建筑 ID
-/// （数组内为各等级名称，用 `/` 拼接展示）。
-pub fn parse_buildings(text: &str) -> Vec<BuildingEntry> {
+/// （数组内为各等级名称，用 `/` 拼接展示；各段先经语言表翻译，无对照保留原名）。
+pub fn parse_buildings(text: &str, translations: &HashMap<String, String>) -> Vec<BuildingEntry> {
     scan_key_values(text, "Name")
         .into_iter()
         .enumerate()
         .filter(|(_, names)| !names.is_empty())
         .map(|(index, names)| BuildingEntry {
             id: index as u32,
-            name: names.join("/"),
+            name: names
+                .iter()
+                .map(|level| translated_name(level, translations))
+                .collect::<Vec<_>>()
+                .join("/"),
         })
         .collect()
 }
 
-/// 解析 `diseases/Diseases.json`：`Name:` 按出现顺序即疾病 ID；显示名优先中译。
+/// 解析 `diseases/Diseases.json`：`Name:` 按出现顺序即疾病 ID；显示名优先中译（无对照保留原名）。
 pub fn parse_diseases(text: &str, translations: &HashMap<String, String>) -> Vec<DiseaseEntry> {
     scan_key_values(text, "Name")
         .into_iter()
         .enumerate()
         .filter_map(|(index, names)| {
             let raw = names.into_iter().next()?;
-            let name = translations.get(&raw).cloned().unwrap_or(raw);
+            let name = translated_name(&raw, translations);
             Some(DiseaseEntry {
                 id: index as u32,
                 name,
@@ -681,8 +702,9 @@ fn line_scalar_field(line: &str, key: &str) -> Option<String> {
 }
 
 /// 解析 `NationalSpirit.json`：宽松 JSON 的 `"id"` + `"name"` 成对提取
-/// （`id` 为字符串如 `fra1`；`desc` / `Bonuses` 等行不会干扰）。
-pub fn parse_national_spirits(text: &str) -> Vec<IdTextNameEntry> {
+/// （`id` 为字符串如 `fra1`；`desc` / `Bonuses` 等行不会干扰）；
+/// `name` 先经语言表翻译，无对照保留原字段。
+pub fn parse_national_spirits(text: &str, translations: &HashMap<String, String>) -> Vec<IdTextNameEntry> {
     let mut entries = Vec::new();
     let mut pending_id: Option<String> = None;
     for line in text.lines() {
@@ -691,7 +713,10 @@ pub fn parse_national_spirits(text: &str) -> Vec<IdTextNameEntry> {
             pending_id = Some(id);
         } else if let Some(name) = line_scalar_field(line, "name") {
             if let Some(id) = pending_id.take() {
-                entries.push(IdTextNameEntry { id, name });
+                entries.push(IdTextNameEntry {
+                    id,
+                    name: translated_name(&name, translations),
+                });
             }
         }
     }
@@ -700,8 +725,8 @@ pub fn parse_national_spirits(text: &str) -> Vec<IdTextNameEntry> {
 
 /// 解析「`Name:` + `ID:`」配对的数据表（两种字段顺序都支持：
 /// `Technologies.json` 为先 `ID` 后 `Name`，`Resources.json` 为先 `Name` 后 `ID`）。
-/// 输出按 `id` 升序。
-pub fn parse_id_name_table(text: &str) -> Vec<IdNameEntry> {
+/// `Name` 先经语言表翻译（英文键 → 中译；无对照保留原字段）。输出按 `id` 升序。
+pub fn parse_id_name_table(text: &str, translations: &HashMap<String, String>) -> Vec<IdNameEntry> {
     let mut entries: Vec<IdNameEntry> = Vec::new();
     let mut pending_id: Option<u32> = None;
     let mut pending_name: Option<String> = None;
@@ -715,9 +740,10 @@ pub fn parse_id_name_table(text: &str) -> Vec<IdNameEntry> {
         // 注意：不能在 if-let 的元组里直接 `.take()`（匹配失败也会取走值），
         // 必须先判空再取。
         if pending_id.is_some() && pending_name.is_some() {
+            let name = translated_name(&pending_name.take().unwrap(), translations);
             entries.push(IdNameEntry {
                 id: pending_id.take().unwrap(),
-                name: pending_name.take().unwrap(),
+                name,
             });
         }
     }
@@ -725,18 +751,339 @@ pub fn parse_id_name_table(text: &str) -> Vec<IdNameEntry> {
     entries
 }
 
-/// 解析「数组顺序即 ID」的 `Name:` 清单（如 `Religions.json`；名称为裸词或字符串）。
-pub fn parse_ordered_names(text: &str) -> Vec<IdNameEntry> {
+/// 解析「数组顺序即 ID」的 `Name:` 清单（如 `Religions.json`；名称为裸词或字符串）；
+/// `Name` 先经语言表翻译（如 `Catholic` → `天主教`；无对照保留原名）。
+pub fn parse_ordered_names(text: &str, translations: &HashMap<String, String>) -> Vec<IdNameEntry> {
     let mut entries = Vec::new();
     for line in text.lines() {
         if let Some(name) = line_scalar_field(line.trim(), "Name") {
             entries.push(IdNameEntry {
                 id: entries.len() as u32,
-                name,
+                name: translated_name(&name, translations),
             });
         }
     }
     entries
+}
+
+/// 法令组条目（`laws/Laws.json` 数组顺序即组号；组内 `Law` 数组顺序即选项编号）。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct LawEntry {
+    pub title: String,
+    pub options: Vec<String>,
+}
+
+/// 决议条目（`rainfall/rfEvent_decision.json`；`id` 为脚本取值、`events` 供复合键补全）。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DecisionEntry {
+    pub id: String,
+    pub name: String,
+    pub events: Vec<String>,
+}
+
+// ===== 宽松 JSON 逐字扫描（决议 / 法令 / 大洲 / 特殊联盟；引擎源码实证） =====
+
+/// 读取 `text[start..]` 处的双引号字符串（尊重 `\` 转义，被转义字符原样保留，
+/// 与 [`parse_quoted_strings`] 的既有约定一致）。返回（内容，闭合引号后的下标）。
+fn read_quoted_at(text: &str, start: usize) -> Option<(String, usize)> {
+    if text.as_bytes().get(start) != Some(&b'"') {
+        return None;
+    }
+    let mut value = String::new();
+    let mut chars = text[start + 1..].char_indices();
+    while let Some((offset, c)) = chars.next() {
+        match c {
+            '\\' => {
+                if let Some((_, escaped)) = chars.next() {
+                    value.push(escaped);
+                }
+            }
+            '"' => return Some((value, start + offset + 2)),
+            _ => value.push(c),
+        }
+    }
+    None
+}
+
+/// 读取 `start` 处（先跳过空白）的值：`"字符串"` 单元素；`[…]` 数组逐元素
+/// （字符串元素取引号内容、裸元素取到分隔符）；其余为裸标量（到 `,` `}` `]` 或换行）。
+/// 返回（值列表，结束下标）。
+fn read_value_at(text: &str, start: usize) -> (Vec<String>, usize) {
+    let bytes = text.as_bytes();
+    let mut index = start;
+    while index < bytes.len() && (bytes[index] as char).is_ascii_whitespace() {
+        index += 1;
+    }
+    if index >= bytes.len() {
+        return (Vec::new(), index);
+    }
+    match bytes[index] {
+        b'"' => match read_quoted_at(text, index) {
+            Some((value, next)) => (vec![value], next),
+            None => (Vec::new(), index + 1),
+        },
+        b'[' => {
+            let mut values = Vec::new();
+            let mut cursor = index + 1;
+            loop {
+                while cursor < bytes.len()
+                    && ((bytes[cursor] as char).is_ascii_whitespace() || bytes[cursor] == b',')
+                {
+                    cursor += 1;
+                }
+                if cursor >= bytes.len() {
+                    return (values, cursor);
+                }
+                if bytes[cursor] == b']' {
+                    return (values, cursor + 1);
+                }
+                if bytes[cursor] == b'"' {
+                    match read_quoted_at(text, cursor) {
+                        Some((value, next)) => {
+                            values.push(value);
+                            cursor = next;
+                        }
+                        None => cursor += 1,
+                    }
+                } else {
+                    let bare_start = cursor;
+                    while cursor < bytes.len()
+                        && ![b',', b']', b'\n', b'\r'].contains(&bytes[cursor])
+                    {
+                        cursor += 1;
+                    }
+                    let value = text[bare_start..cursor].trim();
+                    if !value.is_empty() {
+                        values.push(value.to_string());
+                    }
+                }
+            }
+        }
+        _ => {
+            let bare_start = index;
+            while index < bytes.len() && ![b',', b'}', b']', b'\n', b'\r'].contains(&bytes[index]) {
+                index += 1;
+            }
+            let value = text[bare_start..index].trim();
+            if value.is_empty() {
+                (Vec::new(), index)
+            } else {
+                (vec![value.to_string()], index)
+            }
+        }
+    }
+}
+
+/// 在 `text[from..]` 中查找 `key` 键的词起点（裸键或带引号键；要求独立词边界——
+/// `ImageID` 不会命中 `id`；字符串内容整段跳过，不会在其内部误匹配）。
+fn find_key_start(text: &str, from: usize, key: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut index = from;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'"' {
+            if let Some((word, next)) = read_quoted_at(text, index) {
+                let mut probe = next;
+                while probe < bytes.len() && (bytes[probe] as char).is_ascii_whitespace() {
+                    probe += 1;
+                }
+                if probe < bytes.len() && bytes[probe] == b':' {
+                    if word.eq_ignore_ascii_case(key) {
+                        return Some(index);
+                    }
+                    index = probe + 1;
+                    continue;
+                }
+                index = next;
+                continue;
+            }
+            index += 1;
+            continue;
+        }
+        if byte.is_ascii_alphabetic() || byte == b'_' {
+            let start = index;
+            let mut end = index;
+            while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+                end += 1;
+            }
+            let boundary = start == 0
+                || !(bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_');
+            let mut probe = end;
+            while probe < bytes.len() && (bytes[probe] as char).is_ascii_whitespace() {
+                probe += 1;
+            }
+            if boundary && probe < bytes.len() && bytes[probe] == b':' {
+                if text[start..end].eq_ignore_ascii_case(key) {
+                    return Some(start);
+                }
+                index = probe + 1;
+                continue;
+            }
+            index = end;
+            continue;
+        }
+        index += 1;
+    }
+    None
+}
+
+/// 读取 `key_start` 键的值（跳过键词与 `:` 后交给 [`read_value_at`]）。
+fn key_values_after(text: &str, key_start: usize) -> (Vec<String>, usize) {
+    let bytes = text.as_bytes();
+    let mut index = key_start;
+    while index < bytes.len() && bytes[index] != b':' {
+        index += 1;
+    }
+    if index >= bytes.len() {
+        return (Vec::new(), index);
+    }
+    read_value_at(text, index + 1)
+}
+
+/// 宽松扫描（字符串与转义整段跳过）收集 `key` 键的全部标量值（数组值逐元素展开）。
+fn scan_key_strings(text: &str, key: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut cursor = 0;
+    while let Some(start) = find_key_start(text, cursor, key) {
+        let (mut found, end) = key_values_after(text, start);
+        values.append(&mut found);
+        cursor = end;
+    }
+    values
+}
+
+/// 解析 `laws/Laws.json`：外层 `Law: [ { Title: 组名, Law: [选项…] }, … ]`。
+/// 组数组顺序即组号（`change_law` 首段），组内 `Law` 数组顺序即选项号（次段）。
+pub fn parse_laws(text: &str) -> Vec<LawEntry> {
+    let mut entries = Vec::new();
+    let mut cursor = 0;
+    while let Some(start) = find_key_start(text, cursor, "Title") {
+        let (mut titles, value_end) = key_values_after(text, start);
+        let title = titles.drain(..).next().unwrap_or_default();
+        // 本组范围截至下一个 `Title`：组内首个 `Law` 键即选项数组
+        // （外层包装 `Law:` 在首个 `Title` 之前，不会落入任何组块）。
+        let next = find_key_start(text, value_end, "Title").unwrap_or(text.len());
+        let options = scan_key_strings(&text[value_end..next], "Law");
+        entries.push(LawEntry { title, options });
+        cursor = next;
+    }
+    entries
+}
+
+/// 解析 `<地图>/Continents.json`：`Data` 数组顺序即大洲编号（名称键为 `sName`）。
+/// `id` 保持原数组下标（过滤空名不移位）。
+pub fn parse_continents(text: &str, translations: &HashMap<String, String>) -> Vec<IdNameEntry> {
+    scan_key_strings(text, "sName")
+        .into_iter()
+        .enumerate()
+        .map(|(index, name)| IdNameEntry {
+            id: index as u32,
+            name: translated_name(name.trim(), translations),
+        })
+        .collect()
+}
+
+/// 解析 `rainfall/rfEvent_decision.json`：逐条收集 `id` / `name` / `events`。
+/// 宽松 JSON：键可带引号、对象间可能缺逗号（`desc` / `images` 自动跳过）。
+pub fn parse_decisions(text: &str) -> Vec<DecisionEntry> {
+    let mut entries = Vec::new();
+    let mut cursor = 0;
+    while let Some(start) = find_key_start(text, cursor, "id") {
+        let (mut ids, value_end) = key_values_after(text, start);
+        let id = ids.drain(..).next().unwrap_or_default();
+        let next = find_key_start(text, value_end, "id").unwrap_or(text.len());
+        let chunk = &text[value_end..next];
+        let name = scan_key_strings(chunk, "name")
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+        let events = scan_key_strings(chunk, "events");
+        if !id.is_empty() || !name.is_empty() {
+            entries.push(DecisionEntry { id, name, events });
+        }
+        cursor = next;
+    }
+    entries
+}
+
+/// 解析剧情 `AlliancesSpecial.json` 的 `Name_Alliance` 列表（数组顺序即编号；
+/// `join_alliance_special_id_*` / `leave_alliance_special_id` 取值）。
+pub fn parse_alliance_special_names(text: &str) -> Vec<String> {
+    scan_key_strings(text, "Name_Alliance")
+        .into_iter()
+        .map(|name| name.trim().to_string())
+        .collect()
+}
+
+/// 兵种条目（`units/Units.json` 的 `ID` + 该兵种文件内型号名称表）。
+/// `armies` 的数组顺序即型号 ID（`add_new_army` 的 `兵种ID=型号ID` 对）。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct UnitEntry {
+    pub id: u32,
+    pub name: String,
+    pub armies: Vec<String>,
+}
+
+/// 解析 `units/Units.json` 的 `{File, ID}` 对（保持出现顺序；`Line` 字段忽略）。
+pub fn parse_unit_pairs(text: &str) -> Vec<(u32, String)> {
+    let mut pairs = Vec::new();
+    let mut pending_file: Option<String> = None;
+    let mut pending_id: Option<u32> = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(file) = line_scalar_field(line, "File") {
+            pending_file = Some(file);
+        } else if let Some(id) = line_scalar_field(line, "ID").and_then(|raw| raw.parse::<u32>().ok())
+        {
+            pending_id = Some(id);
+        }
+        // 不能在 if-let 元组里直接 `.take()`（匹配失败也会取走值），先判空再取。
+        if pending_file.is_some() && pending_id.is_some() {
+            pairs.push((pending_id.take().unwrap(), pending_file.take().unwrap()));
+        }
+    }
+    pairs
+}
+
+/// 由 `{File, ID}` 对构建兵种条目：`load_unit_file` 读取兵种文件（相对 `units/`），
+/// 其 `Army:[{Name:…}]` 的数组顺序即型号 ID；名称与型号名经语言表翻译。
+pub fn build_unit_entries(
+    pairs: Vec<(u32, String)>,
+    translations: &HashMap<String, String>,
+    mut load_unit_file: impl FnMut(&str) -> Option<String>,
+) -> Vec<UnitEntry> {
+    pairs
+        .into_iter()
+        .map(|(id, file)| {
+            let armies: Vec<String> = load_unit_file(&file)
+                .map(|text| {
+                    scan_key_values(&text, "Name")
+                        .into_iter()
+                        .filter_map(|values| values.into_iter().next())
+                        .map(|name| translated_name(&name, translations))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let stem = file
+                .strip_suffix(".json")
+                .or_else(|| file.strip_suffix(".JSON"))
+                .unwrap_or(file.as_str());
+            UnitEntry {
+                id,
+                name: translated_name(stem, translations),
+                armies,
+            }
+        })
+        .collect()
+}
+
+/// 解析 `units/Units.json`（含兵种文件的型号名；见 [`parse_unit_pairs`] / [`build_unit_entries`]）。
+pub fn parse_units(
+    index_text: &str,
+    translations: &HashMap<String, String>,
+    load_unit_file: impl FnMut(&str) -> Option<String>,
+) -> Vec<UnitEntry> {
+    build_unit_entries(parse_unit_pairs(index_text), translations, load_unit_file)
 }
 
 /// 提取人物 json 中的首个 `Name:` 值（人物文件为小型数组包装）。
@@ -794,8 +1141,16 @@ pub struct EventLookup {
     pub technologies: Vec<IdNameEntry>,
     /// 宗教清单（`Religions.json` 数组顺序即 ID；供 `change_religion` 等）。
     pub religions: Vec<IdNameEntry>,
-    /// 资源清单（`resources/Resources.json`；供 `resource_price_change` 系列）。
+    /// 资源清单（`resources/Resources.json`；供 `price_change` 系列）。
     pub resources: Vec<IdNameEntry>,
+    /// 法令清单（`laws/Laws.json` 数组顺序即组号；供 `change_law`）。
+    pub laws: Vec<LawEntry>,
+    /// 大洲清单（`<地图>/Continents.json` 数组顺序即编号；供 `civ_capital_continent_is`）。
+    pub continents: Vec<IdNameEntry>,
+    /// 决议清单（`rainfall/rfEvent_decision.json`；供 `add_decision` / `taking_decision` 等）。
+    pub decisions: Vec<DecisionEntry>,
+    /// 兵种清单（`units/Units.json`；供 `add_new_army` 的兵种与型号两段）。
+    pub units: Vec<UnitEntry>,
 }
 
 /// 名称解析核心（与 `generate_civ` 的查找优先级一致）：
@@ -1228,13 +1583,20 @@ struct LookupTables {
     technologies: Vec<IdNameEntry>,
     religions: Vec<IdNameEntry>,
     resources: Vec<IdNameEntry>,
+    laws: Vec<LawEntry>,
+    continents: Vec<IdNameEntry>,
+    decisions: Vec<DecisionEntry>,
+    units: Vec<UnitEntry>,
 }
 
 /// 组装对照表（真实路径 / SAF / 测试共用）。
+/// `translations` 为文明语言包，`root_translations` 为根语言包
+/// （政体 / 宗教 / 科技 / 资源 / 建筑 / 国家精神 / 疾病等名称的中译）。
 #[allow(clippy::too_many_arguments)]
 fn assemble_lookup(
     tags: &[String],
     translations: &HashMap<String, String>,
+    root_translations: &HashMap<String, String>,
     civ_jsons: &HashMap<String, Civ>,
     governments_text: &str,
     characters: Vec<String>,
@@ -1245,7 +1607,7 @@ fn assemble_lookup(
 ) -> EventLookup {
     EventLookup {
         civs: build_civ_entries(tags, translations, |tag| civ_jsons.get(tag).cloned()),
-        governments: parse_governments(governments_text),
+        governments: parse_governments(governments_text, root_translations),
         characters,
         provinces,
         buildings,
@@ -1254,6 +1616,10 @@ fn assemble_lookup(
         technologies: tables.technologies,
         religions: tables.religions,
         resources: tables.resources,
+        laws: tables.laws,
+        continents: tables.continents,
+        decisions: tables.decisions,
+        units: tables.units,
     }
 }
 
@@ -1438,51 +1804,91 @@ fn load_lookup_from_sources(
 
     let governments_text = game.read_text(GOV_FILE).unwrap_or_default();
 
+    // 根语言包：政体 / 建筑 / 疾病 / 宗教 / 科技 / 资源 / 国家精神等显示名的中译
+    // （默认 Bundle 打底、简体中文覆盖；无对照时保留原始字段）。
+    let root_translations = load_translations_from(game, &[ROOT_BUNDLE, ROOT_BUNDLE_CN]);
+
     // 人物 / 建筑 / 疾病。
     let characters = build_character_names(&game.read_json_files(CHARACTERS_DIR));
     let buildings = game
         .read_text(BUILDINGS_FILE)
-        .map(|text| parse_buildings(&text))
+        .map(|text| parse_buildings(&text, &root_translations))
         .unwrap_or_default();
-    let disease_translations = load_translations_from(game, &[ROOT_BUNDLE, ROOT_BUNDLE_CN]);
     let diseases = game
         .read_text(DISEASES_FILE)
-        .map(|text| parse_diseases(&text, &disease_translations))
+        .map(|text| parse_diseases(&text, &root_translations))
         .unwrap_or_default();
 
-    // 省份：由 assets 源发现地图（`Maps.json`），剧本根按其所属地图过滤。
-    let provinces = match assets {
+    // 地图发现（`Maps.json`）：省份与剧本大洲（`<地图>/Continents.json`）都按它定位。
+    let (maps, scenario_map) = match assets {
         Some(source) => {
             let maps = load_maps_from(source);
             let scenario_map = scenario_map_of(&maps, missions_root);
-            load_provinces_from(source, &maps, scenario_map.as_deref())
+            (maps, scenario_map)
         }
+        None => (Vec::new(), None),
+    };
+
+    // 省份：剧本根按其所属地图过滤；全局根合并全部地图。
+    let provinces = match assets {
+        Some(source) => load_provinces_from(source, &maps, scenario_map.as_deref()),
         None => Vec::new(),
     };
 
-    // 附加数据表：国家精神 / 科技 / 宗教 / 资源（文件缺失时按空表处理）。
+    // 附加数据表：国家精神 / 科技 / 宗教 / 资源 / 法令 / 大洲 / 决议（缺失按空表）。
     let tables = LookupTables {
         national_spirits: game
             .read_text(NATIONAL_SPIRIT_FILE)
-            .map(|text| parse_national_spirits(&text))
+            .map(|text| parse_national_spirits(&text, &root_translations))
             .unwrap_or_default(),
         technologies: game
             .read_text(TECHNOLOGIES_FILE)
-            .map(|text| parse_id_name_table(&text))
+            .map(|text| parse_id_name_table(&text, &root_translations))
             .unwrap_or_default(),
         religions: game
             .read_text(RELIGIONS_FILE)
-            .map(|text| parse_ordered_names(&text))
+            .map(|text| parse_ordered_names(&text, &root_translations))
             .unwrap_or_default(),
         resources: game
             .read_text(RESOURCES_FILE)
-            .map(|text| parse_id_name_table(&text))
+            .map(|text| parse_id_name_table(&text, &root_translations))
+            .unwrap_or_default(),
+        laws: game
+            .read_text(LAWS_FILE)
+            .map(|text| parse_laws(&text))
+            .unwrap_or_default(),
+        // 兵种：索引 + 各兵种文件的型号名（文件缺失时该兵种保留空型号）。
+        units: game
+            .read_text(UNITS_FILE)
+            .map(|text| {
+                parse_units(&text, &root_translations, |file| {
+                    game.read_text(&format!("units/{file}"))
+                })
+            })
+            .unwrap_or_default(),
+        // 大洲：剧本根取所属地图；全局根（无剧本上下文）回退首个地图。
+        continents: match assets {
+            Some(source) => scenario_map
+                .clone()
+                .or_else(|| maps.first().map(|info| info.folder.clone()))
+                .and_then(|map| {
+                    source
+                        .read_text(&format!("map/{map}/Continents.json"))
+                        .map(|text| parse_continents(&text, &root_translations))
+                })
+                .unwrap_or_default(),
+            None => Vec::new(),
+        },
+        decisions: assets
+            .and_then(|source| source.read_text(DECISIONS_FILE))
+            .map(|text| parse_decisions(&text))
             .unwrap_or_default(),
     };
 
     assemble_lookup(
         &tags,
         &translations,
+        &root_translations,
         &civ_jsons,
         &governments_text,
         characters,
@@ -1830,6 +2236,17 @@ pub async fn load_event_lookup_scoped<R: tauri::Runtime>(
             }
         }
 
+        // 根语言包：政体 / 建筑 / 疾病 / 宗教 / 科技 / 资源 / 国家精神等显示名的中译
+        // （默认 Bundle 打底、简体中文覆盖；无对照时保留原始字段）。
+        let mut root_translations: HashMap<String, String> = HashMap::new();
+        for relative in [ROOT_BUNDLE, ROOT_BUNDLE_CN] {
+            if let Ok(text) =
+                bridge::read_text_file(&app, &folder_id, &join_rel(&candidate, relative)).await
+            {
+                root_translations.extend(parse_translations(&text));
+            }
+        }
+
         // 人物 / 建筑 / 疾病。
         let characters = load_characters_scoped(
             &app,
@@ -1840,64 +2257,129 @@ pub async fn load_event_lookup_scoped<R: tauri::Runtime>(
         let buildings =
             bridge::read_text_file(&app, &folder_id, &join_rel(&candidate, BUILDINGS_FILE))
                 .await
-                .map(|text| parse_buildings(&text))
+                .map(|text| parse_buildings(&text, &root_translations))
                 .unwrap_or_default();
-        let mut disease_translations: HashMap<String, String> = HashMap::new();
-        for relative in [ROOT_BUNDLE, ROOT_BUNDLE_CN] {
-            if let Ok(text) =
-                bridge::read_text_file(&app, &folder_id, &join_rel(&candidate, relative)).await
-            {
-                disease_translations.extend(parse_translations(&text));
-            }
-        }
         let diseases =
             bridge::read_text_file(&app, &folder_id, &join_rel(&candidate, DISEASES_FILE))
                 .await
-                .map(|text| parse_diseases(&text, &disease_translations))
+                .map(|text| parse_diseases(&text, &root_translations))
                 .unwrap_or_default();
 
-        // 省份：按候选 assets 前缀发现地图（`Maps.json`），剧本根只取所属地图。
-        let provinces = match assets_prefix_of_candidate(&candidate) {
+        // 地图发现（`Maps.json`）：省份与剧本大洲（`<地图>/Continents.json`）都按它定位。
+        let assets_prefix = assets_prefix_of_candidate(&candidate);
+        let (maps, scenario_map) = match assets_prefix.as_deref() {
             Some(prefix) => {
-                let maps = load_maps_scoped(&app, &folder_id, &prefix).await;
+                let maps = load_maps_scoped(&app, &folder_id, prefix).await;
                 let scenario_map = scenario_map_of(&maps, &missions_root);
-                load_provinces_scoped(&app, &folder_id, &prefix, &maps, scenario_map.as_deref())
+                (maps, scenario_map)
+            }
+            None => (Vec::new(), None),
+        };
+        // 省份：剧本根只取所属地图；全局根合并全部地图。
+        let provinces = match assets_prefix.as_deref() {
+            Some(prefix) => {
+                load_provinces_scoped(&app, &folder_id, prefix, &maps, scenario_map.as_deref())
                     .await
             }
             None => Vec::new(),
         };
 
-        // 附加数据表：国家精神 / 科技 / 宗教 / 资源（文件缺失时按空表处理）。
+        // 附加数据表：国家精神 / 科技 / 宗教 / 资源 / 法令 / 大洲 / 决议（缺失按空表）。
         let national_spirits =
             bridge::read_text_file(&app, &folder_id, &join_rel(&candidate, NATIONAL_SPIRIT_FILE))
                 .await
-                .map(|text| parse_national_spirits(&text))
+                .map(|text| parse_national_spirits(&text, &root_translations))
                 .unwrap_or_default();
         let technologies =
             bridge::read_text_file(&app, &folder_id, &join_rel(&candidate, TECHNOLOGIES_FILE))
                 .await
-                .map(|text| parse_id_name_table(&text))
+                .map(|text| parse_id_name_table(&text, &root_translations))
                 .unwrap_or_default();
         let religions =
             bridge::read_text_file(&app, &folder_id, &join_rel(&candidate, RELIGIONS_FILE))
                 .await
-                .map(|text| parse_ordered_names(&text))
+                .map(|text| parse_ordered_names(&text, &root_translations))
                 .unwrap_or_default();
         let resources =
             bridge::read_text_file(&app, &folder_id, &join_rel(&candidate, RESOURCES_FILE))
                 .await
-                .map(|text| parse_id_name_table(&text))
+                .map(|text| parse_id_name_table(&text, &root_translations))
                 .unwrap_or_default();
+        let laws = bridge::read_text_file(&app, &folder_id, &join_rel(&candidate, LAWS_FILE))
+            .await
+            .ok()
+            .map(|text| parse_laws(&text))
+            .unwrap_or_default();
+        // 兵种：索引 + 各兵种文件的型号名（逐个读取；文件缺失时该兵种保留空型号）。
+        let units = match bridge::read_text_file(
+            &app,
+            &folder_id,
+            &join_rel(&candidate, UNITS_FILE),
+        )
+        .await
+        {
+            Ok(index_text) => {
+                let pairs = parse_unit_pairs(&index_text);
+                let mut files: HashMap<String, String> = HashMap::new();
+                for (_id, file) in &pairs {
+                    if files.contains_key(file) {
+                        continue;
+                    }
+                    let relative = join_rel(&candidate, &format!("units/{file}"));
+                    if let Ok(text) = bridge::read_text_file(&app, &folder_id, &relative).await {
+                        files.insert(file.clone(), text);
+                    }
+                }
+                build_unit_entries(pairs, &root_translations, |file| files.get(file).cloned())
+            }
+            Err(_) => Vec::new(),
+        };
+        let continents = match assets_prefix.as_deref() {
+            Some(prefix) => {
+                // 剧本根取所属地图；全局根（无剧本上下文）回退首个地图。
+                let map = scenario_map
+                    .clone()
+                    .or_else(|| maps.first().map(|info| info.folder.clone()));
+                match map {
+                    Some(map) => {
+                        let relative = join_rel(prefix, &format!("map/{map}/Continents.json"));
+                        bridge::read_text_file(&app, &folder_id, &relative)
+                            .await
+                            .ok()
+                            .map(|text| parse_continents(&text, &root_translations))
+                            .unwrap_or_default()
+                    }
+                    None => Vec::new(),
+                }
+            }
+            None => Vec::new(),
+        };
+        let decisions = match assets_prefix.as_deref() {
+            Some(prefix) => {
+                let relative = join_rel(prefix, DECISIONS_FILE);
+                bridge::read_text_file(&app, &folder_id, &relative)
+                    .await
+                    .ok()
+                    .map(|text| parse_decisions(&text))
+                    .unwrap_or_default()
+            }
+            None => Vec::new(),
+        };
         let tables = LookupTables {
             national_spirits,
             technologies,
             religions,
             resources,
+            laws,
+            continents,
+            decisions,
+            units,
         };
 
         return Ok(assemble_lookup(
             &tags,
             &translations,
+            &root_translations,
             &civ_jsons,
             governments_text.as_deref().unwrap_or_default(),
             characters,
@@ -2200,15 +2682,128 @@ fn apk_music_names(archive: &ApkArchive, missions_root: &str) -> Vec<String> {
     names.into_iter().collect()
 }
 
+/// 统治者头像候选目录（`<assets>/game/rulers/rulersImages/H`；`add_ruler` 第三段，
+/// 值为图片文件名去 `.png` 或数字编号，引擎 `loadRulerImage` 实证）。
+fn event_ruler_image_relative_dirs(missions_root: &str) -> Vec<String> {
+    let root = missions_root.trim().trim_matches('/');
+    let segments: Vec<&str> = root
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    for (index, segment) in segments.iter().enumerate() {
+        if *segment == "assets" {
+            let prefix = segments[..=index].join("/");
+            return vec![format!("{prefix}/game/rulers/rulersImages/H")];
+        }
+    }
+    Vec::new()
+}
+
+/// 剧情特殊联盟候选文件（`<剧本目录>/AlliancesSpecial.json`，即 missions 根的上级）。
+fn event_alliance_special_relative_paths(missions_root: &str) -> Vec<String> {
+    let root = missions_root.trim().trim_matches('/');
+    let segments: Vec<&str> = root
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    if segments.len() < 2 {
+        return Vec::new();
+    }
+    let parent = segments[..segments.len() - 1].join("/");
+    vec![format!("{parent}/AlliancesSpecial.json")]
+}
+
+/// 扫描统治者头像（`.png` 文件名去扩展名，同名去重）。
+fn collect_ruler_image_names(root: &Path, missions_root: &str) -> Vec<String> {
+    let mut names: BTreeSet<String> = BTreeSet::new();
+    for dir in event_ruler_image_relative_dirs(missions_root) {
+        let Ok(entries) = fs::read_dir(root.join(&dir)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            if path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("png"))
+            {
+                if let Some(stem) = path.file_stem() {
+                    names.insert(stem.to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
+    names.into_iter().collect()
+}
+
+/// 扫描剧情特殊联盟名称（`AlliancesSpecial.json` 的 `Name_Alliance`，顺序即编号）。
+fn collect_alliance_special_names(root: &Path, missions_root: &str) -> Vec<String> {
+    for relative in event_alliance_special_relative_paths(missions_root) {
+        if let Ok(text) = fs::read_to_string(root.join(&relative)) {
+            return parse_alliance_special_names(&text);
+        }
+    }
+    Vec::new()
+}
+
+/// 从已打开的源 APK 收集统治者头像（文件名去 `.png`）。
+fn apk_ruler_image_names(archive: &ApkArchive, missions_root: &str) -> Vec<String> {
+    let mut names: BTreeSet<String> = BTreeSet::new();
+    for dir in event_ruler_image_relative_dirs(missions_root) {
+        let Some(apk_dir) = apk_base_of_candidate(&dir) else {
+            continue;
+        };
+        let prefix = format!("{apk_dir}/");
+        for entry in &archive.entries {
+            let Some(rest) = entry.name.strip_prefix(&prefix) else {
+                continue;
+            };
+            if rest.contains('/') {
+                continue;
+            }
+            if let Some(stem) = rest
+                .strip_suffix(".png")
+                .or_else(|| rest.strip_suffix(".PNG"))
+            {
+                if !stem.is_empty() {
+                    names.insert(stem.to_string());
+                }
+            }
+        }
+    }
+    names.into_iter().collect()
+}
+
+/// 从已打开的源 APK 读取剧情特殊联盟名称（条目存在时解析）。
+fn apk_alliance_special_names(archive: &ApkArchive, missions_root: &str) -> Vec<String> {
+    for relative in event_alliance_special_relative_paths(missions_root) {
+        let Some(apk_path) = apk_base_of_candidate(&relative) else {
+            continue;
+        };
+        if archive.index.contains_key(&apk_path) {
+            if let Some(text) = archive.read_entry(&apk_path) {
+                return parse_alliance_special_names(&text);
+            }
+        }
+    }
+    Vec::new()
+}
+
 /// 事件脚本资源候选（`list_event_assets` 命令的返回结构）。
 /// - `images`：`.png` 文件名（含扩展名）；
 /// - `events`：事件文件名去 `.txt`（`run_event` 值）；
-/// - `music`：音乐名（音频文件名去扩展名 + `list*.txt` 清单条目）。
+/// - `music`：音乐名（音频文件名去扩展名 + `list*.txt` 清单条目）；
+/// - `ruler_images`：统治者头像文件名去 `.png`（`add_ruler` 第三段）；
+/// - `alliance_specials`：剧情特殊联盟名称（`AlliancesSpecial.json` 顺序即编号）。
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct EventAssets {
     pub images: Vec<String>,
     pub events: Vec<String>,
     pub music: Vec<String>,
+    pub ruler_images: Vec<String>,
+    pub alliance_specials: Vec<String>,
 }
 
 /// 列出事件脚本可引用的资源候选（见 [`EventAssets`]）。
@@ -2233,10 +2828,19 @@ pub async fn list_event_assets<R: tauri::Runtime>(
         let mut music: BTreeSet<String> = collect_music_names(&root, &missions_root)
             .into_iter()
             .collect();
+        let mut ruler_images: BTreeSet<String> = collect_ruler_image_names(&root, &missions_root)
+            .into_iter()
+            .collect();
+        // 特殊联盟名称顺序即编号：工作区优先，缺失时用 APK 条目（不做并集，避免编号错位）。
+        let mut alliance_specials = collect_alliance_special_names(&root, &missions_root);
         let mut extend_from_archive = |archive: &ApkArchive| {
             images.extend(apk_event_image_names(archive, &missions_root));
             events.extend(apk_event_names(archive, &missions_root));
             music.extend(apk_music_names(archive, &missions_root));
+            ruler_images.extend(apk_ruler_image_names(archive, &missions_root));
+            if alliance_specials.is_empty() {
+                alliance_specials = apk_alliance_special_names(archive, &missions_root);
+            }
         };
         #[cfg(target_os = "android")]
         {
@@ -2271,6 +2875,8 @@ pub async fn list_event_assets<R: tauri::Runtime>(
             images: images.into_iter().collect(),
             events: events.into_iter().collect(),
             music: music.into_iter().collect(),
+            ruler_images: ruler_images.into_iter().collect(),
+            alliance_specials,
         })
     })
     .await
@@ -2343,15 +2949,46 @@ pub async fn list_event_assets_scoped<R: tauri::Runtime>(
             }
         }
     }
+    let mut ruler_images: BTreeSet<String> = BTreeSet::new();
+    for dir in event_ruler_image_relative_dirs(&missions_root) {
+        let Ok(entries) = bridge::list_dir(&app, &folder_id, Some(dir)).await else {
+            continue;
+        };
+        for entry in entries {
+            if entry.is_dir {
+                continue;
+            }
+            if entry.name.to_ascii_lowercase().ends_with(".png") {
+                let stem = &entry.name[..entry.name.len() - 4];
+                if !stem.is_empty() {
+                    ruler_images.insert(stem.to_string());
+                }
+            }
+        }
+    }
+    // 特殊联盟名称顺序即编号：工作区优先，缺失时用 APK 条目（不做并集，避免编号错位）。
+    let mut alliance_specials: Vec<String> = Vec::new();
+    for relative in event_alliance_special_relative_paths(&missions_root) {
+        if let Ok(text) = bridge::read_text_file(&app, &folder_id, &relative).await {
+            alliance_specials = parse_alliance_special_names(&text);
+            break;
+        }
+    }
     if let Some(archive) = open_scoped_source_apk(&app, &folder_id, &missions_root).await {
         images.extend(apk_event_image_names(&archive, &missions_root));
         events.extend(apk_event_names(&archive, &missions_root));
         music.extend(apk_music_names(&archive, &missions_root));
+        ruler_images.extend(apk_ruler_image_names(&archive, &missions_root));
+        if alliance_specials.is_empty() {
+            alliance_specials = apk_alliance_special_names(&archive, &missions_root);
+        }
     }
     Ok(EventAssets {
         images: images.into_iter().collect(),
         events: events.into_iter().collect(),
         music: music.into_iter().collect(),
+        ruler_images: ruler_images.into_iter().collect(),
+        alliance_specials,
     })
 }
 
@@ -2432,7 +3069,7 @@ mod tests {
     #[test]
     fn parse_buildings_joins_level_names() {
         let text = "{\nBuildings:[\n{ Name: [\"基础设施\"], AI: [5], },\n{ Name: [\"铁路\", \"铁路Ⅱ\"], },\n]}";
-        let buildings = parse_buildings(text);
+        let buildings = parse_buildings(text, &HashMap::new());
         assert_eq!(
             buildings,
             vec![
@@ -2461,7 +3098,7 @@ mod tests {
     fn parse_national_spirits_reads_id_name_pairs() {
         let text = "{\n\"nationalSpirits\":[\n{\n\"id\":\"fra1\",\n\"name\":\"法兰西万岁\",\n\"desc\":\"§!描述：含冒号，name 字样不干扰\",\n\"Bonuses\":{\n\"UnitsDefense\":15,\n},\n},\n{\n\"id\":\"sov3\",\n\"name\":\"苏维埃精神\",\n},\n]}";
         assert_eq!(
-            parse_national_spirits(text),
+            parse_national_spirits(text, &HashMap::new()),
             vec![
                 IdTextNameEntry { id: "fra1".into(), name: "法兰西万岁".into() },
                 IdTextNameEntry { id: "sov3".into(), name: "苏维埃精神".into() },
@@ -2474,7 +3111,7 @@ mod tests {
         // 科技：先 `ID` 后 `Name`；`ImageID` / `MaintainTechnologyName` 不误匹配。
         let tech = "{\nTechnology:[\n{\nID: 0,\nName: \"毒气科技\",\nImageID: 0,\nMaintainTechnologyName: true,\n},\n{\nID: 1,\nName: \"毒气桶\",\n},\n]}";
         assert_eq!(
-            parse_id_name_table(tech),
+            parse_id_name_table(tech, &HashMap::new()),
             vec![
                 IdNameEntry { id: 0, name: "毒气科技".into() },
                 IdNameEntry { id: 1, name: "毒气桶".into() },
@@ -2483,7 +3120,7 @@ mod tests {
         // 资源：先 `Name` 后 `ID`；`GroupID` / `RequiredTechID` 不误匹配。
         let resources = "{\nResources:[\n{\nName: Grain,\nID: 0,\nImageID: 0,\nGroupID: 0,\n},\n{\nName: \"Rice\",\nID: 1,\nRequiredTechID: -1,\n},\n]}";
         assert_eq!(
-            parse_id_name_table(resources),
+            parse_id_name_table(resources, &HashMap::new()),
             vec![
                 IdNameEntry { id: 0, name: "Grain".into() },
                 IdNameEntry { id: 1, name: "Rice".into() },
@@ -2495,12 +3132,152 @@ mod tests {
     fn parse_ordered_names_uses_array_order() {
         let text = "{\nAge_of_History: Data,\nData:[\n{\nName: Pagan,\nReligionGroupID: 0,\n},\n{\nName: \"Catholic\",\nReligionGroupID: 1,\n},\n]}";
         assert_eq!(
-            parse_ordered_names(text),
+            parse_ordered_names(text, &HashMap::new()),
             vec![
                 IdNameEntry { id: 0, name: "Pagan".into() },
                 IdNameEntry { id: 1, name: "Catholic".into() },
             ]
         );
+    }
+
+    /// 法令表：组名与选项支持裸词 / 引号混写；组内首个 `Law` 键即选项数组。
+    #[test]
+    fn parse_laws_reads_groups_and_options() {
+        let text = "{\n\tLaw:\n\t[\n\t\t{\n\t\t\tImageID: [0, 0],\n\t\t\tTitle: 征兵法案,\n\t\t\tLaw: [\"志愿兵制\",\"有限征兵\", 广泛征兵],\n\t\t\tRequiredTechID: [-1, -1],\n\t\t},\n\t\t{\n\t\t\tTitle: \"领导人的生命\",\n\t\t\tLaw: [\"我们都是普通人\", \"领导人永远不死\" ],\n\t\t},\n\t]\n}";
+        let laws = parse_laws(text);
+        assert_eq!(laws.len(), 2);
+        assert_eq!(laws[0].title, "征兵法案");
+        assert_eq!(
+            laws[0].options,
+            vec!["志愿兵制", "有限征兵", "广泛征兵"]
+        );
+        assert_eq!(laws[1].title, "领导人的生命");
+        assert_eq!(
+            laws[1].options,
+            vec!["我们都是普通人", "领导人永远不死"]
+        );
+    }
+
+    /// 大洲表：`sName` 顺序即编号；命中语言表用译文，无对照保留原名。
+    #[test]
+    fn parse_continents_keeps_array_order() {
+        let text = "{\n\tAge_of_History: Data,\n\tData: [\n\t{\n\t\tsName: \"Ocean\",\n\t\tiR: 255,\n\t},\n\t{\n\t\tsName: Asia,\n\t},\n\t]\n}";
+        let mut translations = HashMap::new();
+        translations.insert("Asia".to_string(), "亚洲".to_string());
+        let continents = parse_continents(text, &translations);
+        assert_eq!(
+            continents,
+            vec![
+                IdNameEntry { id: 0, name: "Ocean".into() },
+                IdNameEntry { id: 1, name: "亚洲".into() },
+            ]
+        );
+    }
+
+    /// 决议表：逐条取 `id` / `name` / `events`；描述里的 `id:` 字样不干扰；
+    /// 对象间缺逗号时仍能逐条解析。
+    #[test]
+    fn parse_decisions_reads_id_name_events() {
+        let text = "{\n\t\"decisions\":[\n\t\t{\n\t\t\t\"id\":\"sov左翼社会革命党叛乱\",\n\t\t\t\"name\":\"左翼社会革命党叛乱\",\n\t\t\t\"desc\":[\"描述里也可能出现 id: 字样\"],\n\t\t\t\"images\":[\"图.png\"],\n\t\t\t\"events\":[\"左翼社会革命党企图叛乱\"],\n\t\t}\n\t\t{\n\t\t\t\"id\":\"巴西南美扩张\",\n\t\t\t\"name\":\"巴西的南美扩张\",\n\t\t\t\"events\":[\"巴西事件一\",\"巴西事件二\"],\n\t\t}\n\t]\n}";
+        let decisions = parse_decisions(text);
+        assert_eq!(decisions.len(), 2);
+        assert_eq!(decisions[0].id, "sov左翼社会革命党叛乱");
+        assert_eq!(decisions[0].name, "左翼社会革命党叛乱");
+        assert_eq!(decisions[0].events, vec!["左翼社会革命党企图叛乱"]);
+        assert_eq!(decisions[1].id, "巴西南美扩张");
+        assert_eq!(decisions[1].events, vec!["巴西事件一", "巴西事件二"]);
+    }
+
+    /// 特殊联盟：`Name_Alliance` 顺序即编号；同对象里的 `Name_FirstTier` 等不干扰；
+    /// 名字首尾空白会去掉（引擎侧带空白的写法仅影响显示）。
+    #[test]
+    fn parse_alliance_special_names_reads_in_order() {
+        let text = "[{FlagTag:\"jap\",Name_Alliance:\"日本国\",Name_FirstTier:\"守护代\",Name_Leader:\"幕府将军\",Name_Rest:\"国主\",firstTier:[23,18]},{FlagTag:\"ming\",Name_Alliance:\" 大明朝贡体系\",Name_FirstTier:\"藩国\"}]";
+        let names = parse_alliance_special_names(text);
+        assert_eq!(
+            names,
+            vec!["日本国".to_string(), "大明朝贡体系".to_string()]
+        );
+    }
+
+    /// 兵种表：`{File, ID}` 对 + 各兵种文件的型号名（数组顺序即型号 ID；
+    /// 名称与型号经语言表翻译；文件缺失时保留空型号）。
+    #[test]
+    fn parse_units_reads_index_and_levels() {
+        let index = "{\n\tArmy: [\n\t\t{\n\t\t\tFile: \"Archer.json\",\n\t\t\tID: 3,\n\t\t\tLine: 2,\n\t\t},\n\t\t{\n\t\t\tFile: \"机械化部队.json\",\n\t\t\tID: 5,\n\t\t},\n\t]\n}";
+        let mut translations = HashMap::new();
+        translations.insert("Slinger".to_string(), "投石手".to_string());
+        translations.insert("Archer".to_string(), "弓箭手".to_string());
+        let units = parse_units(index, &translations, |file| {
+            if file == "Archer.json" {
+                Some("{\n\tArmy: [\n\t\t{ Name: \"Slinger\", },\n\t\t{ Name: \"Archer\", },\n\t\t{ Name: \"Bowmen\" },\n\t]\n}".to_string())
+            } else {
+                None
+            }
+        });
+        assert_eq!(
+            units,
+            vec![
+                UnitEntry {
+                    id: 3,
+                    name: "弓箭手".into(),
+                    armies: vec!["投石手".into(), "弓箭手".into(), "Bowmen".into()],
+                },
+                UnitEntry {
+                    id: 5,
+                    name: "机械化部队".into(),
+                    armies: Vec::new(),
+                },
+            ]
+        );
+    }
+
+    /// 显示名翻译：命中语言表且译文非空时用译文，无对照 / 空译文保留原始字段。
+    #[test]
+    fn lookup_names_translate_with_fallback() {
+        let mut translations = HashMap::new();
+        translations.insert("Catholic".to_string(), "天主教".to_string());
+        translations.insert("Grain".to_string(), "谷物".to_string());
+        translations.insert("Library".to_string(), "图书馆".to_string());
+        translations.insert("TaxOfficeHeadquarters".to_string(), "税务总部".to_string());
+        translations.insert("Democracy".to_string(), "民主制".to_string());
+        translations.insert("Militarism".to_string(), "军国主义".to_string());
+        translations.insert("Barracks".to_string(), String::new());
+
+        let religions =
+            parse_ordered_names("{\nName: Catholic,\n},\n{\nName: Zoroastrian,\n}", &translations);
+        assert_eq!(religions[0].name, "天主教");
+        assert_eq!(religions[1].name, "Zoroastrian");
+
+        let technologies = parse_id_name_table(
+            "{\nID: 0,\nName: Library,\n},\n{\nID: 1,\nName: SteamPower,\n}",
+            &translations,
+        );
+        assert_eq!(technologies[0].name, "图书馆");
+        assert_eq!(technologies[1].name, "SteamPower");
+
+        let resources = parse_id_name_table("{\nName: Grain,\nID: 0,\n}", &translations);
+        assert_eq!(resources[0].name, "谷物");
+
+        // 建筑多级名称逐段翻译；无对照段（Barracks 译文为空）保留原名。
+        let buildings = parse_buildings(
+            "{\nBuildings:[\n{ Name: [\"TaxOfficeHeadquarters\", \"Barracks\"] },\n]}",
+            &translations,
+        );
+        assert_eq!(buildings[0].name, "税务总部/Barracks");
+
+        let governments = parse_governments(
+            "{\nGovernment:[\n{\nName: \"Democracy\",\nExtra_Tag: \"0\",\n},\n]}",
+            &translations,
+        );
+        assert_eq!(governments[0].name, "民主制");
+
+        let spirits = parse_national_spirits(
+            "{\n\"nationalSpirits\":[\n{\n\"id\":\"fra1\",\n\"name\":\"Militarism\",\n},\n{\n\"id\":\"ger2\",\n\"name\":\"UnknownSpirit\",\n},\n]}",
+            &translations,
+        );
+        assert_eq!(spirits[0].name, "军国主义");
+        assert_eq!(spirits[1].name, "UnknownSpirit");
     }
 
     #[test]
@@ -2651,7 +3428,7 @@ mod tests {
         },
     ]
 }"#;
-        let entries = parse_governments(text);
+        let entries = parse_governments(text, &HashMap::new());
         // 没有 Extra_Tag 的条目也保留（tag 为空）：跳过会使其后所有政体编号前移。
         assert_eq!(entries.len(), 4);
         assert_eq!(entries[0].index, 0);
@@ -2683,7 +3460,7 @@ mod tests {
         },
     ]
 }"##;
-        let entries = parse_governments(text);
+        let entries = parse_governments(text, &HashMap::new());
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].name, "天朝礼法君主制");
         assert_eq!(entries[0].tag, "1");
@@ -2696,7 +3473,7 @@ mod tests {
     fn parsers_tolerate_key_case_variants() {
         let governments =
             "{\n\"government\": [\n{\nname: \"临时政府\",\nextra_tag: \"x\",\n},\n]\n}";
-        let entries = parse_governments(governments);
+        let entries = parse_governments(governments, &HashMap::new());
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "临时政府");
         assert_eq!(entries[0].tag, "x");
@@ -2709,7 +3486,7 @@ mod tests {
 
         let buildings =
             "{\nBuildings: [\n{ name: [\"要塞\"], },\n{ NAME: [\"工厂\", \"大工厂\"], },\n]\n}";
-        let parsed = parse_buildings(buildings);
+        let parsed = parse_buildings(buildings, &HashMap::new());
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[1].name, "工厂/大工厂");
     }
@@ -2887,14 +3664,11 @@ mod tests {
             .iter()
             .any(|entry| entry.id == 0 && entry.name == "毒气科技"));
         assert!(lookup.religions.len() >= 3);
-        assert!(lookup
-            .religions
-            .iter()
-            .any(|entry| entry.id == 0 && entry.name == "Pagan"));
-        assert!(lookup
-            .resources
-            .iter()
-            .any(|entry| entry.id == 0 && entry.name == "Grain"));
+        // 宗教 / 资源显示名已按根语言包翻译（无对照条目回退原字段）。
+        let pagan = lookup.religions.iter().find(|entry| entry.id == 0).unwrap();
+        assert_eq!(pagan.name, "异教");
+        let grain = lookup.resources.iter().find(|entry| entry.id == 0).unwrap();
+        assert_eq!(grain.name, "谷物");
 
         // 剧本根（`assets/map/<地图>/scenarios/<剧本>/missions`）应同样加载到地图省份。
         let scenario_root = "暮色黄昏_世界大战0.25.1/assets/map/Earth3/scenarios/TheGreatWar/missions";
@@ -2905,6 +3679,45 @@ mod tests {
             .provinces
             .iter()
             .any(|entry| entry.id == 12049 && entry.name == "费罗尔"));
+
+        // 引擎逆向批次（2026-10-09）：法令 / 大洲 / 决议（暮色 APK 实测）。
+        assert!(lookup.laws.len() >= 5, "法令过少：{}", lookup.laws.len());
+        let recruitment = lookup
+            .laws
+            .iter()
+            .find(|law| law.title == "征兵法案")
+            .expect("应含「征兵法案」组");
+        assert!(recruitment.options.iter().any(|name| name == "志愿兵制"));
+        assert!(
+            !scenario_lookup.continents.is_empty(),
+            "剧本根应加载大洲表"
+        );
+        assert_eq!(scenario_lookup.continents[0].id, 0);
+        assert!(
+            lookup.decisions.iter().any(|decision| {
+                decision.id == "sov左翼社会革命党叛乱"
+                    && decision
+                        .events
+                        .iter()
+                        .any(|event| event == "左翼社会革命党企图叛乱")
+            }),
+            "应含「左翼社会革命党叛乱」决议"
+        );
+        // 兵种表（add_new_army 的兵种与型号）：暮色自定义兵种文件的中文型号名。
+        assert!(lookup.units.len() >= 7, "兵种过少：{}", lookup.units.len());
+        let mech = lookup
+            .units
+            .iter()
+            .find(|unit| unit.name == "机械化部队")
+            .expect("应含「机械化部队」兵种");
+        assert_eq!(
+            mech.armies,
+            vec![
+                "机械化部队".to_string(),
+                "机械化部队II".to_string(),
+                "机械化部队III".to_string()
+            ]
+        );
 
         // 事件图片候选（image / mission_image 的 .png 值）：工作区目录 + 源 APK 条目合并。
         let workspace_images =
@@ -2953,6 +3766,19 @@ mod tests {
         assert!(apk_music.iter().any(|name| name == "世界大战"));
         assert!(apk_music.iter().any(|name| name == "默认"));
 
+        // 统治者头像与剧情特殊联盟（逆向补全批次的 APK 条目来源）。
+        // 注：`game/rulers/rulersImages/H` 为自定义统治者头像（本包 493 张）；
+        // `rulersRandom/rulersImages*` 是随机头像池，不参与 `add_ruler` 补全。
+        let rulers = apk_ruler_image_names(&archive, missions_root);
+        assert!(rulers.len() >= 300, "统治者头像过少：{}", rulers.len());
+        assert!(rulers.iter().any(|name| name == "247"));
+        let alliances = apk_alliance_special_names(&archive, scenario_root);
+        assert_eq!(
+            alliances,
+            vec!["同盟国".to_string(), "协约国".to_string()],
+            "剧本特殊联盟顺序即编号"
+        );
+
         // 标记文件方式：工作区只有导入版块，标记指向工作区之外的源 APK
         // （避免拷贝 GB 级文件，与 Android 上 `content://` URI 用法一致）。
         let import_dir = temp_dir("apk-import-real");
@@ -2977,6 +3803,8 @@ mod tests {
 
     /// 本机验证：全部模组工作区（均为「从 apk 中导入」的版块目录 + 源 APK 兜底）的
     /// 补全数据都能加载——覆盖各自的自定义地图名（Earth3 / ES / Begonia）。
+    /// 同时核对引擎逆向批次（法令 / 大洲 / 决议 / 统治者头像 / 特殊联盟）在
+    /// 五个 APK 上的数据源与「脚本实际用法 ↔ 数据」一致性。
     /// 默认忽略：`cargo test -p age_civ_mod_tool --lib real_all_mods_lookup -- --ignored`
     #[test]
     #[ignore = "需要真实数据 A:\\android\\GameCivs"]
@@ -2996,8 +3824,18 @@ mod tests {
             assert!(!lookup.civs.is_empty(), "{name} 文明清单为空");
             assert!(!lookup.governments.is_empty(), "{name} 政体清单为空");
             assert!(!lookup.provinces.is_empty(), "{name} 省份清单为空");
+            // 逆向批次数据源：五个模组均含 Laws.json 与（唯一地图的）Continents.json；
+            // 决议表除 road_to_56 外均有（road_to_56 的 missionsEvents 也确实未用决策键）。
+            assert!(lookup.laws.len() >= 3, "{name} 法令过少：{}", lookup.laws.len());
+            assert!(!lookup.continents.is_empty(), "{name} 大洲清单为空");
+            assert!(!lookup.units.is_empty(), "{name} 兵种清单为空");
+            if name == "road_to_56" {
+                assert!(lookup.decisions.is_empty(), "road_to_56 无决策表应为空");
+            } else {
+                assert!(!lookup.decisions.is_empty(), "{name} 决议清单为空");
+            }
             println!(
-                "{name}：文明 {} / 政体 {} / 省份 {} / 人物 {} / 国家精神 {} / 科技 {} / 宗教 {} / 资源 {}",
+                "{name}：文明 {} / 政体 {} / 省份 {} / 人物 {} / 国家精神 {} / 科技 {} / 宗教 {} / 资源 {} / 法令 {} / 大洲 {} / 决议 {} / 兵种 {}",
                 lookup.civs.len(),
                 lookup.governments.len(),
                 lookup.provinces.len(),
@@ -3006,20 +3844,60 @@ mod tests {
                 lookup.technologies.len(),
                 lookup.religions.len(),
                 lookup.resources.len(),
+                lookup.laws.len(),
+                lookup.continents.len(),
+                lookup.decisions.len(),
+                lookup.units.len(),
             );
         }
-        // 自定义地图名的剧本根（europe 的 ES / 白日升的 Begonia / 1566 的 Earth3）：
-        // 省份按所属地图过滤加载。
-        for (name, root) in [
-            ("europe/Ukr2014", "europe/assets/map/ES/scenarios/Ukr2014/missions"),
-            ("europe/RusUkrWar", "europe/assets/map/ES/scenarios/RusUkrWar/missions"),
-            ("1566/ming", "1566AuroraPrever2/assets/map/Earth3/scenarios/ming/missions"),
-            ("白日升/RWS", "白日升/assets/map/Begonia/scenarios/RWS/missions"),
+        // 自定义地图名的剧本根（europe 的 ES / 白日升的 Begonia / 1566 / road_to_56 的 Earth3）：
+        // 省份按所属地图过滤加载；大洲按所属地图；特殊联盟按剧本目录（数量与数据文件一致）；
+        // 统治者头像来自模组 APK 的 `rulersImages/H`。
+        // 用例值：`("名称", 剧本根, 特殊联盟数量)`——1566 province 为空表 `[]`（预期 0）。
+        for (name, root, alliance_count) in [
+            ("europe/Ukr2014", "europe/assets/map/ES/scenarios/Ukr2014/missions", 2usize),
+            ("europe/RusUkrWar", "europe/assets/map/ES/scenarios/RusUkrWar/missions", 2),
+            ("1566/ming", "1566AuroraPrever2/assets/map/Earth3/scenarios/ming/missions", 7),
+            (
+                "1566/province(空表)",
+                "1566AuroraPrever2/assets/map/Earth3/scenarios/province/missions",
+                0,
+            ),
+            (
+                "road_to_56/WW2",
+                "road_to_56/assets/map/Earth3/scenarios/WW2/missions",
+                5,
+            ),
+            (
+                "暮色/TheGreatWar",
+                "暮色黄昏_世界大战0.25.1/assets/map/Earth3/scenarios/TheGreatWar/missions",
+                2,
+            ),
+            ("白日升/RWS", "白日升/assets/map/Begonia/scenarios/RWS/missions", 22),
         ] {
             let lookup = load_event_lookup_blocking(work_directory, root)
                 .unwrap_or_else(|error| panic!("{name}：{error}"));
             assert!(!lookup.provinces.is_empty(), "{name} 省份清单为空");
-            println!("{name}：省份 {}", lookup.provinces.len());
+            assert!(!lookup.continents.is_empty(), "{name} 大洲清单为空");
+            let mod_name = root.split('/').next().unwrap();
+            let apk = Path::new(work_directory).join(format!("{mod_name}.apk"));
+            let archive = ApkArchive::open(File::open(&apk).expect("打开模组 APK 失败"))
+                .expect("解析模组 APK 失败");
+            let alliances = apk_alliance_special_names(&archive, root);
+            assert_eq!(
+                alliances.len(),
+                alliance_count,
+                "{name} 特殊联盟数量不符"
+            );
+            let rulers = apk_ruler_image_names(&archive, root);
+            assert!(!rulers.is_empty(), "{name} 统治者头像为空");
+            println!(
+                "{name}：省份 {} / 大洲 {} / 联盟 {} / 头像 {}",
+                lookup.provinces.len(),
+                lookup.continents.len(),
+                alliances.len(),
+                rulers.len()
+            );
         }
     }
 
@@ -3058,7 +3936,11 @@ mod tests {
             "assets/game/diseases/Diseases.json",
             "{\nDisease:[\n{ Name: \"Plague\", },\n{ Name: \"Smallpox\", },\n]}",
         );
-        add("assets/game/languages/Bundle_cn_sp.properties", "Plague = 瘟疫");
+        // 根语言包：疾病 / 宗教 / 资源显示名翻译（无对照的条目回退原字段）。
+        add(
+            "assets/game/languages/Bundle_cn_sp.properties",
+            "Plague = 瘟疫\nPagan = 异教\nCatholic = 天主教\nGrain = 粮食\nNoviceWarrior = 新手战士\nWarrior = 战士",
+        );
         add("assets/game/characters/某人.json", "[{ Name: \"某人甲\", }]");
         // 附加数据表：国家精神 / 科技 / 宗教 / 资源。
         add(
@@ -3106,6 +3988,34 @@ mod tests {
         );
         add("assets/audio/music/世界大战.ogg", "ogg");
         add("assets/audio/music/list.txt", "西线;东线;");
+        // 逆向补全批次：法令 / 大洲 / 决议 / 统治者头像 / 特殊联盟。
+        add(
+            "assets/game/laws/Laws.json",
+            "{\n\tLaw:\n\t[\n\t{\n\t\tTitle: 征兵法案,\n\t\tLaw: [\"志愿兵制\",\"有限征兵\"],\n\t},\n\t{\n\t\tTitle: \"领导人的生命\",\n\t\tLaw: [\"我们都是普通人\",\"领导人永远不死\"],\n\t},\n\t]\n}",
+        );
+        add(
+            "assets/map/TestMap/Continents.json",
+            "{\n\tData: [\n\t{\n\t\tsName: \"Ocean\",\n\t},\n\t{\n\t\tsName: Europe,\n\t},\n\t]\n}",
+        );
+        add(
+            "assets/rainfall/rfEvent_decision.json",
+            "{\n\t\"decisions\":[\n\t\t{\n\t\t\t\"id\":\"rom统一罗马\",\n\t\t\t\"name\":\"罗马尼亚的未竟之业\",\n\t\t\t\"desc\":[\"id: 干扰\"],\n\t\t\t\"events\":[\"罗马帝国宣战巴尔干地区\"],\n\t\t},\n\t]\n}",
+        );
+        add("assets/game/rulers/rulersImages/H/247.png", "png");
+        add("assets/game/rulers/rulersImages/H/Zedong.png", "png");
+        add(
+            "assets/map/TestMap/scenarios/TheGreatWar/AlliancesSpecial.json",
+            "[{FlagTag:\"ming\",Name_Alliance:\" 大明朝贡体系\",Name_FirstTier:\"藩国\"}]",
+        );
+        // 兵种：索引 + 兵种文件（第二个兵种的文件故意缺失——型号为空仍保留条目）。
+        add(
+            "assets/game/units/Units.json",
+            "{\n\tArmy: [\n\t\t{\n\t\t\tFile: \"Warior.json\",\n\t\t\tID: 0,\n\t\t\tLine: 0,\n\t\t},\n\t\t{\n\t\t\tFile: \"机械部队.json\",\n\t\t\tID: 1,\n\t\t\tLine: 1,\n\t\t},\n\t],\n\tAge_of_History: Army\n}",
+        );
+        add(
+            "assets/game/units/Warior.json",
+            "{\n\tArmy: [\n\t\t{ Name: \"NoviceWarrior\", },\n\t\t{ Name: \"Warrior\", },\n\t],\n}",
+        );
         drop(add);
         zip.finish().unwrap();
     }
@@ -3166,15 +4076,60 @@ mod tests {
         assert_eq!(
             lookup.religions,
             vec![
-                IdNameEntry { id: 0, name: "Pagan".into() },
-                IdNameEntry { id: 1, name: "Catholic".into() },
+                IdNameEntry { id: 0, name: "异教".into() },
+                IdNameEntry { id: 1, name: "天主教".into() },
             ]
         );
         assert_eq!(
             lookup.resources,
             vec![
-                IdNameEntry { id: 0, name: "Grain".into() },
+                IdNameEntry { id: 0, name: "粮食".into() },
                 IdNameEntry { id: 1, name: "Rice".into() },
+            ]
+        );
+        // 逆向补全批次：法令 / 大洲 / 决议。
+        assert_eq!(
+            lookup.laws,
+            vec![
+                LawEntry {
+                    title: "征兵法案".into(),
+                    options: vec!["志愿兵制".into(), "有限征兵".into()],
+                },
+                LawEntry {
+                    title: "领导人的生命".into(),
+                    options: vec!["我们都是普通人".into(), "领导人永远不死".into()],
+                },
+            ]
+        );
+        assert_eq!(
+            lookup.continents,
+            vec![
+                IdNameEntry { id: 0, name: "Ocean".into() },
+                IdNameEntry { id: 1, name: "Europe".into() },
+            ]
+        );
+        assert_eq!(
+            lookup.decisions,
+            vec![DecisionEntry {
+                id: "rom统一罗马".into(),
+                name: "罗马尼亚的未竟之业".into(),
+                events: vec!["罗马帝国宣战巴尔干地区".into()],
+            }]
+        );
+        // 兵种：ID + 型号名（缺文件时型号为空；名称与型号经语言表翻译）。
+        assert_eq!(
+            lookup.units,
+            vec![
+                UnitEntry {
+                    id: 0,
+                    name: "Warior".into(),
+                    armies: vec!["新手战士".into(), "战士".into()],
+                },
+                UnitEntry {
+                    id: 1,
+                    name: "机械部队".into(),
+                    armies: Vec::new(),
+                },
             ]
         );
     }
@@ -3378,6 +4333,44 @@ mod tests {
         let _ = fs::remove_dir_all(&workspace);
     }
 
+    /// 统治者头像目录与剧情特殊联盟文件：目录推导（assets 段）与内容收集。
+    #[test]
+    fn collect_ruler_and_alliance_sources() {
+        let workspace = temp_dir("ruler-alliance");
+        let ruler_dir = workspace.join("包名/assets/game/rulers/rulersImages/H");
+        fs::create_dir_all(&ruler_dir).unwrap();
+        fs::write(ruler_dir.join("247.png"), b"x").unwrap();
+        fs::write(ruler_dir.join("Zedong.png"), b"x").unwrap();
+        fs::write(ruler_dir.join("readme.txt"), b"x").unwrap();
+        let scenario = workspace.join("包名/assets/map/Earth3/scenarios/TheGreatWar");
+        fs::create_dir_all(&scenario).unwrap();
+        fs::write(
+            scenario.join("AlliancesSpecial.json"),
+            "[{Name_Alliance:\"日本国\"},{Name_Alliance:\" 大明朝贡体系\"}]",
+        )
+        .unwrap();
+
+        let missions_root = "包名/assets/map/Earth3/scenarios/TheGreatWar/missions";
+        assert_eq!(
+            event_ruler_image_relative_dirs(missions_root),
+            vec!["包名/assets/game/rulers/rulersImages/H".to_string()]
+        );
+        assert_eq!(
+            event_alliance_special_relative_paths(missions_root),
+            vec![
+                "包名/assets/map/Earth3/scenarios/TheGreatWar/AlliancesSpecial.json".to_string()
+            ]
+        );
+        let rulers = collect_ruler_image_names(&workspace, missions_root);
+        assert_eq!(rulers, vec!["247".to_string(), "Zedong".to_string()]);
+        let alliances = collect_alliance_special_names(&workspace, missions_root);
+        assert_eq!(
+            alliances,
+            vec!["日本国".to_string(), "大明朝贡体系".to_string()]
+        );
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
     #[test]
     fn apk_event_image_names_reads_entries() {
         let dir = temp_dir("event-images-apk");
@@ -3399,6 +4392,14 @@ mod tests {
                 "西线".to_string(),
             ]
         );
+        // 统治者头像（去 .png）与剧情特殊联盟（顺序保持）。
+        let rulers = apk_ruler_image_names(&archive, "测试包/assets/game/missions");
+        assert_eq!(rulers, vec!["247".to_string(), "Zedong".to_string()]);
+        let alliances = apk_alliance_special_names(
+            &archive,
+            "测试包/assets/map/TestMap/scenarios/TheGreatWar/missions",
+        );
+        assert_eq!(alliances, vec!["大明朝贡体系".to_string()]);
         // 剧本根：剧本 events/common 与 missionsEvents 同样收录。
         let scenario_events = apk_event_names(
             &archive,

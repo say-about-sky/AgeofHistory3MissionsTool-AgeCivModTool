@@ -65,6 +65,39 @@ pub fn listen_workspace_changed(on_changed: impl FnMut() + 'static) {
 	event_listener.forget();
 }
 
+/// 资源管理器文件操作进度事件负载（复制/移动/删除大目录时后端上报）。
+/// `total = 0` 表示总量未知（SAF 模式），前端显示不确定进度条。
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileOpProgressPayload {
+	/// 操作类型：copy / move / delete（展示用）。
+	#[allow(dead_code)]
+	pub kind: String,
+	pub stage: String,
+	pub completed: u64,
+	pub total: u64,
+}
+
+/// 监听资源管理器文件操作进度（复制/移动/删除）。
+///
+/// 进度由后端命令通过 `file-op-progress` 事件上报；事件只在应用生命周期内注册
+/// 一次（调用方用 `use_hook` 包一次）。**回调在 dioxus 作用域之外执行**：
+/// 只能做不依赖作用域的操作（仅 `Signal::set`），禁止 `spawn`/读信号/调用 hook。
+pub fn listen_file_op_progress(on_progress: impl FnMut(FileOpProgressPayload) + 'static) {
+	let callback = std::rc::Rc::new(std::cell::RefCell::new(on_progress));
+
+	let event_listener = Closure::<dyn FnMut(JsValue)>::new(move |event: JsValue| {
+		let Ok(payload) = js_sys::Reflect::get(&event, &JsValue::from_str("payload")) else {
+			return;
+		};
+		if let Ok(parsed) = serde_wasm_bindgen::from_value::<FileOpProgressPayload>(payload) {
+			(callback.borrow_mut())(parsed);
+		}
+	});
+	let _ = listen_event("file-op-progress", event_listener.as_ref());
+	event_listener.forget();
+}
+
 /// 等待指定毫秒（`setTimeout` 包装成 Promise）：用于「短暂提示后自动收起」等场景。
 pub async fn sleep_ms(milliseconds: u32) {
 	let promise = Promise::new(&mut |resolve, _reject| {
