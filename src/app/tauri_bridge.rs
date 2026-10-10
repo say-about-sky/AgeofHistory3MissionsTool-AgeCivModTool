@@ -5,16 +5,56 @@ use wasm_bindgen_futures::JsFuture;
 
 #[wasm_bindgen]
 extern "C" {
-	#[wasm_bindgen(js_namespace = ["window", "__TAURI__", "core"])]
-	pub fn invoke(cmd: &str, args: JsValue) -> Promise;
+	#[wasm_bindgen(js_namespace = ["window", "__TAURI__", "core"], js_name = invoke)]
+	fn invoke_raw(cmd: &str, args: JsValue) -> Promise;
 
 	/// 打开系统文件/目录选择器（`options.directory` 控制模式）。
 	#[wasm_bindgen(js_namespace = ["window", "__TAURI__", "dialog"], js_name = open)]
-	pub fn open_dialog(options: JsValue) -> Promise;
+	fn open_dialog_raw(options: JsValue) -> Promise;
 
 	/// 监听应用事件（`window.__TAURI__.event.listen`）。
 	#[wasm_bindgen(js_namespace = ["window", "__TAURI__", "event"], js_name = listen)]
-	fn listen_event(event: &str, handler: &JsValue) -> Promise;
+	fn listen_event_raw(event: &str, handler: &JsValue) -> Promise;
+}
+
+/// 是否运行在 Tauri 环境（桌面窗口 / Android 应用）。
+///
+/// 纯浏览器调试（`dx serve`）下 `window.__TAURI__` 不存在。此时命令调用一律返回
+/// **被拒绝的 Promise**（走调用方既有的错误提示路径）、事件监听静默跳过——
+/// 直接调用未包装的绑定会向 wasm 抛 JS 异常并中断组件渲染（页面空白）。
+pub fn is_tauri_available() -> bool {
+	web_sys::window()
+		.and_then(|window| js_sys::Reflect::get(&window, &JsValue::from_str("__TAURI__")).ok())
+		.map(|tauri| !tauri.is_undefined() && !tauri.is_null())
+		.unwrap_or(false)
+}
+
+/// 调用 Tauri 命令（非 Tauri 环境返回拒绝原因明确的 Promise）。
+pub fn invoke(cmd: &str, args: JsValue) -> Promise {
+	if !is_tauri_available() {
+		return Promise::reject(&JsValue::from_str(&format!(
+			"纯浏览器调试环境不支持命令 {cmd}（请改用 cargo tauri dev 启动桌面窗口）"
+		)));
+	}
+	invoke_raw(cmd, args)
+}
+
+/// 打开系统文件/目录选择器（非 Tauri 环境返回拒绝的 Promise）。
+pub fn open_dialog(options: JsValue) -> Promise {
+	if !is_tauri_available() {
+		return Promise::reject(&JsValue::from_str(
+			"纯浏览器调试环境不支持系统文件对话框（请改用 cargo tauri dev 启动桌面窗口）",
+		));
+	}
+	open_dialog_raw(options)
+}
+
+/// 注册事件监听（非 Tauri 环境静默跳过，返回空 Promise）。
+fn listen_event(event: &str, handler: &JsValue) -> Promise {
+	if !is_tauri_available() {
+		return Promise::resolve(&JsValue::UNDEFINED);
+	}
+	listen_event_raw(event, handler)
 }
 
 /// APK 操作进度事件负载（Rust 命令 `emit` 与 Android 插件 `trigger` 格式一致）。

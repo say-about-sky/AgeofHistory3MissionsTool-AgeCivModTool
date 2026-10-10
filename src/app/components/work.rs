@@ -6,53 +6,36 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 
 use super::{
+	decision::{
+		decision_tab_id, decision_tab_title, is_decision_file, is_decision_tab_id, DecisionGroup,
+		DecisionPanel, DecisionTab, DECISION_TAB_PREFIX,
+	},
 	FocusIcon, FocusTarget, MindClipboard, MindMapCanvas, MissionRecord, Shared, WorkDirectory,
-	event::{delete_event_text, rename_event_text, save_event_text, EventPanel},
+	event::EventPanel,
 	files::{ExplorerClipboard, ExplorerCommand, Files, WorkspaceFile},
 	frame::Frame,
 	missions_roots::{
-		default_tree_path, missions_root_label, missions_root_of, missions_subfile, missions_tree_file,
+		default_tree_path, missions_root_label, missions_root_of, missions_root_of_events_dir,
+		missions_subfile, missions_tree_file,
+	},
+	// 平台分派文件操作（桌面真实路径 / 安卓 SAF 两套实现的集中地；新增请加在 platform_fs）。
+	platform_fs::{
+		create_scoped_workspace_skeleton, delete_event_text, import_source_apk_event_text,
+		invoke_scoped, join_scoped_path, load_decision_groups, load_single_icon, load_tree_icons,
+		load_tree_records, load_workspace_files, rename_event_text, save_decision_groups,
+		save_event_text, save_tree_file, scan_scoped_workspace_files, LoadProgress,
+		WorkDirectoryArgs,
 	},
 	undo::{
-		focus_wants_native_undo, now_ms, pop_applicable, UndoDepths, UndoEntry, UndoRegistration,
-		UndoScope, UndoZone, UNDO_LIMIT, UNDO_MERGE_WINDOW_MS,
+		canvas_scope_is_open, decision_scope_is_open, focus_wants_native_undo, now_ms,
+		pop_applicable, UndoDepths, UndoEntry, UndoRegistration, UndoScope, UndoZone, UNDO_LIMIT,
+		UNDO_MERGE_WINDOW_MS,
 	},
 };
 use crate::app::tauri_bridge::{
 	invoke, listen_apk_progress, listen_file_op_progress, listen_workspace_changed, open_dialog,
 	sleep_ms,
 };
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct MissionFileArgs {
-	work_directory: String,
-	missions_root: String,
-	file_name: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SaveMissionsFileArgs {
-	work_directory: String,
-	missions_root: String,
-	file_name: String,
-	missions: Vec<MissionRecord>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct MissionIconsArgs {
-	work_directory: String,
-	missions_root: String,
-	names: Vec<String>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct WorkDirectoryArgs {
-	work_directory: String,
-}
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -105,6 +88,8 @@ struct LookupSourceArgs {
 	work_directory: String,
 	/// 作为补全数据源的 APK 位置（绝对路径或 content:// URI）。
 	apk_path: String,
+	/// 目标模组目录（工作区顶层目录名；None = 对全部模组生效）。
+	mod_dir: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -113,6 +98,8 @@ struct LookupSourceScopedArgs {
 	folder_id: String,
 	/// 作为补全数据源的 APK 位置（content:// URI、绝对路径或工作区内相对路径）。
 	apk_path: String,
+	/// 目标模组目录（工作区顶层目录名；None = 对全部模组生效）。
+	mod_dir: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -146,53 +133,6 @@ struct ScopedFolder {
 	name: Option<String>,
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ScopedEntry {
-	name: String,
-	path: String,
-	is_dir: bool,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ScopedFolderPath {
-	folder_id: String,
-	path: Option<String>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ScopedReadFilesArgs {
-	folder_id: String,
-	dir_path: String,
-	names: Vec<String>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ScopedFilePath {
-	folder_id: String,
-	path: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ScopedWriteTextFile {
-	folder_id: String,
-	path: String,
-	contents: String,
-	recursive: bool,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ScopedMkdir {
-	folder_id: String,
-	path: String,
-	recursive: bool,
-}
-
 async fn is_android() -> Result<bool, String> {
 	let value = JsFuture::from(invoke("is_android", js_sys::Object::new().into()))
 		.await
@@ -218,141 +158,6 @@ async fn open_all_files_access_settings() -> Result<bool, String> {
 	value
 		.as_bool()
 		.ok_or_else(|| "全盘文件授权结果无效".to_string())
-}
-
-/// 调用 Android scoped 命令（参数为 camelCase serde 结构，返回 void）。
-async fn invoke_scoped<T: Serialize>(command: &str, context: &str, args: &T) -> Result<(), String> {
-	let args = serde_wasm_bindgen::to_value(args).map_err(|error| error.to_string())?;
-	JsFuture::from(invoke(command, args))
-		.await
-		.map_err(|error| format!("{context}：{error:?}"))?;
-	Ok(())
-}
-
-
-/// 读取 Android 工作区目录（走 App 自带快速插件：单次子项游标查询列出一层目录）。
-async fn scoped_read_dir(
-	folder_id: &str,
-	path: Option<String>,
-) -> Result<Vec<ScopedEntry>, String> {
-	let args = serde_wasm_bindgen::to_value(&ScopedFolderPath {
-		folder_id: folder_id.to_string(),
-		path,
-	})
-	.map_err(|error| error.to_string())?;
-	let value = JsFuture::from(invoke("list_scoped_dir", args))
-		.await
-		.map_err(|error| format!("读取 Android 目录失败：{error:?}"))?;
-	serde_wasm_bindgen::from_value(value).map_err(|error| format!("读取目录列表失败：{error}"))
-}
-
-/// SAF（folder_id）模式的工作区递归列举（前序 DFS）。
-/// 桥接层保证每层目录内「文件夹优先、其次文件」；这里逆序压栈，
-/// 使展开顺序与目录内排列一致，子树行紧跟父目录行（资源管理器虚拟列表依赖前序顺序）。
-async fn scan_scoped_workspace_files(
-	folder_id: &str,
-	root_path: &str,
-) -> Result<Vec<WorkspaceFile>, String> {
-	let mut entries = Vec::new();
-	let mut pending = vec![root_path.to_string()];
-	while let Some(directory) = pending.pop() {
-		let path = if directory.is_empty() {
-			None
-		} else {
-			Some(directory)
-		};
-		let mut subdirectories = Vec::new();
-		for entry in scoped_read_dir(folder_id, path).await? {
-			let relative_path = entry
-				.path
-				.strip_prefix(root_path)
-				.unwrap_or(&entry.path)
-				.trim_start_matches('/')
-				.to_string();
-			entries.push(WorkspaceFile {
-				name: entry.name,
-				relative_path,
-				is_directory: entry.is_dir,
-			});
-			if entry.is_dir {
-				subdirectories.push(entry.path);
-			}
-		}
-		// 逆序入栈：弹出时按目录内排列顺序深度优先展开。
-		pending.extend(subdirectories.into_iter().rev());
-	}
-	Ok(entries)
-}
-
-/// 批量读取 Android 工作区图标（快速路径：单次列目录 + 直读文件，返回 data URL；缺失项自动跳过）。
-async fn scoped_read_files_in_dir(
-	folder_id: &str,
-	dir_path: &str,
-	names: &[String],
-) -> Result<Vec<FocusIcon>, String> {
-	let args = serde_wasm_bindgen::to_value(&ScopedReadFilesArgs {
-		folder_id: folder_id.to_string(),
-		dir_path: dir_path.to_string(),
-		names: names.to_vec(),
-	})
-	.map_err(|error| error.to_string())?;
-	let value = JsFuture::from(invoke("read_scoped_files_in_dir", args))
-		.await
-		.map_err(|error| format!("读取 Android 工作区图标失败：{error:?}"))?;
-	serde_wasm_bindgen::from_value(value).map_err(|error| format!("图标数据格式错误：{error}"))
-}
-
-async fn scoped_read_text_file(folder_id: &str, path: String) -> Result<String, String> {
-	let args = serde_wasm_bindgen::to_value(&ScopedFilePath {
-		folder_id: folder_id.to_string(),
-		path,
-	})
-	.map_err(|error| error.to_string())?;
-	let value = JsFuture::from(invoke("read_scoped_text_file", args))
-		.await
-		.map_err(|error| format!("读取工作区文本失败：{error:?}"))?;
-	value
-		.as_string()
-		.ok_or_else(|| "工作区文本读取结果无效".to_string())
-}
-
-async fn scoped_write_text_file(
-	folder_id: &str,
-	path: String,
-	contents: String,
-) -> Result<(), String> {
-	let args = serde_wasm_bindgen::to_value(&ScopedWriteTextFile {
-		folder_id: folder_id.to_string(),
-		path,
-		contents,
-		recursive: true,
-	})
-	.map_err(|error| error.to_string())?;
-	JsFuture::from(invoke("write_scoped_text_file", args))
-		.await
-		.map_err(|error| format!("写入工作区文本失败：{error:?}"))?;
-	Ok(())
-}
-
-async fn scoped_mkdir(folder_id: &str, path: String) -> Result<(), String> {
-	let args = serde_wasm_bindgen::to_value(&ScopedMkdir {
-		folder_id: folder_id.to_string(),
-		path,
-		recursive: true,
-	})
-	.map_err(|error| error.to_string())?;
-	JsFuture::from(invoke("mkdir_scoped_dir", args))
-		.await
-		.map_err(|error| format!("创建工作区目录失败：{error:?}"))?;
-	Ok(())
-}
-
-fn join_scoped_path(parent: &str, child: &str) -> String {
-	if parent.is_empty() {
-		child.to_string()
-	} else {
-		format!("{parent}/{child}")
-	}
 }
 
 fn join_rel_path(parent: &str, name: &str) -> String {
@@ -1015,16 +820,20 @@ async fn export_apk_sections_to_apk(
 }
 
 /// 「指定补全数据 APK」：把 APK 位置写入工作区根标记（事件编辑器补全用）。
+/// 「指定补全数据 APK」：把 APK 位置写入标记（事件编辑器补全用）。
+/// `mod_dir` = 目标模组目录（仅该模组生效）；None = 工作区根（全部模组）。
 /// 真实路径模式走 `set_lookup_source_apk`，SAF 模式走 `set_lookup_source_apk_scoped`。
 async fn set_lookup_source_apk(
 	directory: &WorkDirectory,
 	apk_path: &str,
+	mod_dir: Option<String>,
 ) -> Result<String, String> {
 	let value = match &directory.folder_id {
 		Some(folder_id) => {
 			let args = serde_wasm_bindgen::to_value(&LookupSourceScopedArgs {
 				folder_id: folder_id.clone(),
 				apk_path: apk_path.to_string(),
+				mod_dir: mod_dir.clone(),
 			})
 			.map_err(|error| error.to_string())?;
 			JsFuture::from(invoke("set_lookup_source_apk_scoped", args)).await
@@ -1033,6 +842,7 @@ async fn set_lookup_source_apk(
 			let args = serde_wasm_bindgen::to_value(&LookupSourceArgs {
 				work_directory: directory.root_path.clone(),
 				apk_path: apk_path.to_string(),
+				mod_dir: mod_dir.clone(),
 			})
 			.map_err(|error| error.to_string())?;
 			JsFuture::from(invoke("set_lookup_source_apk", args)).await
@@ -1043,6 +853,67 @@ async fn set_lookup_source_apk(
 		.as_string()
 		.ok_or_else(|| "设置结果格式错误".to_string())
 }
+
+/// 「指定补全数据 APK」的目标模组目录（模组隔离）：
+/// 1. 当前激活标签页（国策树 / 决议）所属的（上级）模组目录；
+/// 2. 资源管理器高亮选择的文件 / 文件夹所属模组目录；
+/// 3. 都没有 → None（对全部模组生效，写入工作区根）。
+/// 工作区顶层必须确有该目录（`workspace_files` 中 `is_directory`），否则不判定为模组。
+fn lookup_target_mod_dir(
+	active_tab_id: Option<&str>,
+	open_tabs: &[TreeTab],
+	decision_tabs: &[DecisionTab],
+	selected: Option<&str>,
+	files: &[WorkspaceFile],
+) -> Option<String> {
+	// 激活标签页 → 其工作区相对路径（决议标签 id 带 `decision:` 前缀；
+	// 国策树标签 id 即 json 路径，这里统一按 id → 路径解析）。
+	let tab_path = active_tab_id.and_then(|id| {
+		if let Some(path) = id.strip_prefix(DECISION_TAB_PREFIX) {
+			Some(path.to_string())
+		} else {
+			open_tabs
+				.iter()
+				.find(|tab| tab.id == id)
+				.map(|tab| tab.json_path.clone())
+		}
+	});
+	// 决议标签即使已关闭（id 保留时）也应有对应 tab；找不到时退回按 id 当路径解析。
+	let tab_path = tab_path.or_else(|| {
+		active_tab_id
+			.filter(|id| !open_tabs.iter().any(|tab| tab.id == *id))
+			.and_then(|id| decision_tabs.iter().find(|tab| tab.id == id))
+			.map(|tab| tab.relative_path.clone())
+	});
+	for candidate in [tab_path.as_deref(), selected] {
+		if let Some(dir) = candidate.and_then(|path| top_level_mod_dir(path, files)) {
+			return Some(dir);
+		}
+	}
+	None
+}
+
+/// 路径首段若为工作区顶层目录则视为「模组目录」（如 `modB/assets/…` → `modB`）。
+fn top_level_mod_dir(path: &str, files: &[WorkspaceFile]) -> Option<String> {
+	let segment = path.split('/').find(|segment| !segment.is_empty())?;
+	files
+		.iter()
+		.any(|file| file.is_directory && file.relative_path == segment)
+		.then(|| segment.to_string())
+}
+
+/// 打开事件时的补全根（missions 资源根）：按事件目录推导其**所属模组**的资源根
+/// （`on_open_script` 统一入口内部使用，决议编辑器 / 资源管理器 / 画布菜单 / 热导入
+/// 等所有打开路径共用；多模组工作区互不串扰）。
+/// 常规布局推导失败时退回工作区默认国策资源根（取其所在目录）；没有国策树时返回 None。
+fn event_missions_root_for_dir(events_dir: &str, files: &[WorkspaceFile]) -> Option<String> {
+	if let Some(root) = missions_root_of_events_dir(events_dir) {
+		return Some(root);
+	}
+	let tree = default_tree_path(files.iter().map(|file| file.relative_path.as_str()))?;
+	tree.rsplit_once('/').map(|(dir, _)| dir.to_string())
+}
+
 
 /// 打包工作区内的目录为 APK（产物位于源目录同级，不签名）。
 async fn package_workspace_apk(
@@ -1299,193 +1170,6 @@ async fn import_signing_key_to_workspace(
 	Ok(summary.message)
 }
 
-async fn load_workspace_files(
-	work_directory: &WorkDirectory,
-) -> Result<Vec<WorkspaceFile>, String> {
-	if let Some(folder_id) = &work_directory.folder_id {
-		return scan_scoped_workspace_files(folder_id, &work_directory.root_path).await;
-	}
-
-	let args = serde_wasm_bindgen::to_value(&WorkDirectoryArgs {
-		work_directory: work_directory.root_path.clone(),
-	})
-	.map_err(|error| error.to_string())?;
-	let files_value = JsFuture::from(invoke("list_workspace_files", args))
-		.await
-		.map_err(|error| format!("读取工作区文件失败：{error:?}"))?;
-	serde_wasm_bindgen::from_value(files_value)
-		.map_err(|error| format!("工作区文件格式错误：{error}"))
-}
-
-/// 读取单个国策树配置（missions 目录下的 .json 文件）。
-async fn load_tree_records(
-	work_directory: &WorkDirectory,
-	json_path: &str,
-) -> Result<Vec<MissionRecord>, String> {
-	if let Some(folder_id) = &work_directory.folder_id {
-		let path = join_scoped_path(&work_directory.root_path, json_path);
-		let contents = scoped_read_text_file(folder_id, path.clone()).await?;
-		let args = serde_wasm_bindgen::to_value(&ParseMissionsArgs { contents })
-			.map_err(|error| error.to_string())?;
-		let value = JsFuture::from(invoke("parse_missions", args))
-			.await
-			.map_err(|error| format!("读取国策配置失败：{error:?}"))?;
-		let parsed: ParsedMissionsFile = serde_wasm_bindgen::from_value(value)
-			.map_err(|error| format!("国策配置格式错误：{error}"))?;
-		// 宽松语法的文件在打开时被自动纠正：把规范化内容写回原文件。
-		if let Some(corrected) = parsed.corrected_contents {
-			scoped_write_text_file(folder_id, path, corrected)
-				.await
-				.map_err(|error| format!("自动纠正语法后保存失败：{error}"))?;
-		}
-		Ok(parsed.missions)
-	} else {
-		let (missions_root, file_name) = missions_tree_file(json_path)
-			.ok_or_else(|| format!("不是有效的国策树文件：{json_path}"))?;
-		let args = serde_wasm_bindgen::to_value(&MissionFileArgs {
-			work_directory: work_directory.root_path.clone(),
-			missions_root,
-			file_name,
-		})
-		.map_err(|error| error.to_string())?;
-		let value = JsFuture::from(invoke("load_missions_file", args))
-			.await
-			.map_err(|error| format!("读取国策配置失败：{error:?}"))?;
-		serde_wasm_bindgen::from_value(value)
-			.map_err(|error| format!("国策配置格式错误：{error}"))
-	}
-}
-
-/// 仅加载该树实际引用到的图标（缺失的图标静默跳过）。
-async fn load_tree_icons(
-	work_directory: &WorkDirectory,
-	json_path: &str,
-	missions: &[MissionRecord],
-	mut progress: Signal<Option<LoadProgress>>,
-) -> Result<Vec<FocusIcon>, String> {
-	let mut names: Vec<String> = missions
-		.iter()
-		.map(|mission| {
-			mission
-				.image_name
-				.strip_suffix(".png")
-				.unwrap_or(&mission.image_name)
-				.to_string()
-		})
-		.filter(|name| !name.is_empty())
-		.collect();
-	names.sort();
-	names.dedup();
-
-	let missions_root = missions_root_of(json_path).unwrap_or_else(|| "missions".to_string());
-	if let Some(folder_id) = &work_directory.folder_id {
-		let icon_directory = join_scoped_path(
-			&work_directory.root_path,
-			&format!("{missions_root}/missionsImages/H"),
-		);
-		let total_icons = names.len();
-		let mut icons = Vec::with_capacity(total_icons);
-		let mut completed = 0_usize;
-		for chunk in names.chunks(ICON_READ_CHUNK_SIZE) {
-			icons.extend(scoped_read_files_in_dir(folder_id, &icon_directory, chunk).await?);
-			completed += chunk.len();
-			progress.set(Some(LoadProgress {
-				stage: format!("正在载入国策图标（{completed}/{total_icons}）..."),
-				completed,
-				total: total_icons,
-			}));
-		}
-		Ok(icons)
-	} else {
-		let args = serde_wasm_bindgen::to_value(&MissionIconsArgs {
-			work_directory: work_directory.root_path.clone(),
-			missions_root: missions_root.clone(),
-			names,
-		})
-		.map_err(|error| error.to_string())?;
-		let value = JsFuture::from(invoke("load_mission_icons", args))
-			.await
-			.map_err(|error| format!("读取国策图标失败：{error:?}"))?;
-		serde_wasm_bindgen::from_value(value)
-			.map_err(|error| format!("国策图标格式错误：{error}"))
-	}
-}
-
-/// 手动加载单个图标（资源管理器双击 .png 时调用）；文件缺失时返回 None。
-async fn load_single_icon(
-	work_directory: &WorkDirectory,
-	name: &str,
-	relative_path: &str,
-) -> Result<Option<FocusIcon>, String> {
-	if let Some(folder_id) = &work_directory.folder_id {
-		let (dir_part, file_name) = relative_path
-			.rsplit_once('/')
-			.map_or(("", relative_path), |(dir, file)| (dir, file));
-		let dir_path = join_scoped_path(&work_directory.root_path, dir_part);
-		let stem = file_name
-			.rsplit_once('.')
-			.map_or(file_name, |(stem, _)| stem);
-		let found = scoped_read_files_in_dir(folder_id, &dir_path, &[stem.to_string()]).await?;
-		Ok(found.into_iter().next().map(|icon| FocusIcon {
-			name: name.to_string(),
-			data_url: icon.data_url,
-		}))
-	} else {
-		let missions_root =
-			missions_root_of(relative_path).unwrap_or_else(|| "missions".to_string());
-		let args = serde_wasm_bindgen::to_value(&MissionIconsArgs {
-			work_directory: work_directory.root_path.clone(),
-			missions_root,
-			names: vec![name.to_string()],
-		})
-		.map_err(|error| error.to_string())?;
-		let value = JsFuture::from(invoke("load_mission_icons", args))
-			.await
-			.map_err(|error| format!("读取国策图标失败：{error:?}"))?;
-		let icons: Vec<FocusIcon> = serde_wasm_bindgen::from_value(value)
-			.map_err(|error| format!("国策图标格式错误：{error}"))?;
-		Ok(icons.into_iter().next())
-	}
-}
-
-/// 保存单个国策树到对应的 .json 文件。
-async fn save_tree_file(
-	work_directory: &WorkDirectory,
-	json_path: &str,
-	records: Vec<MissionRecord>,
-) -> Result<(), String> {
-	if let Some(folder_id) = &work_directory.folder_id {
-		let args = serde_wasm_bindgen::to_value(&SerializeMissionsArgs { missions: records })
-			.map_err(|error| error.to_string())?;
-		let value = JsFuture::from(invoke("serialize_missions", args))
-			.await
-			.map_err(|error| format!("序列化国策配置失败：{error:?}"))?;
-		let contents = value
-			.as_string()
-			.ok_or_else(|| "国策配置序列化结果无效".to_string())?;
-		scoped_write_text_file(
-			folder_id,
-			join_scoped_path(&work_directory.root_path, json_path),
-			contents,
-		)
-		.await
-	} else {
-		let (missions_root, file_name) = missions_tree_file(json_path)
-			.ok_or_else(|| format!("不是有效的国策树文件：{json_path}"))?;
-		let args = serde_wasm_bindgen::to_value(&SaveMissionsFileArgs {
-			work_directory: work_directory.root_path.clone(),
-			missions_root,
-			file_name,
-			missions: records,
-		})
-		.map_err(|error| error.to_string())?;
-		JsFuture::from(invoke("save_missions_file", args))
-			.await
-			.map_err(|error| format!("保存国策配置失败：{error:?}"))?;
-		Ok(())
-	}
-}
-
 /// 标签页显示名：经典资源用文件名，嵌套资源加资源标签前缀避免同名混淆。
 fn tree_tab_title(json_path: &str) -> String {
 	match missions_tree_file(json_path) {
@@ -1525,30 +1209,6 @@ fn package_candidates(files: &[WorkspaceFile]) -> Vec<String> {
 	directories
 }
 
-#[derive(Serialize)]
-struct ParseMissionsArgs {
-	contents: String,
-}
-
-/// `parse_missions` 的返回：解析出的国策记录；文件语法被自动纠正时附带规范化后的内容。
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ParsedMissionsFile {
-	missions: Vec<MissionRecord>,
-	#[serde(default)]
-	corrected_contents: Option<String>,
-}
-
-#[derive(Clone)]
-struct LoadProgress {
-	stage: String,
-	completed: usize,
-	total: usize,
-}
-
-/// 单批并发读取的图标数量，平衡 IPC 并发度与内存占用。
-const ICON_READ_CHUNK_SIZE: usize = 8;
-
 /// 一个已打开的国策树标签页：持有该树的配置与引用图标，关闭标签页即释放。
 /// missions / icons 用共享句柄存储：父级重渲染时只做引用计数克隆与指针比较，
 /// 不再深拷贝/深比较整棵数据（大图标库可达数 MB）。
@@ -1570,6 +1230,8 @@ struct ZoneUndoStacks {
 	canvas_redo: Vec<UndoEntry>,
 	events_undo: Vec<UndoEntry>,
 	events_redo: Vec<UndoEntry>,
+	decisions_undo: Vec<UndoEntry>,
+	decisions_redo: Vec<UndoEntry>,
 	explorer_undo: Vec<UndoEntry>,
 	explorer_redo: Vec<UndoEntry>,
 }
@@ -1579,6 +1241,7 @@ impl ZoneUndoStacks {
 		match zone {
 			UndoZone::Canvas => &mut self.canvas_undo,
 			UndoZone::Events => &mut self.events_undo,
+			UndoZone::Decisions => &mut self.decisions_undo,
 			UndoZone::Explorer => &mut self.explorer_undo,
 		}
 	}
@@ -1587,6 +1250,7 @@ impl ZoneUndoStacks {
 		match zone {
 			UndoZone::Canvas => &mut self.canvas_redo,
 			UndoZone::Events => &mut self.events_redo,
+			UndoZone::Decisions => &mut self.decisions_redo,
 			UndoZone::Explorer => &mut self.explorer_redo,
 		}
 	}
@@ -1601,6 +1265,8 @@ impl ZoneUndoStacks {
 			canvas_redo: self.canvas_redo.len(),
 			events_undo: self.events_undo.len(),
 			events_redo: self.events_redo.len(),
+			decisions_undo: self.decisions_undo.len(),
+			decisions_redo: self.decisions_redo.len(),
 			explorer_undo: self.explorer_undo.len(),
 			explorer_redo: self.explorer_redo.len(),
 		}
@@ -1703,11 +1369,6 @@ const EVENTS_MIN_WIDTH: f64 = 260.0;
 const EVENTS_MAX_WIDTH: f64 = 760.0;
 
 #[derive(Serialize)]
-struct SerializeMissionsArgs {
-	missions: Vec<MissionRecord>,
-}
-
-#[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DirectoryNameArgs {
 	directory_name: String,
@@ -1718,6 +1379,8 @@ pub fn Work() -> Element {
 	let work_directory = use_signal(|| None::<WorkDirectory>);
 	let workspace_files = use_signal(Vec::<WorkspaceFile>::new);
 	let mut open_tabs = use_signal(Vec::<TreeTab>::new);
+	// 决议编辑标签页（与国策标签平行；id 带 `decision:` 前缀，共用 active_tab_id）。
+	let mut decision_tabs = use_signal(Vec::<DecisionTab>::new);
 	let mut active_tab_id = use_signal(|| None::<String>);
 	// 资源管理器手动加载的图标：双击 .png 时推送给对应标签页画布并入其图标列表。
 	let pending_icon = use_signal(|| None::<(String, FocusIcon)>);
@@ -1742,7 +1405,9 @@ pub fn Work() -> Element {
 	let mut files_open = use_signal(|| true);
 	let mut events_open = use_signal(|| false);
 	let events_root = use_signal(|| None::<String>);
-	let open_event_request = use_signal(|| None::<(String, u64)>);
+	// 打开请求：(事件目录, 文件名, 自增序号)；目录为工作区相对完整目录
+	//（`…/missionsEvents` 或 `…/events/…`，决议事件脚本常用后者）。
+	let open_event_request = use_signal(|| None::<(String, String, u64)>);
 	let rename_event_request = use_signal(|| None::<(String, String)>);
 	let mut selected_file = use_signal(|| None::<String>);
 	let explorer_clipboard = use_signal(|| None::<ExplorerClipboard>);
@@ -1802,9 +1467,11 @@ pub fn Work() -> Element {
 				let redo_stack = stacks.redo_mut(zone);
 				let redo_cleared = !redo_stack.is_empty();
 				redo_stack.clear();
-				let is_event_edit = matches!(&scope, UndoScope::EventFile(_));
+				// 连续输入类编辑（事件表格 / 决议编辑器）在时间窗内合并为一步。
+				let is_mergeable_edit =
+					matches!(&scope, UndoScope::EventFile(_) | UndoScope::DecisionFile(_));
 				let undo_stack = stacks.undo_mut(zone);
-				let mergeable = is_event_edit
+				let mergeable = is_mergeable_edit
 					&& undo_stack.last().is_some_and(|last| {
 						last.scope == scope && now - last.timestamp < UNDO_MERGE_WINDOW_MS
 					});
@@ -1842,11 +1509,18 @@ pub fn Work() -> Element {
 			let mut active_tab_id = active_tab_id;
 			let zone = *active_zone.read();
 			let event_scope = event_active_scope.read().clone();
+			let decision_scope: Option<String> = active_tab_id
+				.read()
+				.clone()
+				.filter(|id| is_decision_tab_id(id));
 			let entry = {
 				let mut stacks = undo_stacks.borrow_mut();
 				pop_applicable(stacks.undo_mut(zone), |entry| match &entry.scope {
 					UndoScope::EventFile(file) => {
 						event_scope.as_deref() == Some(file.as_str())
+					}
+					UndoScope::DecisionFile(id) => {
+						decision_scope.as_deref() == Some(id.as_str())
 					}
 					_ => true,
 				})
@@ -1854,9 +1528,12 @@ pub fn Work() -> Element {
 			let Some(entry) = entry else {
 				return;
 			};
-			// 画布条目：先激活对应标签页再应用，保证用户能看到变化。
-			if let UndoScope::Tab(tab_id) = &entry.scope {
-				active_tab_id.set(Some(tab_id.clone()));
+			// 画布 / 决议条目：先激活对应标签页再应用，保证用户能看到变化。
+			match &entry.scope {
+				UndoScope::Tab(tab_id) | UndoScope::DecisionFile(tab_id) => {
+					active_tab_id.set(Some(tab_id.clone()));
+				}
+				_ => {}
 			}
 			entry.undo.call(());
 			let mut stacks = undo_stacks.borrow_mut();
@@ -1871,11 +1548,18 @@ pub fn Work() -> Element {
 			let mut active_tab_id = active_tab_id;
 			let zone = *active_zone.read();
 			let event_scope = event_active_scope.read().clone();
+			let decision_scope: Option<String> = active_tab_id
+				.read()
+				.clone()
+				.filter(|id| is_decision_tab_id(id));
 			let entry = {
 				let mut stacks = undo_stacks.borrow_mut();
 				pop_applicable(stacks.redo_mut(zone), |entry| match &entry.scope {
 					UndoScope::EventFile(file) => {
 						event_scope.as_deref() == Some(file.as_str())
+					}
+					UndoScope::DecisionFile(id) => {
+						decision_scope.as_deref() == Some(id.as_str())
 					}
 					_ => true,
 				})
@@ -1883,13 +1567,77 @@ pub fn Work() -> Element {
 			let Some(entry) = entry else {
 				return;
 			};
-			if let UndoScope::Tab(tab_id) = &entry.scope {
-				active_tab_id.set(Some(tab_id.clone()));
+			match &entry.scope {
+				UndoScope::Tab(tab_id) | UndoScope::DecisionFile(tab_id) => {
+					active_tab_id.set(Some(tab_id.clone()));
+				}
+				_ => {}
 			}
 			entry.redo.call(());
 			let mut stacks = undo_stacks.borrow_mut();
 			stacks.undo_mut(zone).push(entry);
 			undo_depths.set(stacks.depths());
+		}
+	});
+
+	// 撤销安全网：条目的执行器/信号由对应组件作用域持有，组件卸载后再执行会 panic
+	//（Dropped(ValueDroppedError)，并可能连锁 RefCell already borrowed）。按「承载条目的
+	// 界面是否仍挂载」收敛两个子分区，把该约束作为不变式兜底所有移除路径：
+	// ①画布条目：只保留仍打开的标签页（关闭时有即时清理；文件被剪除等路径由此覆盖）；
+	// ②事件条目：事件面板（抽屉）关闭后其组件已卸载，条目全部作废。
+	let undo_stacks_for_reconcile = undo_stacks.clone();
+	use_effect(move || {
+		let open_ids: Vec<String> = open_tabs.read().iter().map(|tab| tab.id.clone()).collect();
+		let decision_ids: Vec<String> = decision_tabs
+			.read()
+			.iter()
+			.map(|tab| tab.id.clone())
+			.collect();
+		let events_open_now = *events_open.read();
+		// 先收敛栈，再在释放借用后更新深度信号（避免订阅回调重入借用 RefCell）。
+		let updated_depths = {
+			let mut stacks = undo_stacks_for_reconcile.borrow_mut();
+			let before = stacks.canvas_undo.len()
+				+ stacks.canvas_redo.len()
+				+ stacks.events_undo.len()
+				+ stacks.events_redo.len()
+				+ stacks.decisions_undo.len()
+				+ stacks.decisions_redo.len();
+			stacks
+				.canvas_undo
+				.retain(|entry| canvas_scope_is_open(&entry.scope, &open_ids));
+			stacks
+				.canvas_redo
+				.retain(|entry| canvas_scope_is_open(&entry.scope, &open_ids));
+			stacks
+				.decisions_undo
+				.retain(|entry| decision_scope_is_open(&entry.scope, &decision_ids));
+			stacks
+				.decisions_redo
+				.retain(|entry| decision_scope_is_open(&entry.scope, &decision_ids));
+			if !events_open_now {
+				stacks
+					.events_undo
+					.retain(|entry| !matches!(&entry.scope, UndoScope::EventFile(_)));
+				stacks
+					.events_redo
+					.retain(|entry| !matches!(&entry.scope, UndoScope::EventFile(_)));
+			}
+			let after = stacks.canvas_undo.len()
+				+ stacks.canvas_redo.len()
+				+ stacks.events_undo.len()
+				+ stacks.events_redo.len()
+				+ stacks.decisions_undo.len()
+				+ stacks.decisions_redo.len();
+			if after != before {
+				Some(stacks.depths())
+			} else {
+				None
+			}
+		};
+		if let Some(depths) = updated_depths {
+			let mut undo_depths = undo_depths;
+			undo_depths.set(depths);
 		}
 	});
 
@@ -2111,33 +1859,8 @@ pub fn Work() -> Element {
 						.await
 						.map_err(|error| format!("工作区名称无效：{error:?}"))?;
 					let root_path = join_scoped_path(&parent_directory.root_path, &directory_name);
-					scoped_mkdir(&folder_id, root_path.clone()).await?;
-					scoped_mkdir(
-						&folder_id,
-						join_scoped_path(&root_path, "missions/missionsImages/H"),
-					)
-					.await?;
-					scoped_mkdir(
-						&folder_id,
-						join_scoped_path(&root_path, "missions/missionsEvents"),
-					)
-					.await?;
-					let args = serde_wasm_bindgen::to_value(&SerializeMissionsArgs {
-						missions: Vec::new(),
-					})
-					.map_err(|error| error.to_string())?;
-					let value = JsFuture::from(invoke("serialize_missions", args))
-						.await
-						.map_err(|error| format!("初始化任务配置失败：{error:?}"))?;
-					let contents = value
-						.as_string()
-						.ok_or_else(|| "任务配置序列化结果无效".to_string())?;
-					scoped_write_text_file(
-						&folder_id,
-						join_scoped_path(&root_path, "missions/Missions.json"),
-						contents,
-					)
-					.await?;
+					// SAF 工作区骨架（missions 三件套 + 空 Missions.json）统一在 platform_fs 创建。
+					create_scoped_workspace_skeleton(&folder_id, &root_path).await?;
 					WorkDirectory {
 						display_path: format!(
 							"{}/{}",
@@ -2465,6 +2188,20 @@ pub fn Work() -> Element {
 		let mut apk_status = apk_status;
 		let mut lookup_epoch = lookup_epoch;
 		let selected = selected_file.read().clone();
+		// 模组隔离：优先当前标签页所属模组 → 资源管理器高亮项所属模组 → 全局（见函数注释）。
+		let target_mod = {
+			let active = active_tab_id.read().clone();
+			let open_tabs = open_tabs.read();
+			let decision_tabs = decision_tabs.read();
+			let files = workspace_files.read();
+			lookup_target_mod_dir(
+				active.as_deref(),
+				&open_tabs,
+				&decision_tabs,
+				selected.as_deref(),
+				&files,
+			)
+		};
 		spawn(async move {
 			let Some(directory) = work_directory.read().clone() else {
 				apk_status.set("设置失败：请先打开工作区".to_string());
@@ -2491,7 +2228,7 @@ pub fn Work() -> Element {
 				}
 			}
 			apk_status.set("正在设置补全数据源...".to_string());
-			match set_lookup_source_apk(&directory, &apk_path).await {
+			match set_lookup_source_apk(&directory, &apk_path, target_mod).await {
 				Ok(message) => {
 					apk_status.set(message);
 					// 事件编辑器按（工作区 | 资源根）缓存对照表：纪元 +1 强制重新加载。
@@ -2788,6 +2525,36 @@ pub fn Work() -> Element {
 		move |tab_id: String| {
 		let mut undo_depths = undo_depths;
 		dioxus_logger::tracing::info!("CLOSE-TAB: {tab_id}");
+		// 决议标签关闭：从决议集合移除并清理其撤销条目（国策逻辑不动）。
+		if is_decision_tab_id(&tab_id) {
+			let was_active = active_tab_id.read().as_deref() == Some(tab_id.as_str());
+			let remaining: Vec<DecisionTab> = decision_tabs
+				.read()
+				.iter()
+				.filter(|tab| tab.id != tab_id)
+				.cloned()
+				.collect();
+			if was_active {
+				let next_active = open_tabs
+					.read()
+					.first()
+					.map(|tab| tab.id.clone())
+					.or_else(|| remaining.first().map(|tab| tab.id.clone()));
+				active_tab_id.set(next_active);
+			}
+			decision_tabs.set(remaining);
+			{
+				let mut stacks = undo_stacks.borrow_mut();
+				stacks
+					.decisions_undo
+					.retain(|entry| entry.scope != UndoScope::DecisionFile(tab_id.clone()));
+				stacks
+					.decisions_redo
+					.retain(|entry| entry.scope != UndoScope::DecisionFile(tab_id.clone()));
+				undo_depths.set(stacks.depths());
+			}
+			return;
+		}
 		// 先快照全部信号值（读守卫随语句结束释放），再统一写入，避免重入借用。
 		let tabs_snapshot: Vec<TreeTab> = open_tabs.read().clone();
 		let current_active = active_tab_id.read().clone();
@@ -2837,6 +2604,13 @@ pub fn Work() -> Element {
 			.iter()
 			.find(|tab| tab.id == tab_id)
 			.map(|tab| tab.dirty)
+			.or_else(|| {
+				decision_tabs
+					.read()
+					.iter()
+					.find(|tab| tab.id == tab_id)
+					.map(|tab| tab.dirty)
+			})
 			.unwrap_or(false);
 		if dirty {
 			tab_close_prompt.set(Some(tab_id));
@@ -2909,8 +2683,82 @@ pub fn Work() -> Element {
 		});
 	});
 
+	// 双击 rainfall/rfEvent_decision.json 打开（或激活）决议编辑标签页。
+	let on_open_decision = EventHandler::new(move |relative_path: String| {
+		if let Some(tab) = decision_tabs
+			.read()
+			.iter()
+			.find(|tab| tab.relative_path == relative_path)
+		{
+			active_tab_id.set(Some(tab.id.clone()));
+			return;
+		}
+		let mut load_error = load_error;
+		let Some(directory) = work_directory.read().clone() else {
+			load_error.set("打开决议配置失败：请先打开工作区".to_string());
+			return;
+		};
+		let mut decision_tabs = decision_tabs;
+		let mut active_tab_id = active_tab_id;
+		spawn(async move {
+			load_error.set(String::new());
+			match load_decision_groups(&directory, &relative_path).await {
+				Ok(groups) => {
+					let id = decision_tab_id(&relative_path);
+					decision_tabs.with_mut(|tabs| {
+						if !tabs.iter().any(|tab| tab.id == id) {
+							tabs.push(DecisionTab {
+								id: id.clone(),
+								title: decision_tab_title(&relative_path),
+								relative_path: relative_path.clone(),
+								decisions: Shared::new(groups),
+								dirty: false,
+								save_ack: 0,
+							});
+						}
+					});
+					active_tab_id.set(Some(id));
+				}
+				Err(error) => load_error.set(format!("打开决议配置失败：{error}")),
+			}
+		});
+	});
+
 	// 文件列表变化后剪掉已不存在的国策树标签页。
 	let prune_tabs = EventHandler::new(move |files: Vec<WorkspaceFile>| {
+		// 决议标签：决议文件被删除 / 移出工作区时剪除（与国策标签同理）。
+		let removed_decisions: Vec<String> = decision_tabs
+			.read()
+			.iter()
+			.filter(|tab| {
+				!files
+					.iter()
+					.any(|file| file.relative_path == tab.relative_path)
+			})
+			.map(|tab| tab.id.clone())
+			.collect();
+		if !removed_decisions.is_empty() {
+			let remaining: Vec<DecisionTab> = decision_tabs
+				.read()
+				.iter()
+				.filter(|tab| !removed_decisions.contains(&tab.id))
+				.cloned()
+				.collect();
+			let active_removed = active_tab_id
+				.read()
+				.as_ref()
+				.map(|id| removed_decisions.contains(id))
+				.unwrap_or(false);
+			if active_removed {
+				let next_active = open_tabs
+					.read()
+					.first()
+					.map(|tab| tab.id.clone())
+					.or_else(|| remaining.first().map(|tab| tab.id.clone()));
+				active_tab_id.set(next_active);
+			}
+			decision_tabs.set(remaining);
+		}
 		let removed: Vec<String> = open_tabs
 			.read()
 			.iter()
@@ -2991,23 +2839,143 @@ pub fn Work() -> Element {
 		});
 	});
 
+	// 保存单个决议配置（仅激活标签页响应 Ctrl+S / 保存按钮——在 DecisionPanel 内判定）。
+	let on_save_decision_tab =
+		EventHandler::new(move |(tab_id, decisions): (String, Vec<DecisionGroup>)| {
+			let Some(directory) = work_directory.read().clone() else {
+				return;
+			};
+			let Some(relative_path) = decision_tabs
+				.read()
+				.iter()
+				.find(|tab| tab.id == tab_id)
+				.map(|tab| tab.relative_path.clone())
+			else {
+				return;
+			};
+			let mut save_status = save_status;
+			let mut decision_tabs = decision_tabs;
+			spawn(async move {
+				save_status.set("正在保存...".to_string());
+				match save_decision_groups(&directory, &relative_path, decisions).await {
+					Ok(()) => {
+						decision_tabs.with_mut(|tabs| {
+							if let Some(tab) = tabs
+								.iter_mut()
+								.find(|tab| tab.relative_path == relative_path)
+							{
+								tab.save_ack = tab.save_ack.wrapping_add(1);
+							}
+						});
+						save_status.set("保存完成".to_string());
+						// 「保存完成」短暂提示后自动收起；期间若状态又被改写则按文本比对跳过。
+						sleep_ms(1500).await;
+						if save_status.peek().as_str() == "保存完成" {
+							save_status.set(String::new());
+						}
+					}
+					Err(error) => save_status.set(format!("保存失败：{error}")),
+				}
+			});
+		});
+
+	// 决议编辑器脏状态回传，关闭标签页前提示未保存修改。
+	let on_decision_dirty_change = EventHandler::new(move |(tab_id, dirty): (String, bool)| {
+		decision_tabs.with_mut(|tabs| {
+			if let Some(tab) = tabs.iter_mut().find(|tab| tab.id == tab_id) {
+				tab.dirty = dirty;
+			}
+		});
+	});
+
 	// 点击标签页切换激活国策树。
 	let on_select_tab = EventHandler::new(move |tab_id: String| {
 		active_tab_id.set(Some(tab_id));
 	});
 
-	let on_edit_event = move |(missions_root, file_name): (String, String)| {
+	// 打开事件编辑器（**唯一入口**）：决议编辑器 / 资源管理器 / 画布菜单 / 热导入等
+	// 一切打开事件的路径都调用这里——请求携带完整事件目录，事件面板按目录读文件；
+	// 补全根（missions 资源根）由事件目录推导（`event_missions_root_for_dir`），
+	// 事件属于哪个模组就用哪个模组的补全数据（多模组工作区互不串扰）。
+	// 后续加入新工作区 / 新编辑面板时：提供（事件目录, 文件名）调用本入口即可复用同一套隔离。
+	let on_open_script = EventHandler::new(move |(events_dir, file_name): (String, String)| {
 		let mut events_open = events_open;
 		let mut events_root = events_root;
 		let mut open_event_request = open_event_request;
 		let mut focus_seq = focus_seq;
 		events_open.set(true);
-		events_root.set(Some(missions_root));
+		if let Some(root) = event_missions_root_for_dir(&events_dir, &workspace_files.read()) {
+			events_root.set(Some(root));
+		}
 		// 请求携带自增序号：即使重复点击同一脚本也能再次触发打开与重读。
 		let seq = focus_seq.read().wrapping_add(1);
 		focus_seq.set(seq);
-		open_event_request.set(Some((file_name, seq)));
+		open_event_request.set(Some((events_dir, file_name, seq)));
+	});
+
+	// 画布 / 思维导图菜单「编辑事件」：事件目录 = 该树资源根下的 missionsEvents。
+	let on_edit_event = move |(missions_root, file_name): (String, String)| {
+		on_open_script.call((format!("{missions_root}/missionsEvents"), file_name));
 	};
+
+	// 决议事件双击且本地缺失（元组：模组目录 / 文件名 / 回退目录 / 模板内容）：
+	// 先尝试从源 APK 热导入该单条脚本（按 APK 原路径落盘，与正常文件同链路），
+	// APK 内没有再按模板创建到回退目录；两种情况都登记文件并打开。
+	let on_import_or_create_decision_script = EventHandler::new(
+		move |(mod_dir, file_name, fallback_dir, contents): (String, String, String, String)| {
+			let Some(directory) = work_directory.read().clone() else {
+				let mut load_error = load_error;
+				load_error.set("打开事件脚本失败：请先打开工作区".to_string());
+				return;
+			};
+			let mut events_open = events_open;
+			events_open.set(true);
+			spawn(async move {
+				let mut load_error = load_error;
+				let mut workspace_files = workspace_files;
+				// 1) 源 APK 热导入（无源 APK / 未收录 → None → 走模板创建）。
+				let (events_dir, open_name) =
+					match import_source_apk_event_text(&directory, &mod_dir, &file_name).await {
+						Some(relative) => relative
+							.rsplit_once('/')
+							.map(|(dir, name)| (dir.to_string(), name.to_string()))
+							.unwrap_or((String::new(), relative)),
+						None => {
+							// 2) 回退：按模板创建。
+							match save_event_text(&directory, &fallback_dir, &file_name, &contents).await
+							{
+								Ok(()) => (fallback_dir, file_name),
+								Err(error) => {
+									load_error.set(format!("创建事件脚本失败：{error}"));
+									return;
+								}
+							}
+						}
+					};
+				let relative_path = format!("{events_dir}/{open_name}");
+				workspace_files.with_mut(|files| {
+					if !files.iter().any(|file| file.relative_path == relative_path) {
+						files.push(WorkspaceFile {
+							name: open_name.clone(),
+							relative_path,
+							is_directory: false,
+						});
+					}
+				});
+				// 打开刚导入 / 创建的脚本（统一入口：补全根按事件目录推导，跟随该模组）。
+				on_open_script.call((events_dir, open_name));
+			});
+		},
+	);
+
+	// 双击决议图片 → 在内置资源管理器中定位：打开抽屉并选中该条目，
+	// Files 会自动展开其上级目录并把该行滚动到可视区域（与事件面板选中同一机制）。
+	let on_reveal_decision_item = EventHandler::new(move |(path, _is_directory): (String, bool)| {
+		let mut files_open = files_open;
+		let mut selected_file = selected_file;
+		files_open.set(true);
+		selected_file.set(Some(path));
+	});
 
 	let on_create_event_file =
 		move |(missions_root, file_name, contents): (String, String, String)| {
@@ -3016,10 +2984,11 @@ pub fn Work() -> Element {
 				load_error.set("创建事件脚本失败：请先打开工作区".to_string());
 				return;
 			};
+			let events_dir = format!("{missions_root}/missionsEvents");
 			spawn(async move {
 				let mut load_error = load_error;
 				let mut workspace_files = workspace_files;
-				match save_event_text(&directory, &missions_root, &file_name, &contents).await {
+				match save_event_text(&directory, &events_dir, &file_name, &contents).await {
 					Ok(()) => {
 						let relative_path =
 							format!("{missions_root}/missionsEvents/{file_name}");
@@ -3042,10 +3011,11 @@ pub fn Work() -> Element {
 		let Some(directory) = work_directory.read().clone() else {
 			return;
 		};
+		let events_dir = format!("{missions_root}/missionsEvents");
 		spawn(async move {
 			let mut load_error = load_error;
 			let mut workspace_files = workspace_files;
-			match delete_event_text(&directory, &missions_root, &file_name).await {
+			match delete_event_text(&directory, &events_dir, &file_name).await {
 				Ok(()) => {
 					let relative_path = format!("{missions_root}/missionsEvents/{file_name}");
 					workspace_files.with_mut(|files| {
@@ -3065,11 +3035,12 @@ pub fn Work() -> Element {
 			let Some(directory) = work_directory.read().clone() else {
 				return;
 			};
+			let events_dir = format!("{missions_root}/missionsEvents");
 			spawn(async move {
 				let mut load_error = load_error;
 				let mut workspace_files = workspace_files;
 				let mut rename_event_request = rename_event_request;
-				match rename_event_text(&directory, &missions_root, &old_name, &new_name).await {
+				match rename_event_text(&directory, &events_dir, &old_name, &new_name).await {
 					Ok(()) => {
 						workspace_files.with_mut(|files| {
 							let old_relative_path =
@@ -3298,6 +3269,11 @@ pub fn Work() -> Element {
 	// png → 手动载入当前国策树图标库（供创建卡片菜单选用）并聚焦使用该图标的卡片。
 	// 路径兼容经典工作区与解包 APK 布局（assets/…/missions、assets/…/scenarios/…/missions）。
 	let on_open_file = use_callback(move |relative_path: String| {
+		// 决议配置：rainfall/rfEvent_decision.json → 决议编辑器标签页。
+		if is_decision_file(&relative_path) {
+			on_open_decision.call(relative_path.clone());
+			return;
+		}
 		// 国策树：资源根目录下的直接 .json 子文件。
 		if missions_tree_file(&relative_path).is_some() {
 			on_open_tree.call(relative_path.clone());
@@ -3309,20 +3285,24 @@ pub fn Work() -> Element {
 				!name.contains('/') && name.to_ascii_lowercase().ends_with(".txt")
 			})
 		{
-			let mut events_open = events_open;
-			let mut events_root = events_root;
-			let mut open_event_request = open_event_request;
-			let mut focus_seq = focus_seq;
-			events_open.set(true);
-			events_root.set(Some(missions_root));
-			let seq = focus_seq.read().wrapping_add(1);
-			focus_seq.set(seq);
-			open_event_request.set(Some((file_name.clone(), seq)));
+			let events_dir = format!("{missions_root}/missionsEvents");
+			on_open_script.call((events_dir, file_name.clone()));
 
+			// 双击事件文件时聚焦思维导图上的对应卡片。
 			let title = file_name.strip_suffix(".txt").unwrap_or(&file_name).to_string();
 			let mut mind_focus_request = mind_focus_request;
-			mind_focus_request.set(Some((FocusTarget::Title(title), seq)));
+			mind_focus_request.set(Some((FocusTarget::Title(title), *focus_seq.peek())));
 			return;
+		}
+		// 决议 / 全局事件脚本：任意 `…/events/…` 目录下的 .txt（如 events/common），
+		// 以文件所在目录为事件目录交给事件面板。
+		if relative_path.to_ascii_lowercase().ends_with(".txt")
+			&& relative_path.to_ascii_lowercase().contains("/events/")
+		{
+			if let Some((events_dir, file_name)) = relative_path.rsplit_once('/') {
+				on_open_script.call((events_dir.to_string(), file_name.to_string()));
+				return;
+			}
 		}
 		// 图标：<资源根>/missionsImages/…/*.png。
 		if let Some((_, name)) = missions_subfile(&relative_path, "missionsImages")
@@ -3607,6 +3587,10 @@ pub fn Work() -> Element {
 	let undo_zone_label = undo_zone.label().to_string();
 	let undo_depths_snapshot = *undo_depths.read();
 	let event_scope_snapshot = event_active_scope.read().clone();
+	let active_decision_scope: Option<String> = active_tab_id
+		.read()
+		.clone()
+		.filter(|id| is_decision_tab_id(id));
 	let (can_undo, can_redo) = match undo_zone {
 		UndoZone::Canvas => (
 			undo_depths_snapshot.canvas_undo > 0,
@@ -3627,6 +3611,19 @@ pub fn Work() -> Element {
 			(
 				stacks.events_undo.iter().any(&applies),
 				stacks.events_redo.iter().any(&applies),
+			)
+		}
+		UndoZone::Decisions => {
+			let stacks = undo_stacks.borrow();
+			let applies = |entry: &UndoEntry| match &entry.scope {
+				UndoScope::DecisionFile(id) => {
+					active_decision_scope.as_deref() == Some(id.as_str())
+				}
+				_ => true,
+			};
+			(
+				stacks.decisions_undo.iter().any(&applies),
+				stacks.decisions_redo.iter().any(&applies),
 			)
 		}
 	};
@@ -3677,6 +3674,13 @@ pub fn Work() -> Element {
 			.iter()
 			.find(|tab| tab.id == tab_id)
 			.map(|tab| tab.title.clone())
+			.or_else(|| {
+				decision_tabs
+					.read()
+					.iter()
+					.find(|tab| tab.id == tab_id)
+					.map(|tab| tab.title.clone())
+			})
 			.unwrap_or_default();
 		(tab_id, title)
 	});
@@ -3692,7 +3696,28 @@ pub fn Work() -> Element {
 				.collect::<Vec<String>>(),
 		)
 	});
+	// 决议编辑器候选来源：工作区全部文件的相对路径（图片 / 事件脚本候选在组件内过滤）。
+	let decision_files = use_memo(move || {
+		Shared::new(
+			workspace_files
+				.read()
+				.iter()
+				.map(|file| file.relative_path.clone())
+				.collect::<Vec<String>>(),
+		)
+	});
 	let event_files_snapshot = (*event_files.read()).clone();
+	let decision_files_snapshot = (*decision_files.read()).clone();
+	let decision_canvas_tabs: Vec<(String, DecisionTab)> = decision_tabs
+		.read()
+		.iter()
+		.cloned()
+		.map(|tab| (tab.id.clone(), tab))
+		.collect();
+	let decision_tab_entries: Vec<(String, String)> = decision_canvas_tabs
+		.iter()
+		.map(|(id, tab)| (id.clone(), tab.title.clone()))
+		.collect();
 	let canvas_tabs: Vec<(String, TreeTab)> = open_tabs
 		.read()
 		.iter()
@@ -3805,11 +3830,12 @@ pub fn Work() -> Element {
                 is_android: *android_platform.read(),
                 all_files_access_granted: *all_files_access_granted.read(),
                 tabs: open_tabs
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        .read()
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        .iter()
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        .map(|tab| (tab.id.clone(), tab.title.clone()))
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        .collect(),
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        .read()
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        .iter()
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        .map(|tab| (tab.id.clone(), tab.title.clone()))
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        .collect(),
                 active_tab_id: active_tab_id.read().clone(),
+                decision_tabs: decision_tab_entries,
                 on_select_tab,
                 on_close_tab: on_close_tab_requested,
                 can_undo,
@@ -3819,92 +3845,94 @@ pub fn Work() -> Element {
                 on_redo,
             }
             div { class: "editor-body",
-                if *files_open.read() {
+                // 关闭时仅隐藏、不卸载：保留目录展开/收起、滚动位置与搜索词等浏览状态
+                //（与画布「加载中只隐藏不卸载」同一模式），再次打开抽屉不重置。
+                div {
+                    class: "drawer explorer-drawer",
+                    style: if *files_open.read() { "display: flex;" } else { "display: none;" },
+                    onfocusin: move |_| {
+                        if *active_zone.peek() != UndoZone::Explorer {
+                            active_zone.set(UndoZone::Explorer);
+                        }
+                    },
+                    onpointerdown: move |_| {
+                        if *active_zone.peek() != UndoZone::Explorer {
+                            active_zone.set(UndoZone::Explorer);
+                        }
+                    },
+                    Files {
+                        files: workspace_files,
+                        work_directory: current_directory.as_ref().map(|directory| directory.display_path.clone()),
+                        width: *explorer_width.read(),
+                        selected_path: selected_file,
+                        clipboard: explorer_clipboard,
+                        on_open_file,
+                        on_command: on_explorer_command,
+                    }
                     div {
-                        class: "drawer explorer-drawer",
-                        onfocusin: move |_| {
-                            if *active_zone.peek() != UndoZone::Explorer {
-                                active_zone.set(UndoZone::Explorer);
-                            }
+                        class: "resize-handle",
+                        role: "separator",
+                        aria_orientation: "vertical",
+                        aria_hidden: "true",
+                        id: "resize-explorer",
+                        onpointerdown: move |evt: Event<PointerData>| {
+                            resizing
+                                .set(
+                                    Some(PanelResize {
+                                        side: ResizeSide::Explorer,
+                                        start_x: evt.client_coordinates().x,
+                                        start_width: *explorer_width.read(),
+                                    }),
+                                );
+                            let pointer_id = evt.data().pointer_id();
+                            spawn(async move {
+                                let _ = dioxus::document::eval(
+                                        &format!(
+                                            "document.getElementById('resize-explorer')?.setPointerCapture({pointer_id})",
+                                        ),
+                                    )
+                                    .await;
+                            });
                         },
-                        onpointerdown: move |_| {
-                            if *active_zone.peek() != UndoZone::Explorer {
-                                active_zone.set(UndoZone::Explorer);
-                            }
-                        },
-                        Files {
-                            files: workspace_files,
-                            work_directory: current_directory.as_ref().map(|directory| directory.display_path.clone()),
-                            width: *explorer_width.read(),
-                            selected_path: selected_file,
-                            clipboard: explorer_clipboard,
-                            on_open_file,
-                            on_command: on_explorer_command,
-                        }
-                        div {
-                            class: "resize-handle",
-                            role: "separator",
-                            aria_orientation: "vertical",
-                            aria_hidden: "true",
-                            id: "resize-explorer",
-                            onpointerdown: move |evt: Event<PointerData>| {
-                                resizing
-                                    .set(
-                                        Some(PanelResize {
-                                            side: ResizeSide::Explorer,
-                                            start_x: evt.client_coordinates().x,
-                                            start_width: *explorer_width.read(),
-                                        }),
-                                    );
-                                let pointer_id = evt.data().pointer_id();
-                                spawn(async move {
-                                    let _ = dioxus::document::eval(
-                                            &format!(
-                                                "document.getElementById('resize-explorer')?.setPointerCapture({pointer_id})",
-                                            ),
-                                        )
-                                        .await;
-                                });
-                            },
-                        }
                     }
                 }
                 main { class: "editor-main",
-                    if *loading.read() {
-                        div { class: "loading-panel", role: "status",
-                            div { class: "loading-stage", "{loading_stage}" }
-                            if let Some(percent) = loading_percent {
-                                div {
-                                    class: "loading-progress",
-                                    role: "progressbar",
-                                    aria_valuemin: "0",
-                                    aria_valuemax: "100",
-                                    aria_valuenow: "{percent:.0}",
-                                    div {
-                                        class: "loading-progress-fill",
-                                        style: "width: {percent}%;",
-                                    }
-                                }
-                            } else {
-                                div { class: "loading-progress indeterminate",
-                                    div { class: "loading-progress-fill" }
-                                }
-                            }
-                            if let Some(counter) = loading_counter {
-                                div { class: "loading-progress-text", "{counter}" }
-                            }
-                        }
-                    } else if !open_tabs.read().is_empty() {
+                    // 加载进度显示期间画布/欢迎页只隐藏、不卸载：组件卸载会让未保存编辑与撤销
+                    // 执行器随作用域释放——重新挂载回到文件打开时的旧快照（表现为「工作区被
+                    // 重置」），且撤销栈里的旧执行器一旦被点击会 panic（Dropped(ValueDroppedError)，
+                    // 并连锁 RefCell already borrowed）。加载面板作为兄弟节点叠加显示。
+                    if !open_tabs.read().is_empty() || !decision_tabs.read().is_empty() {
                         div {
                             class: "canvas-stage",
+                            style: if *loading.read() { "display: none;" } else { "display: flex;" },
+                            // 撤销分区按当前激活标签类型动态选择：国策画布 → 画布分区，
+                            // 决议编辑 → 决议分区（两类面板同处一个容器，子组件自身不挂 zone）。
                             onfocusin: move |_| {
-                                if *active_zone.peek() != UndoZone::Canvas {
-                                    active_zone.set(UndoZone::Canvas);
+                                let zone = if active_tab_id
+                                    .read()
+                                    .as_deref()
+                                    .is_some_and(is_decision_tab_id)
+                                {
+                                    UndoZone::Decisions
+                                } else {
+                                    UndoZone::Canvas
+                                };
+                                if *active_zone.peek() != zone {
+                                    active_zone.set(zone);
                                 }
                             },
                             onpointerdown: move |_| {
-                                if *active_zone.peek() != UndoZone::Canvas {
-                                    active_zone.set(UndoZone::Canvas);
+                                let zone = if active_tab_id
+                                    .read()
+                                    .as_deref()
+                                    .is_some_and(is_decision_tab_id)
+                                {
+                                    UndoZone::Decisions
+                                } else {
+                                    UndoZone::Canvas
+                                };
+                                if *active_zone.peek() != zone {
+                                    active_zone.set(zone);
                                 }
                             },
                             for (tab_id , tab) in canvas_tabs {
@@ -3929,14 +3957,34 @@ pub fn Work() -> Element {
                                     on_dirty_change,
                                 }
                             }
+                            // 决议编辑面板（与国策画布并列；非激活时组件内部隐藏而不卸载）。
+                            for (tab_id , tab) in decision_canvas_tabs {
+                                DecisionPanel {
+                                    key: "{tab_id}",
+                                    tab,
+                                    active_tab_id,
+                                    save_request,
+                                    files: decision_files_snapshot.clone(),
+                                    on_save: on_save_decision_tab,
+                                    on_dirty_change: on_decision_dirty_change,
+                                    on_undo_push,
+                                    on_open_script,
+                                    on_open_missing_script: on_import_or_create_decision_script,
+                                    work_directory: current_directory.clone(),
+                                    on_reveal_item: on_reveal_decision_item,
+                                }
+                            }
                         }
                     } else {
-                        div { class: "welcome-panel",
+                        div {
+                            class: "welcome-panel",
+                            // 与画布同理：加载进度显示期间仅隐藏、不卸载。
+                            style: if *loading.read() { "display: none;" } else { "display: block;" },
                             div { class: "welcome-mark", "A" }
                             h1 { "国策树工作区" }
                             p {
                                 if work_directory.read().is_some() {
-                                    "在资源管理器中双击国策资源目录（missions / assets/game/missions / 剧本 missions）下的 .json 文件打开国策树。"
+                                    "在资源管理器中双击国策资源目录（missions / assets/game/missions / 剧本 missions）下的 .json 文件打开国策树；双击 rainfall/rfEvent_decision.json 打开决议编辑器。"
                                 } else {
                                     "从文件菜单打开现有工作区，或创建一个新的工作区。"
                                 }
@@ -3951,6 +3999,31 @@ pub fn Work() -> Element {
                             }
                             if !load_error.read().is_empty() {
                                 p { class: "workspace-error", role: "alert", "{load_error.read()}" }
+                            }
+                        }
+                    }
+                    if *loading.read() {
+                        div { class: "loading-panel", role: "status",
+                            div { class: "loading-stage", "{loading_stage}" }
+                            if let Some(percent) = loading_percent {
+                                div {
+                                    class: "loading-progress",
+                                    role: "progressbar",
+                                    aria_valuemin: "0",
+                                    aria_valuemax: "100",
+                                    aria_valuenow: "{percent:.0}",
+                                    div {
+                                        class: "loading-progress-fill",
+                                        style: "width: {percent}%;",
+                                    }
+                                }
+                            } else {
+                                div { class: "loading-progress indeterminate",
+                                    div { class: "loading-progress-fill" }
+                                }
+                            }
+                            if let Some(counter) = loading_counter {
+                                div { class: "loading-progress-text", "{counter}" }
                             }
                         }
                     }
@@ -3996,6 +4069,11 @@ pub fn Work() -> Element {
                         }
                         EventPanel {
                             work_directory: current_directory.clone(),
+                            // 会话隔离：每个标签页独立的事件编辑状态（打开文件 / 未保存草稿 / 补全根）。
+                            session_key: active_tab_id
+                                                                                                                                                .read()
+                                                                                                                                                .clone()
+                                                                                                                                                .unwrap_or_else(|| "explorer".to_string()),
                             missions_root: events_root,
                             save_request,
                             open_request: open_event_request,
@@ -4459,7 +4537,12 @@ pub fn Work() -> Element {
                 }
                 div { class: "confirm-dialog", role: "alertdialog",
                     p { class: "confirm-message",
-                        "国策树「{tab_title}」有未保存的修改，关闭标签页将丢失这些修改。"
+                        // 决议标签用自身标题（含模组目录前缀）措辞，避免出现「国策树「决议配置」」。
+                        if is_decision_tab_id(&tab_id) {
+                            "「{tab_title}」有未保存的修改，关闭标签页将丢失这些修改。"
+                        } else {
+                            "国策树「{tab_title}」有未保存的修改，关闭标签页将丢失这些修改。"
+                        }
                     }
                     div { class: "confirm-actions",
                         button {
@@ -4482,4 +4565,109 @@ pub fn Work() -> Element {
             }
         }
     }
+}
+
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn file(path: &str, is_directory: bool) -> WorkspaceFile {
+		WorkspaceFile {
+			name: path.rsplit('/').next().unwrap_or(path).to_string(),
+			relative_path: path.to_string(),
+			is_directory,
+		}
+	}
+
+	#[test]
+	fn lookup_target_mod_dir_priorities() {
+		let files = vec![
+			file("modA", true),
+			file("modA/assets", true),
+			file("modB", true),
+			file("readme.txt", false),
+		];
+		let tree = TreeTab {
+			id: "modA/assets/game/missions/Tree.json".to_string(),
+			title: "modA".to_string(),
+			json_path: "modA/assets/game/missions/Tree.json".to_string(),
+			missions: Shared::new(Vec::new()),
+			icons: Shared::new(Vec::new()),
+			dirty: false,
+			save_ack: 0,
+		};
+		let decision = DecisionTab {
+			id: format!("{DECISION_TAB_PREFIX}modB/assets/rainfall/rfEvent_decision.json"),
+			title: "modB/决议配置".to_string(),
+			relative_path: "modB/assets/rainfall/rfEvent_decision.json".to_string(),
+			decisions: Shared::new(Vec::new()),
+			dirty: false,
+			save_ack: 0,
+		};
+		// 1) 激活标签页优先（国策树标签 → 其 json 路径首段）。
+		assert_eq!(
+			lookup_target_mod_dir(Some(&tree.id), std::slice::from_ref(&tree), &[], Some("modB/assets"), &files)
+				.as_deref(),
+			Some("modA")
+		);
+		// 2) 决议标签（decision: 前缀）解析。
+		assert_eq!(
+			lookup_target_mod_dir(
+				Some(&decision.id),
+				std::slice::from_ref(&tree),
+				std::slice::from_ref(&decision),
+				None,
+				&files
+			)
+			.as_deref(),
+			Some("modB")
+		);
+		// 3) 无标签页 → 资源管理器高亮项所属模组。
+		assert_eq!(
+			lookup_target_mod_dir(None, &[], &[], Some("modB/assets/rainfall"), &files).as_deref(),
+			Some("modB")
+		);
+		// 4) 高亮项首段非顶层目录 → 回退全局。
+		assert_eq!(lookup_target_mod_dir(None, &[], &[], Some("readme.txt"), &files), None);
+		// 5) 都没有 → 全局。
+		assert_eq!(lookup_target_mod_dir(None, &[], &[], None, &files), None);
+		// 6) 关闭的决议标签（id 不在 open_tabs）→ 前缀解析失败后回退高亮项。
+		assert_eq!(
+			lookup_target_mod_dir(Some("decision:gone/x.json"), &[], &[], Some("modA/x"), &files)
+				.as_deref(),
+			Some("modA")
+		);
+	}
+
+	#[test]
+	fn event_missions_root_for_dir_overrides_per_module() {
+		let files = vec![
+			file("modA", true),
+			file("modA/assets", true),
+			file("modA/assets/game", true),
+			file("modA/assets/game/missions", true),
+			file("modA/assets/game/missions/Missions.json", false),
+			file("modB", true),
+			file("modB/assets/game/missions", true),
+			file("modB/assets/game/missions/Missions.json", false),
+		];
+		// 事件目录 → 其所属模组的资源根（不串到默认树 / 其他模组）。
+		assert_eq!(
+			event_missions_root_for_dir("modB/assets/game/events/common", &files).as_deref(),
+			Some("modB/assets/game/missions")
+		);
+		assert_eq!(
+			event_missions_root_for_dir("modB/assets/game/missions/missionsEvents", &files)
+				.as_deref(),
+			Some("modB/assets/game/missions")
+		);
+		// 无法推导（无 events 段）→ 退回默认国策资源根所在目录（去掉树文件名）。
+		assert_eq!(
+			event_missions_root_for_dir("modB/custom", &files).as_deref(),
+			Some("modA/assets/game/missions")
+		);
+		// 工作区没有国策树 → None。
+		assert_eq!(event_missions_root_for_dir("modB/custom", &[]), None);
+	}
 }

@@ -4,6 +4,7 @@
 //! 命令名与前端 `invoke("...")` 使用的字符串一一对应，重命名时需同步前端。
 
 pub mod apk;
+pub mod decisions;
 pub mod events;
 pub mod icons;
 pub mod missions;

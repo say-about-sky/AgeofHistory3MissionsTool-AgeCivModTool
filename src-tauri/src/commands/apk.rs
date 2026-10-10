@@ -99,6 +99,12 @@ pub async fn extract_apk_to_workspace<R: tauri::Runtime>(
         apk_extract_destination(&work_directory, apk_name.as_deref(), Path::new(&apk_path))?;
     fs::create_dir_all(&destination)
         .map_err(|error| format!("创建解压目录失败 {}：{error}", destination.display()))?;
+    // 记录源 APK 位置（同「从 apk 中导入」）：事件编辑器补全在该模组缺少游戏数据文件时
+    // 直接从源 APK 读取；标记写在解压目标（模组）目录下，保证每个模组用自己导入的 APK。
+    let _ = fs::write(
+        destination.join(crate::apk_pack::SOURCE_APK_MARKER),
+        &apk_path,
+    );
     #[cfg(target_os = "android")]
     {
         // .nomedia：让 Android 媒体库跳过整棵解压树的逐文件索引登记（新文件创建时

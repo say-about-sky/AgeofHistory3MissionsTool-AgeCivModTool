@@ -19,6 +19,7 @@ mod apk_update;
 mod android_fs_bridge;
 mod bks;
 mod commands;
+mod decision_format;
 mod mission_format;
 mod models;
 mod paths;
@@ -77,9 +78,18 @@ pub fn run() {
             commands::missions::load_missions_file,
             commands::missions::save_missions_file,
             commands::missions::find_unused_event_scripts,
+            commands::decisions::parse_decisions,
+            commands::decisions::serialize_decisions,
+            commands::decisions::load_decisions_file,
+            commands::decisions::save_decisions_file,
+            commands::decisions::resolve_decision_file,
+            commands::decisions::load_decision_images,
+            commands::decisions::probe_decision_images,
             commands::icons::load_mission_icons,
             commands::events::load_mission_event,
             commands::events::save_mission_event,
+            commands::events::resolve_event_script_by_id,
+            commands::events::resolve_event_script_by_id_scoped,
             commands::events::delete_mission_event,
             commands::events::rename_mission_event,
             commands::workspace::copy_workspace_item,
@@ -97,6 +107,8 @@ pub fn run() {
             commands::missions_db::set_lookup_source_apk_scoped,
             commands::missions_db::list_event_assets,
             commands::missions_db::list_event_assets_scoped,
+            commands::missions_db::import_source_apk_event,
+            commands::missions_db::import_source_apk_event_scoped,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

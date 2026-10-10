@@ -39,6 +39,10 @@ const ZIP32_LIMIT: u64 = 0xFFFF_FFFF;
 /// 「从 apk 中导入」写入解包目录的源 APK 标记文件（内容为 APK 路径或 URI；
 /// 事件编辑器补全据此直接从源 APK 读取游戏数据，打包时跳过、不进入产物）。
 pub(crate) const SOURCE_APK_MARKER: &str = ".ageciv-source";
+/// 「指定补全数据 APK」写入的标记文件（内容为 APK 路径或 URI）：
+/// 写在工作区根 = 对全部模组生效；写在模组目录内 = 仅该模组（见 [`set_lookup_source_apk`]）。
+/// 优先级高于 [`SOURCE_APK_MARKER`]（导入源）；打包时跳过、不进入产物。
+pub(crate) const LOOKUP_SOURCE_MARKER: &str = ".ageciv-lookup-source";
 /// 打包进度回调：`completed` / `total` 为字节数。
 pub type PackProgress<'a> = &'a (dyn Fn(u64, u64) + Sync);
 
@@ -457,9 +461,14 @@ fn walk_directory_parallel(
 }
 
 /// 打包时跳过：旧签名残留（META-INF 下的签名文件）、用户签名密钥与
-/// 「从 apk 中导入」写入的源 APK 标记（供事件编辑器补全读取，不进入产物）。
+/// 补全相关的标记文件（源 APK 标记 / 指定补全数据标记，工作区根与模组目录内都要跳过，
+/// 不进入产物）。
 fn should_skip_apk_entry(relative: &str) -> bool {
-    if relative == "signing.pem" || relative == SOURCE_APK_MARKER {
+    if relative == "signing.pem" {
+        return true;
+    }
+    let file_name = relative.rsplit('/').next().unwrap_or(relative);
+    if file_name == SOURCE_APK_MARKER || file_name == LOOKUP_SOURCE_MARKER {
         return true;
     }
     let Some(rest) = relative.strip_prefix("META-INF/") else {

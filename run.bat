@@ -1,7 +1,10 @@
 @REM  只打开web链接调试
 @REM  不启动桌面窗口，仅运行 Dioxus 开发服务器，浏览器打开 http://localhost:1420
 @REM  手机等局域网设备可访问 http://本机IP:1420（需放行防火墙 1420 端口）
-@REM  注意：纯浏览器环境没有 __TAURI__，文件读写/系统对话框等不可用，仅适合调试界面
+@REM  注意：纯浏览器环境没有 __TAURI__——文件读写/系统对话框不可用（命令会返回
+@REM  「纯浏览器调试环境不支持…」的可读错误，不会崩溃），仅适合调试界面/布局/交互。
+@REM  改动源码后 dx 自动重建：等终端出现 "Build completed" 再刷新页面；
+@REM  页面左上角的 "Your app is being rebuilt / Hot-patch success" 是 dx 开发提示层，可忽略。
 @REM  dx serve --addr 0.0.0.0 --port 1420 --interactive false
 
 @REM  桌面窗口调试

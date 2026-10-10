@@ -32,7 +32,7 @@ use serde::Serialize;
 
 use crate::android_fs_bridge as bridge;
 use crate::apk_extract::{list_apk_entries, read_apk_entry_bytes, ScanEntry};
-use crate::apk_pack::SOURCE_APK_MARKER;
+use crate::apk_pack::{LOOKUP_SOURCE_MARKER, SOURCE_APK_MARKER};
 
 /// tag 顺序清单（分号分隔）。
 const CIV_TAGS_FILE: &str = "Civilizations.txt";
@@ -1396,11 +1396,55 @@ impl DataSource for DirSource {
 const ENTRY_READ_LIMIT: u64 = 8 * 1024 * 1024;
 
 /// 已打开的源 APK：文件句柄 + 中央目录条目。
+///
+/// 持有方式为 `Arc`：解析缓存与调用方共享同一档案，条目读取基于定位读取
+/// （`read_at`），多线程 / 多次调用可并发使用。
 struct ApkArchive {
     file: File,
     entries: Vec<ScanEntry>,
     /// 条目名 → 下标（精确读取用）。
     index: HashMap<String, usize>,
+}
+
+/// 源 APK 解析缓存：键 = 「位置 + 文件长度/修改时间」（元数据不可用时退回位置），
+/// 容量固定 3——热导入按钮反复按需读取同一 APK 时免去重复扫描中央目录（~20ms/次）。
+static SOURCE_APK_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::VecDeque<(String, std::sync::Arc<ApkArchive>)>>,
+> = std::sync::OnceLock::new();
+
+/// 打开（或命中缓存回取）源 APK 档案。
+fn cached_archive(location: &str, file: File) -> Option<std::sync::Arc<ApkArchive>> {
+    let key = |file: &File| -> String {
+        match file.metadata() {
+            Ok(meta) => {
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_secs())
+                    .unwrap_or_default();
+                format!("{location}|{}|{mtime}", meta.len())
+            }
+            Err(_) => location.to_string(),
+        }
+    };
+    let cache = SOURCE_APK_CACHE
+        .get_or_init(|| std::sync::Mutex::new(std::collections::VecDeque::new()));
+    let wanted = key(&file);
+    if let Ok(guard) = cache.lock() {
+        if let Some((_, archive)) = guard.iter().find(|(item, _)| item == &wanted) {
+            return Some(archive.clone());
+        }
+    }
+    let archive = std::sync::Arc::new(ApkArchive::open(file).ok()?);
+    if let Ok(mut guard) = cache.lock() {
+        guard.retain(|(item, _)| item != &wanted);
+        guard.push_back((wanted, archive.clone()));
+        while guard.len() > 3 {
+            guard.pop_front();
+        }
+    }
+    Some(archive)
 }
 
 impl ApkArchive {
@@ -1679,7 +1723,7 @@ pub fn load_event_lookup_blocking_with(
 
     // 2) APK 兜底：「从 apk 中导入」后的工作区只剩 missions / scenarios 版块，
     //    其余游戏数据直接从源 APK 按需读取。
-    if let Some(archive) = open_source_apk(&root, missions_root, open_apk) {
+    if let Some(archive) = open_lookup_source_apk(&root, missions_root, open_apk) {
         for candidate in &candidates {
             let Some(base) = apk_base_of_candidate(candidate) else {
                 continue;
@@ -1709,10 +1753,10 @@ fn open_source_apk(
     work_directory: &Path,
     missions_root: &str,
     open_apk: &dyn Fn(&str) -> Option<File>,
-) -> Option<ApkArchive> {
-    let try_open = |location: &str| -> Option<ApkArchive> {
+) -> Option<std::sync::Arc<ApkArchive>> {
+    let try_open = |location: &str| -> Option<std::sync::Arc<ApkArchive>> {
         let file = open_apk(location)?;
-        ApkArchive::open(file).ok()
+        cached_archive(location, file)
     };
 
     let top = missions_root
@@ -1765,6 +1809,44 @@ fn open_source_apk(
         }
     }
     None
+}
+
+/// 打开「补全数据源 APK」（事件编辑器对照表 / 资源候选专用）。
+/// **模组级标记优先于根级标记**（保证「每个模组用自己导入的 APK」的隔离）：
+/// 1. `<模组>/.ageciv-lookup-source`（指定补全数据 APK，该模组）；
+/// 2. `<模组>/.ageciv-source`（该模组导入 / 解压时写入的源 APK）；
+/// 3. `<工作区>/.ageciv-lookup-source`（指定补全数据 APK，全局）；
+/// 4. `<工作区>/.ageciv-source`（旧版「指定补全数据 APK」写入根标记，仍按用户指定生效）；
+/// 5. 回退 [`open_source_apk`]（顶层 `*.apk`——同名优先）。
+fn open_lookup_source_apk(
+    work_directory: &Path,
+    missions_root: &str,
+    open_apk: &dyn Fn(&str) -> Option<File>,
+) -> Option<std::sync::Arc<ApkArchive>> {
+    let try_open = |location: &str| -> Option<std::sync::Arc<ApkArchive>> {
+        let file = open_apk(location)?;
+        cached_archive(location, file)
+    };
+    let top = missions_root.split('/').find(|segment| !segment.is_empty());
+    let mut markers = Vec::new();
+    if let Some(top) = top {
+        markers.push(work_directory.join(top).join(LOOKUP_SOURCE_MARKER));
+        markers.push(work_directory.join(top).join(SOURCE_APK_MARKER));
+    }
+    markers.push(work_directory.join(LOOKUP_SOURCE_MARKER));
+    markers.push(work_directory.join(SOURCE_APK_MARKER));
+    for marker in markers {
+        let Ok(text) = fs::read_to_string(&marker) else {
+            continue;
+        };
+        let location = text.trim();
+        if !location.is_empty() {
+            if let Some(archive) = try_open(location) {
+                return Some(archive);
+            }
+        }
+    }
+    open_source_apk(work_directory, missions_root, open_apk)
 }
 
 /// 读取数据源下的全部对照原料（工作区目录 / APK / 测试共用）。
@@ -2050,7 +2132,7 @@ async fn open_scoped_apk_location<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     folder_id: &str,
     location: &str,
-) -> Option<ApkArchive> {
+) -> Option<std::sync::Arc<ApkArchive>> {
     use tauri_plugin_android_fs::{AndroidFsExt, FsUri};
 
     let api = app.android_fs_async();
@@ -2071,7 +2153,172 @@ async fn open_scoped_apk_location<R: tauri::Runtime>(
             Err(_) => return None,
         }
     };
-    ApkArchive::open(file.ok()?).ok()
+    cached_archive(location, file.ok()?)
+}
+
+// ===== 决议事件热导入（按需从源 APK 解压单条脚本） =====
+//
+// 「从 apk 中导入」只解压 missions / scenarios 等版块，`assets/game/events/` 等
+// 事件脚本目录刻意不随导入落盘；决议编辑器双击缺失事件时改为从源 APK **按需**解压
+// 该单条脚本（命中即写回工作区原路径，编辑 / 导出链路与正常文件一致），
+// APK 内也没有才回退模板创建。
+
+/// 在 APK 条目中挑选同名事件脚本（文件名的尾部段匹配，大小写不敏感）。
+/// 优先级：全局 `assets/game/events/common/` → 其余 `…/events/common/` →
+/// 任意 `…/events/` → `…/missionsEvents/`；同级按路径序取第一个。
+fn pick_event_entry<'a>(entries: &'a [ScanEntry], file_name: &str) -> Option<&'a ScanEntry> {
+    let wanted = file_name.trim();
+    if wanted.is_empty() {
+        return None;
+    }
+    let global = format!("assets/game/events/common/{}", wanted.to_ascii_lowercase());
+    let mut matches: Vec<(u8, &ScanEntry)> = entries
+        .iter()
+        .filter(|entry| {
+            let lower = entry.name.to_ascii_lowercase();
+            lower.ends_with(".txt")
+                && (lower.contains("/events/") || lower.contains("missionsevents/"))
+        })
+        .filter(|entry| {
+            entry
+                .name
+                .rsplit('/')
+                .next()
+                .is_some_and(|name| name.eq_ignore_ascii_case(wanted))
+        })
+        .map(|entry| {
+            let lower = entry.name.to_ascii_lowercase();
+            let score = if lower == global {
+                0
+            } else if lower.contains("/events/common/") {
+                1
+            } else if lower.contains("/events/") {
+                2
+            } else {
+                3
+            };
+            (score, entry)
+        })
+        .collect();
+    matches.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.name.cmp(&b.1.name)));
+    matches.first().map(|(_, entry)| *entry)
+}
+
+/// 热导入实现（真实路径模式）：按 APK 内原路径解压到 `<工作区>/<模组目录>/` 下。
+/// `Ok(None)` = 无源 APK 或 APK 内没有该脚本（调用方回退模板创建）。
+fn import_source_apk_event_blocking(
+    work_directory: &Path,
+    mod_dir: &str,
+    file_name: &str,
+    open_apk: &dyn Fn(&str) -> Option<File>,
+) -> Result<Option<String>, String> {
+    let Some(archive) = open_source_apk(work_directory, mod_dir, open_apk) else {
+        return Ok(None);
+    };
+    let Some(entry) = pick_event_entry(&archive.entries, file_name) else {
+        return Ok(None);
+    };
+    let Some(relative) = crate::apk_extract::sanitize_entry_name(&entry.name) else {
+        return Ok(None);
+    };
+    let base = mod_dir.trim_matches('/');
+    let output = if base.is_empty() {
+        work_directory.join(&relative)
+    } else {
+        work_directory.join(base).join(&relative)
+    };
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("创建目录失败 {}：{error}", parent.display()))?;
+    }
+    let bytes = read_apk_entry_bytes(&archive.file, entry, ENTRY_READ_LIMIT)?;
+    fs::write(&output, bytes)
+        .map_err(|error| format!("写入脚本失败 {}：{error}", output.display()))?;
+    Ok(Some(join_rel(base, &entry.name)))
+}
+
+/// 决议编辑器「双击缺失事件」热导入：从源 APK 按需解压单条事件脚本到工作区
+/// （按 APK 内原路径，全局 `assets/game/events/common/` 或剧本路径保持语义不变），
+/// 返回写入的工作区相对路径；`Ok(None)` = 无源 APK / APK 内没有（调用方回退模板创建）。
+#[tauri::command]
+pub async fn import_source_apk_event<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    work_directory: String,
+    mod_dir: String,
+    file_name: String,
+) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        #[cfg(target_os = "android")]
+        {
+            use tauri_plugin_android_fs::{AndroidFsExt, FsUri};
+            let open_apk = |location: &str| {
+                // 真实路径（全盘访问权限下）直接交给 std 打开；URI 走 android-fs 插件。
+                if !location.contains("://") {
+                    if let Ok(file) = File::open(location) {
+                        return Some(file);
+                    }
+                }
+                let uri = if location.contains("://") {
+                    FsUri::from_uri(location.to_string())
+                } else {
+                    FsUri::from_path(Path::new(location))
+                };
+                app.android_fs().open_file_readable(&uri).ok()
+            };
+            import_source_apk_event_blocking(
+                Path::new(&work_directory),
+                &mod_dir,
+                &file_name,
+                &open_apk,
+            )
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = app;
+            import_source_apk_event_blocking(
+                Path::new(&work_directory),
+                &mod_dir,
+                &file_name,
+                &|location| File::open(location).ok(),
+            )
+        }
+    })
+    .await
+    .map_err(|error| format!("热导入任务失败：{error}"))?
+}
+
+/// [`import_source_apk_event`] 的 SAF/scoped 版：写入经 android-fs bridge。
+/// （APK 字节按 UTF-8 宽容解码——事件脚本为文本文件；非法字节替换为 U+FFFD。）
+#[tauri::command]
+pub async fn import_source_apk_event_scoped<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    folder_id: String,
+    mod_dir: String,
+    file_name: String,
+) -> Result<Option<String>, String> {
+    if folder_id.trim().is_empty() {
+        return Err("缺少 scoped 目录授权".to_string());
+    }
+    let Some(archive) = open_scoped_source_apk(&app, &folder_id, &mod_dir).await else {
+        return Ok(None);
+    };
+    let Some(entry) = pick_event_entry(&archive.entries, &file_name) else {
+        return Ok(None);
+    };
+    let Some(_relative) = crate::apk_extract::sanitize_entry_name(&entry.name) else {
+        return Ok(None);
+    };
+    let bytes = read_apk_entry_bytes(&archive.file, entry, ENTRY_READ_LIMIT)?;
+    let target = join_rel(&mod_dir, &entry.name);
+    bridge::write_text_file(
+        &app,
+        &folder_id,
+        &target,
+        &String::from_utf8_lossy(&bytes),
+        true,
+    )
+    .await?;
+    Ok(Some(target))
 }
 
 /// SAF：打开「源 APK」——优先进口时写入的标记文件（`<包目录>/.ageciv-source`
@@ -2080,7 +2327,7 @@ async fn open_scoped_source_apk<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     folder_id: &str,
     missions_root: &str,
-) -> Option<ApkArchive> {
+) -> Option<std::sync::Arc<ApkArchive>> {
     let top = missions_root.split('/').find(|segment| !segment.is_empty());
 
     let mut markers = Vec::new();
@@ -2125,19 +2372,53 @@ async fn open_scoped_source_apk<R: tauri::Runtime>(
     None
 }
 
-/// 写入「补全数据源 APK」标记（内容为 APK 路径或 `content://` URI）。
-fn write_source_apk_marker(root: &Path, location: &str) -> Result<(), String> {
-    fs::write(root.join(SOURCE_APK_MARKER), location.as_bytes())
+/// [`open_lookup_source_apk`] 的 SAF/scoped 版（标记文件经 bridge 读取）——
+/// 优先级与桌面版一致（模组级标记优先于根级标记）。
+async fn open_scoped_lookup_source_apk<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    folder_id: &str,
+    missions_root: &str,
+) -> Option<std::sync::Arc<ApkArchive>> {
+    let top = missions_root.split('/').find(|segment| !segment.is_empty());
+    let mut markers = Vec::new();
+    if let Some(top) = top {
+        markers.push(join_rel(top, LOOKUP_SOURCE_MARKER));
+        markers.push(join_rel(top, SOURCE_APK_MARKER));
+    }
+    markers.push(LOOKUP_SOURCE_MARKER.to_string());
+    markers.push(SOURCE_APK_MARKER.to_string());
+    for marker in markers {
+        let Ok(text) = bridge::read_text_file(app, folder_id, &marker).await else {
+            continue;
+        };
+        let location = text.trim();
+        if location.is_empty() {
+            continue;
+        }
+        if let Some(archive) = open_scoped_apk_location(app, folder_id, location).await {
+            return Some(archive);
+        }
+    }
+    open_scoped_source_apk(app, folder_id, missions_root).await
+}
+
+/// 写入标记文件（内容为 APK 位置：真实路径或 `content://` URI）。
+fn write_apk_marker(dir: &Path, marker: &str, location: &str) -> Result<(), String> {
+    fs::write(dir.join(marker), location.as_bytes())
         .map_err(|error| format!("写入标记文件失败：{error}"))
 }
 
-/// 设置「补全数据源 APK」（真实路径模式）：标记写入工作区根。
-/// 事件编辑器在缺少游戏数据文件（如只有 missions / scenarios 版块的工作区）时，
-/// 据此直接从该 APK 读取文明 / 政体 / 省份等对照数据。
+/// 设置「补全数据源 APK」（真实路径模式）。
+/// `mod_dir` 为工作区顶层模组目录名（可选）：给定则标记写入
+/// `<工作区>/<模组>/.ageciv-lookup-source`（仅该模组的补全使用该 APK）；
+/// 否则写入工作区根（对全部模组生效）。事件编辑器在缺少游戏数据文件
+///（如只有 missions / scenarios 版块的工作区）时据此直接读取文明 / 政体 / 省份等
+/// 对照数据；优先级高于「从 apk 中导入」写入的源 APK 标记。
 #[tauri::command]
 pub async fn set_lookup_source_apk(
     work_directory: String,
     apk_path: String,
+    mod_dir: Option<String>,
 ) -> Result<String, String> {
     let location = apk_path.trim();
     if location.is_empty() {
@@ -2147,16 +2428,34 @@ pub async fn set_lookup_source_apk(
     if !root.is_dir() {
         return Err(format!("工作目录不存在：{}", root.display()));
     }
-    write_source_apk_marker(&root, location)?;
-    Ok("已设置补全数据源 APK：事件编辑器将从该 APK 读取文明 / 省份等数据".to_string())
+    match mod_dir.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+        Some(mod_dir) => {
+            let mod_dir = crate::paths::validate_work_directory_name(mod_dir)?;
+            let dir = root.join(mod_dir);
+            if !dir.is_dir() {
+                return Err(format!("模组目录不存在：{mod_dir}"));
+            }
+            write_apk_marker(&dir, LOOKUP_SOURCE_MARKER, location)?;
+            Ok(format!(
+                "已为模组「{mod_dir}」指定补全数据源 APK：该模组将从该 APK 读取文明 / 省份等数据"
+            ))
+        }
+        None => {
+            write_apk_marker(&root, LOOKUP_SOURCE_MARKER, location)?;
+            Ok("已设置补全数据源 APK（全部模组）：事件编辑器将从该 APK 读取文明 / 省份等数据"
+                .to_string())
+        }
+    }
 }
 
-/// 设置「补全数据源 APK」（Android SAF / scoped 模式）：标记写在工作区根。
+/// 设置「补全数据源 APK」（Android SAF / scoped 模式）。
+/// `mod_dir` 语义同 [`set_lookup_source_apk`]（写 `<模组>/.ageciv-lookup-source` 或工作区根）。
 #[tauri::command]
 pub async fn set_lookup_source_apk_scoped<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     folder_id: String,
     apk_path: String,
+    mod_dir: Option<String>,
 ) -> Result<String, String> {
     let location = apk_path.trim();
     if location.is_empty() {
@@ -2165,8 +2464,22 @@ pub async fn set_lookup_source_apk_scoped<R: tauri::Runtime>(
     if folder_id.trim().is_empty() {
         return Err("缺少 scoped 目录授权".to_string());
     }
-    bridge::write_text_file(&app, &folder_id, SOURCE_APK_MARKER, location, false).await?;
-    Ok("已设置补全数据源 APK：事件编辑器将从该 APK 读取文明 / 省份等数据".to_string())
+    match mod_dir.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+        Some(mod_dir) => {
+            let mod_dir = crate::paths::validate_work_directory_name(mod_dir)?;
+            let marker = join_rel(mod_dir, LOOKUP_SOURCE_MARKER);
+            bridge::write_text_file(&app, &folder_id, &marker, location, false).await?;
+            Ok(format!(
+                "已为模组「{mod_dir}」指定补全数据源 APK：该模组将从该 APK 读取文明 / 省份等数据"
+            ))
+        }
+        None => {
+            bridge::write_text_file(&app, &folder_id, LOOKUP_SOURCE_MARKER, location, false)
+                .await?;
+            Ok("已设置补全数据源 APK（全部模组）：事件编辑器将从该 APK 读取文明 / 省份等数据"
+                .to_string())
+        }
+    }
 }
 
 /// 加载事件编辑器「文明 / 政体对照表」（Android SAF/scoped 模式）。
@@ -2392,7 +2705,7 @@ pub async fn load_event_lookup_scoped<R: tauri::Runtime>(
 
     // 工作区只剩 missions / scenarios 版块（「从 apk 中导入」的结果）：
     // 其余游戏数据直接从源 APK 读取（标记文件 → 工作区顶层 `*.apk`）。
-    if let Some(archive) = open_scoped_source_apk(&app, &folder_id, &missions_root).await {
+    if let Some(archive) = open_scoped_lookup_source_apk(&app, &folder_id, &missions_root).await {
         for candidate in game_dir_candidates(&missions_root) {
             let Some(base) = apk_base_of_candidate(&candidate) else {
                 continue;
@@ -2858,7 +3171,7 @@ pub async fn list_event_assets<R: tauri::Runtime>(
                 };
                 app.android_fs().open_file_readable(&uri).ok()
             };
-            if let Some(archive) = open_source_apk(&root, &missions_root, &open_apk) {
+            if let Some(archive) = open_lookup_source_apk(&root, &missions_root, &open_apk) {
                 extend_from_archive(&archive);
             }
         }
@@ -2866,7 +3179,7 @@ pub async fn list_event_assets<R: tauri::Runtime>(
         {
             let _ = app;
             if let Some(archive) =
-                open_source_apk(&root, &missions_root, &|location| File::open(location).ok())
+                open_lookup_source_apk(&root, &missions_root, &|location| File::open(location).ok())
             {
                 extend_from_archive(&archive);
             }
@@ -2974,7 +3287,7 @@ pub async fn list_event_assets_scoped<R: tauri::Runtime>(
             break;
         }
     }
-    if let Some(archive) = open_scoped_source_apk(&app, &folder_id, &missions_root).await {
+    if let Some(archive) = open_scoped_lookup_source_apk(&app, &folder_id, &missions_root).await {
         images.extend(apk_event_image_names(&archive, &missions_root));
         events.extend(apk_event_names(&archive, &missions_root));
         music.extend(apk_music_names(&archive, &missions_root));
@@ -4203,7 +4516,7 @@ mod tests {
         let package_dir = workspace.join("测试包");
         fs::create_dir_all(package_dir.join("assets/game/missions/missionsEvents")).unwrap();
         // 与命令相同的写法（内容允许带换行）。
-        write_source_apk_marker(&workspace, &format!("{}\n", apk.display())).unwrap();
+        write_apk_marker(&workspace, SOURCE_APK_MARKER, &format!("{}\n", apk.display())).unwrap();
 
         let lookup = load_event_lookup_blocking(
             workspace.to_str().unwrap(),
@@ -4213,7 +4526,7 @@ mod tests {
         assert_synthetic_lookup(&lookup);
 
         // 标记内容为空 → 不采用（与命令校验一致）。
-        write_source_apk_marker(&workspace, "  \n").unwrap();
+        write_apk_marker(&workspace, SOURCE_APK_MARKER, "  \n").unwrap();
         let empty = load_event_lookup_blocking(
             workspace.to_str().unwrap(),
             "测试包/assets/game/missions",
@@ -4408,6 +4721,235 @@ mod tests {
         assert!(scenario_events.contains(&"剧本事件".to_string()));
         assert!(scenario_events.contains(&"剧本国策".to_string()));
         assert!(scenario_events.contains(&"全局事件".to_string()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 热导入的条目挑选优先级：全局 events/common > 其他 events/common > 任意 events > missionsEvents。
+    #[test]
+    fn picks_event_entry_by_priority() {
+        let entry = |name: &str| ScanEntry {
+            name: name.to_string(),
+            method: 0,
+            comp_size: 10,
+            lfh_offset: 0,
+        };
+        let entries = vec![
+            entry("assets/game/missions/missionsEvents/突袭.txt"),
+            entry("assets/map/TestMap/scenarios/TheGreatWar/events/common/突袭.txt"),
+            entry("assets/game/events/common/突袭.txt"),
+        ];
+        let picked = pick_event_entry(&entries, "突袭.txt").unwrap();
+        assert_eq!(picked.name, "assets/game/events/common/突袭.txt");
+
+        // 无全局目录：优先 events/common，其次 missionsEvents。
+        let entries = vec![
+            entry("assets/game/missions/missionsEvents/突袭.txt"),
+            entry("assets/map/TestMap/scenarios/TheGreatWar/events/common/突袭.txt"),
+        ];
+        let picked = pick_event_entry(&entries, "突袭.txt").unwrap();
+        assert_eq!(
+            picked.name,
+            "assets/map/TestMap/scenarios/TheGreatWar/events/common/突袭.txt"
+        );
+
+        // 文件名大小写不敏感；非 .txt / 非事件目录不参与。
+        let entries = vec![
+            entry("assets/audio/music/突袭.txt"),
+            entry("assets/game/events/common/突袭.doc"),
+            entry("assets/game/events/common/突袭.TXT"),
+        ];
+        let picked = pick_event_entry(&entries, "突袭.txt").unwrap();
+        assert_eq!(picked.name, "assets/game/events/common/突袭.TXT");
+
+        assert!(pick_event_entry(&entries, "不存在.txt").is_none());
+        assert!(pick_event_entry(&entries, "  ").is_none());
+    }
+
+    /// 热导入端到端（合成 APK）：源 APK 里的同名脚本按原路径解压到模组目录；
+    /// 找不到 / 无源 APK 时返回 None 供调用方回退模板创建。
+    #[test]
+    fn imports_single_event_from_source_apk() {
+        let dir = temp_dir("hot-import");
+        let workspace = dir.join("workspace");
+        let mod_root = workspace.join("modB");
+        fs::create_dir_all(&mod_root).unwrap();
+        write_synthetic_source_apk(&workspace.join("测试包.apk"));
+        write_apk_marker(
+            &mod_root,
+            SOURCE_APK_MARKER,
+            &workspace.join("测试包.apk").to_string_lossy(),
+        )
+        .unwrap();
+        let open = |location: &str| File::open(location).ok();
+
+        // 全局事件：按 APK 原路径落盘（目录自动创建）。
+        let imported =
+            import_source_apk_event_blocking(&workspace, "modB", "全局事件.txt", &open).unwrap();
+        assert_eq!(
+            imported.as_deref(),
+            Some("modB/assets/game/events/common/全局事件.txt")
+        );
+        assert_eq!(
+            fs::read_to_string(mod_root.join("assets/game/events/common/全局事件.txt")).unwrap(),
+            "{}"
+        );
+
+        // 剧本事件保持剧本路径（与引擎加载位置一致）。
+        let imported =
+            import_source_apk_event_blocking(&workspace, "modB", "剧本事件.txt", &open).unwrap();
+        assert_eq!(
+            imported.as_deref(),
+            Some("modB/assets/map/TestMap/scenarios/TheGreatWar/events/common/剧本事件.txt")
+        );
+
+        // APK 内没有 → None（调用方回退模板创建）。
+        assert!(
+            import_source_apk_event_blocking(&workspace, "modB", "不存在的事件.txt", &open)
+                .unwrap()
+                .is_none()
+        );
+
+        // 无源 APK（无标记、无顶层 apk）→ None。
+        let bare = dir.join("bare");
+        fs::create_dir_all(bare.join("modX")).unwrap();
+        assert!(
+            import_source_apk_event_blocking(&bare, "modX", "全局事件.txt", &open)
+                .unwrap()
+                .is_none()
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 补全数据源解析优先级（**模组级标记优先于根级标记**；导入隔离）:
+    /// `<模组>/.ageciv-lookup-source` → `<模组>/.ageciv-source`（导入）→
+    /// `<根>/.ageciv-lookup-source` → `<根>/.ageciv-source`（旧版全局指定）→ 顶层 apk
+    /// （无模组标记的模组才回退根级指定）。
+    /// 同时验证热导入（`open_source_apk`）不受用户指定影响。
+    #[test]
+    fn lookup_source_apk_prefers_user_specified_over_import() {
+        use std::io::Write as _;
+
+        let dir = temp_dir("lookup-priority");
+        let workspace = dir.join("workspace");
+        let mod_b = workspace.join("modB");
+        let mod_a = workspace.join("modA");
+        fs::create_dir_all(&mod_b).unwrap();
+        fs::create_dir_all(&mod_a).unwrap();
+        let open = |location: &str| File::open(location).ok();
+
+        // 最小合成 APK：各含一个独有条目，用于区分实际来源。
+        let apk = |name: &str, tag: &str| {
+            let path = dir.join(name);
+            let mut zip = zip::ZipWriter::new(File::create(&path).unwrap());
+            zip.start_file(
+                format!("assets/{tag}.txt"),
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+            zip.write_all(tag.as_bytes()).unwrap();
+            zip.finish().unwrap();
+            path
+        };
+        let import_apk = apk("import.apk", "import");
+        let lookup_mod_apk = apk("lookup-mod.apk", "lookup_mod");
+        let lookup_root_apk = apk("lookup-root.apk", "lookup_root");
+        let lookup_root2_apk = apk("lookup-root2.apk", "lookup_root2");
+
+        // 仅导入标记（模组目录）→ 用导入 APK。
+        write_apk_marker(&mod_b, SOURCE_APK_MARKER, &import_apk.to_string_lossy()).unwrap();
+        let archive =
+            open_lookup_source_apk(&workspace, "modB/assets/game/missions", &open).unwrap();
+        assert!(archive.index.contains_key("assets/import.txt"));
+
+        // 模组级「指定补全数据 APK」优先于导入标记（本次修复的场景）。
+        write_apk_marker(
+            &mod_b,
+            LOOKUP_SOURCE_MARKER,
+            &lookup_mod_apk.to_string_lossy(),
+        )
+        .unwrap();
+        let archive =
+            open_lookup_source_apk(&workspace, "modB/assets/game/missions", &open).unwrap();
+        assert!(archive.index.contains_key("assets/lookup_mod.txt"));
+        // 其他模组不受影响：modA 仍用其导入 APK。
+        write_apk_marker(&mod_a, SOURCE_APK_MARKER, &import_apk.to_string_lossy()).unwrap();
+        let archive =
+            open_lookup_source_apk(&workspace, "modA/assets/game/missions", &open).unwrap();
+        assert!(archive.index.contains_key("assets/import.txt"));
+
+        // 根级指定（新标记 / 旧版根 `.ageciv-source`）**不**压过模组自己的导入标记：
+        // 每个模组用自己导入的 APK（导入隔离），根级指定只作无模组标记时的回退。
+        write_apk_marker(
+            &workspace,
+            SOURCE_APK_MARKER,
+            &lookup_root_apk.to_string_lossy(),
+        )
+        .unwrap();
+        let archive =
+            open_lookup_source_apk(&workspace, "modA/assets/game/missions", &open).unwrap();
+        assert!(
+            archive.index.contains_key("assets/import.txt"),
+            "模组导入标记应优先于根级旧版指定"
+        );
+        // 没有模组级标记的模组（modC）回退根级旧版指定。
+        fs::create_dir_all(workspace.join("modC")).unwrap();
+        let archive =
+            open_lookup_source_apk(&workspace, "modC/assets/game/missions", &open).unwrap();
+        assert!(
+            archive.index.contains_key("assets/lookup_root.txt"),
+            "无模组标记时回退根级旧版指定"
+        );
+        // 根级新标记（lookup-source）优先于根级旧版标记。
+        write_apk_marker(
+            &workspace,
+            LOOKUP_SOURCE_MARKER,
+            &lookup_root2_apk.to_string_lossy(),
+        )
+        .unwrap();
+        let archive =
+            open_lookup_source_apk(&workspace, "modC/assets/game/missions", &open).unwrap();
+        assert!(
+            archive.index.contains_key("assets/lookup_root2.txt"),
+            "根级新标记应优先于旧版根标记"
+        );
+
+        // 热导入（导入语义）不受用户指定影响：仍取模组导入标记。
+        let archive = open_source_apk(&workspace, "modA", &open).unwrap();
+        assert!(
+            archive.index.contains_key("assets/import.txt"),
+            "热导入仍使用导入 APK"
+        );
+
+        // set_lookup_source_apk：模组目录写入 + 校验非法 / 不存在目录。
+        tauri::async_runtime::block_on(async {
+            let message = set_lookup_source_apk(
+                workspace.to_string_lossy().into_owned(),
+                lookup_mod_apk.to_string_lossy().into_owned(),
+                Some("modB".to_string()),
+            )
+            .await
+            .unwrap();
+            assert!(message.contains("modB"), "消息应点名模组：{message}");
+            assert_eq!(
+                fs::read_to_string(mod_b.join(LOOKUP_SOURCE_MARKER)).unwrap(),
+                lookup_mod_apk.to_string_lossy()
+            );
+            assert!(set_lookup_source_apk(
+                workspace.to_string_lossy().into_owned(),
+                "x.apk".to_string(),
+                Some("..".to_string()),
+            )
+            .await
+            .is_err());
+            assert!(set_lookup_source_apk(
+                workspace.to_string_lossy().into_owned(),
+                "x.apk".to_string(),
+                Some("not-there".to_string()),
+            )
+            .await
+            .is_err());
+        });
+
         let _ = fs::remove_dir_all(&dir);
     }
 }

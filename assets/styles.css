@@ -599,6 +599,7 @@ body {
 }
 
 .explorer-search {
+  position: relative;
   display: flex;
   flex: none;
   align-items: center;
@@ -646,6 +647,66 @@ body {
 .explorer-search .search-clear:hover {
   color: #ffffff;
   background: #45638f;
+}
+
+/* 搜索框自动补全下拉（轻量：无遮罩、限高滚动、悬停即高亮） */
+.explorer-suggest {
+  position: absolute;
+  /* 固定挂到搜索栏下方：缺省 top（auto）时绝对定位落在静态位置，
+     会与输入框重叠（flex 容器内的静态位置≈容器顶部）。 */
+  top: 100%;
+  left: 6px;
+  right: 6px;
+  z-index: 26;
+  overflow-y: auto;
+  max-height: 214px;
+  border: 1px solid var(--explorer-line);
+  border-radius: 4px;
+  background: var(--explorer-raised);
+  box-shadow: 0 6px 16px rgb(0 0 0 / 35%);
+}
+
+.explorer-suggest-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  box-sizing: border-box;
+  padding: 3px 8px;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  color: var(--explorer-text);
+  background: transparent;
+  font-size: 11px;
+  text-align: left;
+}
+
+.explorer-suggest-item.active,
+.explorer-suggest-item:hover {
+  color: #ffffff;
+  background: #45638f;
+}
+
+.explorer-suggest-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.explorer-suggest-hint {
+  overflow: hidden;
+  flex: 1;
+  color: var(--explorer-muted);
+  font-size: 10px;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.explorer-suggest-item.active .explorer-suggest-hint,
+.explorer-suggest-item:hover .explorer-suggest-hint {
+  color: rgb(255 255 255 / 70%);
 }
 
 .search-status {
@@ -1809,4 +1870,515 @@ body {
   .document-title {
     display: none;
   }
+}
+
+/* ===== 决议编辑器（decision.rs）===== */
+
+.decision-stage {
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
+  overflow: hidden;
+}
+
+.decision-layout {
+  display: flex;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+}
+
+.decision-groups {
+  display: flex;
+  width: 236px;
+  flex: none;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--surface-blue);
+  border-right: 1px solid var(--line);
+}
+
+.decision-groups.resizing {
+  cursor: col-resize;
+  user-select: none;
+}
+
+.decision-groups-head {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 10px;
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+/* 图片加载进度（原「长按…双击打开」提示位置；空闲时不渲染）。 */
+.decision-groups-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.decision-groups-progress-label {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 400;
+}
+
+.decision-groups-progress-track {
+  height: 4px;
+  overflow: hidden;
+  background: rgb(111 168 242 / 18%);
+  border-radius: 2px;
+}
+
+.decision-groups-progress-fill {
+  height: 100%;
+  background: var(--blue-strong);
+  border-radius: 2px;
+  transition: width 0.15s ease-out;
+}
+
+.decision-groups-filter {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 10px 8px;
+}
+
+.decision-groups-filter .decision-input {
+  flex: 1;
+  min-width: 0;
+}
+
+.decision-filter-clear {
+  flex: none;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+
+.decision-groups-list {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  overflow-anchor: none;
+  overflow-y: auto;
+}
+
+/* 虚拟滚动的上下占位（高度按实测行高累计，不参与压缩）。 */
+.decision-group-spacer {
+  flex: none;
+}
+
+.decision-group-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 7px 10px;
+  color: var(--ink);
+  text-align: left;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+}
+
+.decision-group-item:hover {
+  background: rgb(111 168 242 / 12%);
+}
+
+.decision-group-item.active {
+  background: rgb(111 168 242 / 22%);
+}
+
+.decision-group-id {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.decision-group-name {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.decision-add-group {
+  margin: 8px;
+  padding: 7px 8px;
+  cursor: pointer;
+}
+
+.decision-detail {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+  min-height: 0;
+  padding: 12px 14px;
+  overflow-anchor: none;
+  overflow-y: auto;
+}
+
+.decision-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.decision-section-title {
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.decision-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.decision-field-label {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.decision-input {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  padding: 6px 8px;
+}
+
+.decision-desc-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+}
+
+.decision-desc-input {
+  box-sizing: border-box;
+  min-width: 0;
+  flex: 1;
+  padding: 6px 8px;
+  resize: vertical;
+}
+
+.decision-index {
+  min-width: 16px;
+  padding-top: 6px;
+  color: var(--muted);
+  font-size: 11px;
+  text-align: center;
+}
+
+.decision-row-actions {
+  display: flex;
+  gap: 2px;
+  flex: none;
+}
+
+.decision-row-actions button {
+  padding: 2px 8px;
+  cursor: pointer;
+}
+
+.decision-list-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.decision-list-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.decision-add-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.decision-add-row input {
+  min-width: 0;
+  flex: 1;
+}
+
+.decision-add-row button {
+  flex: none;
+  cursor: pointer;
+}
+
+.decision-warnings {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 10px;
+  background: rgb(244 162 97 / 12%);
+  border: 1px solid rgb(244 162 97 / 40%);
+  border-radius: 8px;
+  color: var(--ink);
+  font-size: 11px;
+}
+
+.decision-warnings.ok {
+  background: rgb(126 214 165 / 10%);
+  border-color: rgb(126 214 165 / 32%);
+  color: var(--muted);
+}
+
+.decision-warnings-collapsed summary {
+  color: var(--ink);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.decision-warnings-collapsed[open] summary {
+  margin-bottom: 2px;
+}
+
+.decision-empty {
+  padding: 12px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.decision-delete-group {
+  align-self: flex-start;
+  padding: 6px 10px;
+  cursor: pointer;
+}
+
+/* ===== 决议编辑器：分栏分隔条、图片预览、事件下拉、条目菜单 ===== */
+
+.decision-resize-handle {
+  position: relative;
+  z-index: 4;
+  flex: none;
+  width: 4px;
+  margin: 0 -2px;
+  cursor: col-resize;
+  touch-action: none;
+  user-select: none;
+  background: transparent;
+}
+
+.decision-resize-handle::after {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 1px;
+  width: 2px;
+  content: "";
+  background: transparent;
+  transition: background 0.12s;
+}
+
+.decision-resize-handle:hover::after,
+.decision-resize-handle:active::after {
+  background: var(--blue-strong);
+}
+
+.decision-group-block {
+  display: flex;
+  flex-direction: column;
+  border-bottom: 1px solid var(--line);
+}
+
+.decision-group-block.active {
+  background: rgb(111 168 242 / 10%);
+}
+
+.decision-group-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 10px;
+  color: var(--ink);
+  cursor: pointer;
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.decision-group-head:hover {
+  background: rgb(111 168 242 / 12%);
+}
+
+.decision-group-head .decision-group-id {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.decision-group-head .decision-group-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 组名行内编辑（右键「重命名」/ 新建组占位）：占满标题剩余空间，避免撑破行高。 */
+.decision-group-head .decision-group-name-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 1px 6px;
+  font-size: 11px;
+}
+
+.decision-group-caret {
+  flex: none;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.decision-group-image-add {
+  flex: none;
+  padding: 1px 6px;
+  cursor: pointer;
+  font-size: 11px;
+  line-height: 1.2;
+}
+
+.decision-group-images {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 10px 2px;
+}
+
+.decision-image-entry {
+  position: relative;
+  display: block;
+  overflow: hidden;
+  background: rgb(15 23 35 / 6%);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  cursor: grab;
+  touch-action: pan-y;
+  user-select: none;
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.decision-image-entry.dragging {
+  border-color: var(--blue-strong);
+  box-shadow: 0 0 0 1px var(--blue-strong) inset;
+  opacity: 0.85;
+}
+
+.decision-image-preview {
+  display: block;
+  width: 100%;
+  height: auto;
+  pointer-events: none;
+}
+
+.decision-image-placeholder {
+  box-sizing: border-box;
+  padding: 22px 0;
+  color: var(--muted);
+  font-size: 18px;
+  text-align: center;
+}
+
+.decision-image-name {
+  position: absolute;
+  right: 4px;
+  bottom: 4px;
+  padding: 0 5px;
+  overflow: hidden;
+  max-width: calc(100% - 8px);
+  background: rgb(11 17 26 / 72%);
+  border-radius: 4px;
+  color: #eef3ff;
+  font-size: 10px;
+  line-height: 1.6;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+.decision-group-events {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 2px 10px 8px 18px;
+}
+
+.decision-entry {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 26px;
+  padding: 3px 6px;
+  color: var(--ink);
+  background: rgb(15 23 35 / 5%);
+  border: 1px solid transparent;
+  border-radius: 5px;
+  cursor: grab;
+  font-size: 11px;
+  touch-action: pan-y;
+  user-select: none;
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.decision-entry:hover {
+  border-color: var(--line);
+}
+
+.decision-entry.dragging {
+  border-color: var(--blue-strong);
+  opacity: 0.85;
+}
+
+.decision-entry-index {
+  flex: none;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.decision-entry-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.decision-entry-input {
+  width: 100%;
+  font-size: 11px;
+}
+
+.decision-entry-empty {
+  padding: 4px 6px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.decision-entry-add {
+  align-self: flex-start;
+  margin-top: 2px;
+  padding: 3px 8px;
+  cursor: pointer;
+  font-size: 11px;
+}
+
+.decision-side-message {
+  margin: 0 10px 8px;
+  cursor: pointer;
 }

@@ -80,20 +80,6 @@ pub fn missions_root_label(root: &str) -> String {
 	root.rsplit('/').nth(1).unwrap_or(root).to_string()
 }
 
-/// 资源根目录本身及其全部上级目录（用于资源管理器自动展开）。
-pub fn root_ancestors(root: &str) -> Vec<String> {
-	let mut paths = Vec::new();
-	let mut cursor = String::new();
-	for segment in root.split('/').filter(|segment| !segment.is_empty()) {
-		if !cursor.is_empty() {
-			cursor.push('/');
-		}
-		cursor.push_str(segment);
-		paths.push(cursor.clone());
-	}
-	paths
-}
-
 /// 从工作区文件列表中选出默认打开的国策树：
 /// 优先经典 `missions/Missions.json`，其次 `assets/game/missions/Missions.json`，
 /// 再次任意剧本资源目录下的 `Missions.json`，最后任意第一个 `.json`（按路径排序）。
@@ -117,4 +103,63 @@ pub fn default_tree_path<'a>(paths: impl Iterator<Item = &'a str>) -> Option<Str
 		.into_iter()
 		.next()
 		.map(|(_, _, root, name)| format!("{root}/{name}"))
+}
+
+/// 从事件脚本目录推导其「missions 资源根」（事件编辑器补全与资源候选按资源根加载，
+/// 决议编辑器打开的全局 / 剧本事件需要落到该事件**所属模组**的资源根上）：
+/// - `…/missionsEvents` → 去掉该段（如 `<mod>/assets/game/missions/missionsEvents`
+///   → `<mod>/assets/game/missions`）；
+/// - `…/events/<子目录…>` → `events` 段替换为 `missions`（如
+///   `<mod>/assets/game/events/common` → `<mod>/assets/game/missions`；
+///   剧本 `<mod>/assets/map/X/scenarios/Y/events/common` → `…/scenarios/Y/missions`）；
+/// - 其他布局 / 根级无前缀的裸目录 → `None`（调用方回退默认树路径）。
+pub fn missions_root_of_events_dir(events_dir: &str) -> Option<String> {
+	let segments: Vec<&str> = events_dir
+		.split('/')
+		.filter(|segment| !segment.is_empty())
+		.collect();
+	if let Some(position) = segments.iter().position(|segment| *segment == "missionsEvents") {
+		let head = segments[..position].join("/");
+		return (!head.is_empty()).then_some(head);
+	}
+	if let Some(position) = segments.iter().position(|segment| *segment == "events") {
+		let head = segments[..position].join("/");
+		return Some(if head.is_empty() {
+			"missions".to_string()
+		} else {
+			format!("{head}/missions")
+		});
+	}
+	None
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn missions_root_of_events_dir_maps_layouts() {
+		assert_eq!(
+			missions_root_of_events_dir("modB/assets/game/missions/missionsEvents").as_deref(),
+			Some("modB/assets/game/missions")
+		);
+		assert_eq!(
+			missions_root_of_events_dir("modB/assets/game/events/common").as_deref(),
+			Some("modB/assets/game/missions")
+		);
+		assert_eq!(
+			missions_root_of_events_dir(
+				"modB/assets/map/Earth3/scenarios/TheGreatWar/events/common"
+			)
+			.as_deref(),
+			Some("modB/assets/map/Earth3/scenarios/TheGreatWar/missions")
+		);
+		assert_eq!(
+			missions_root_of_events_dir("assets/game/events/common").as_deref(),
+			Some("assets/game/missions")
+		);
+		// 根级无前缀 / 非事件目录 → 无法推导。
+		assert_eq!(missions_root_of_events_dir("missionsEvents"), None);
+		assert_eq!(missions_root_of_events_dir("assets/gfx/decision"), None);
+	}
 }

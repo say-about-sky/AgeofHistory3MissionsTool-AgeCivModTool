@@ -69,7 +69,14 @@ pub async fn write_scoped_text_in_dir<R: tauri::Runtime>(
     file_name: String,
     contents: String,
 ) -> Result<(), String> {
-    bridge::write_text_in_dir(&app, &folder_id, &dir_path, &file_name, &contents).await
+    bridge::write_text_in_dir(&app, &folder_id, &dir_path, &file_name, &contents).await?;
+    // 内容可能修改了事件 id：失效该脚本的索引缓存。
+    crate::commands::events::invalidate_event_script_cache(&format!(
+        "{}/{}",
+        dir_path.trim_matches('/'),
+        file_name
+    ));
+    Ok(())
 }
 
 /// 读取工作区相对路径下的文本文件。
@@ -91,7 +98,9 @@ pub async fn write_scoped_text_file<R: tauri::Runtime>(
     contents: String,
     recursive: bool,
 ) -> Result<(), String> {
-    bridge::write_text_file(&app, &folder_id, &path, &contents, recursive).await
+    bridge::write_text_file(&app, &folder_id, &path, &contents, recursive).await?;
+    crate::commands::events::invalidate_event_script_cache(&path);
+    Ok(())
 }
 
 /// 创建目录（`recursive` 为 false 时要求父目录已存在）。
@@ -112,7 +121,9 @@ pub async fn remove_scoped_file<R: tauri::Runtime>(
     folder_id: String,
     path: String,
 ) -> Result<(), String> {
-    bridge::remove_file(&app, &folder_id, &path).await
+    bridge::remove_file(&app, &folder_id, &path).await?;
+    crate::commands::events::invalidate_event_script_cache(&path);
+    Ok(())
 }
 
 /// 删除目录（`recursive` 为 true 时连同内容删除）。
@@ -147,7 +158,10 @@ pub async fn move_scoped_item<R: tauri::Runtime>(
     to_folder_id: String,
     to_path: String,
 ) -> Result<(), String> {
-    bridge::move_item(&app, &from_folder_id, &from_path, &to_folder_id, &to_path).await
+    bridge::move_item(&app, &from_folder_id, &from_path, &to_folder_id, &to_path).await?;
+    crate::commands::events::invalidate_event_script_cache(&from_path);
+    crate::commands::events::invalidate_event_script_cache(&to_path);
+    Ok(())
 }
 
 /// 尝试把 Android SAF 工作区解析为真实文件系统路径。

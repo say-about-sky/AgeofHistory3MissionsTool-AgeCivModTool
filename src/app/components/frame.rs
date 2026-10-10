@@ -22,6 +22,9 @@ pub fn Frame(
         is_android: bool,
         all_files_access_granted: Option<bool>,
 	tabs: Vec<(String, String)>,
+	/// 决议编辑标签（与国策标签合并渲染；id 带 `decision:` 前缀，与国策互不冲突）。
+	#[props(default)]
+	decision_tabs: Vec<(String, String)>,
 	active_tab_id: Option<String>,
 	on_select_tab: EventHandler<String>,
 	on_close_tab: EventHandler<String>,
@@ -40,8 +43,10 @@ pub fn Frame(
 	let mut io_menu_open = use_signal(|| false);
 	// 预克隆标签数据，供 rsx 循环体中的多个闭包各自持有。
 	// 注意：select_id 与 close_id 都必须填 id，不能填 title，否则关闭匹配不到标签。
+	// 国策与决议两类标签合并渲染（决议 id 带 `decision:` 前缀，点击/关闭回调按 id 分派）。
 	let tab_items: Vec<(String, String, String, String)> = tabs
 		.iter()
+		.chain(decision_tabs.iter())
 		.map(|(id, title)| (id.clone(), title.clone(), id.clone(), id.clone()))
 		.collect();
 
@@ -285,11 +290,13 @@ pub fn Frame(
                     span { class: "toolbar-icon", "▤" }
                     "资源管理器"
                 }
-                if !tabs.is_empty() {
+                // 国策与决议标签合并渲染：任一来源非空即显示标签条
+                //（2026-10 修复：此前仅开决议标签时标签条不显示，无法选中/关闭）。
+                if !tab_items.is_empty() {
                     div {
                         class: "tab-strip",
                         role: "tablist",
-                        aria_label: "国策树标签页",
+                        aria_label: "标签页",
                         for (id , title , select_id , close_id) in tab_items {
                             div {
                                 class: if active_tab_id.as_ref() == Some(&id) { "editor-tab active" } else { "editor-tab" },

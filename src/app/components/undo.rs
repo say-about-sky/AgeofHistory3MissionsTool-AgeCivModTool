@@ -13,6 +13,8 @@ pub enum UndoScope {
     Tab(String),
     /// 事件脚本文件（按「资源根/missionsEvents/文件名」，归入事件编辑分区）。
     EventFile(String),
+    /// 决议定义文件（按决议标签页 id，归入决议编辑分区）。
+    DecisionFile(String),
     /// 资源管理器的文件操作（复制/剪切粘贴等），独立分区。
     Explorer,
 }
@@ -23,6 +25,7 @@ pub enum UndoZone {
     #[default]
     Canvas,
     Events,
+    Decisions,
     Explorer,
 }
 
@@ -32,6 +35,7 @@ impl UndoZone {
         match self {
             UndoZone::Canvas => "画布",
             UndoZone::Events => "事件编辑",
+            UndoZone::Decisions => "决议编辑",
             UndoZone::Explorer => "资源管理器",
         }
     }
@@ -43,6 +47,7 @@ impl UndoScope {
         match self {
             UndoScope::Tab(_) => UndoZone::Canvas,
             UndoScope::EventFile(_) => UndoZone::Events,
+            UndoScope::DecisionFile(_) => UndoZone::Decisions,
             UndoScope::Explorer => UndoZone::Explorer,
         }
     }
@@ -55,6 +60,8 @@ pub struct UndoDepths {
     pub canvas_redo: usize,
     pub events_undo: usize,
     pub events_redo: usize,
+    pub decisions_undo: usize,
+    pub decisions_redo: usize,
     pub explorer_undo: usize,
     pub explorer_redo: usize,
 }
@@ -87,6 +94,27 @@ pub fn pop_applicable<F: Fn(&UndoEntry) -> bool>(
     Some(stack.remove(position))
 }
 
+/// 撤销安全网判定：画布条目（`Tab` 作用域）是否仍对应打开的标签页。
+///
+/// 条目的执行器由子组件作用域持有，标签页关闭 / 画布卸载后执行器与信号即被释放，
+/// 再执行会 panic（`Dropped(ValueDroppedError)`，并可能连锁 `RefCell already borrowed`）。
+/// 其它作用域（事件、资源管理器）的条目不受此判定影响，由各自分区处理。
+pub fn canvas_scope_is_open(scope: &UndoScope, open_ids: &[String]) -> bool {
+    match scope {
+        UndoScope::Tab(id) => open_ids.iter().any(|open| open == id),
+        _ => true,
+    }
+}
+
+/// 撤销安全网判定：决议编辑条目（`DecisionFile` 作用域）是否仍对应打开的决议标签页。
+/// 与画布条目同理：决议标签页关闭后其组件作用域释放，旧的撤销执行器不得再执行。
+pub fn decision_scope_is_open(scope: &UndoScope, open_ids: &[String]) -> bool {
+    match scope {
+        UndoScope::DecisionFile(id) => open_ids.iter().any(|open| open == id),
+        _ => true,
+    }
+}
+
 /// 当前时间（毫秒）。
 pub fn now_ms() -> f64 {
     js_sys::Date::now()
@@ -101,4 +129,51 @@ pub fn focus_wants_native_undo() -> bool {
         .and_then(|document| document.active_element())
         .and_then(|element| element.closest("[data-native-undo]").ok().flatten())
         .is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canvas_scope_retention_follows_open_tabs() {
+        let open = vec!["a.json".to_string()];
+        // 仍打开的标签页保留。
+        assert!(canvas_scope_is_open(
+            &UndoScope::Tab("a.json".to_string()),
+            &open
+        ));
+        // 已关闭 / 被剪除的标签页剪掉。
+        assert!(!canvas_scope_is_open(
+            &UndoScope::Tab("b.json".to_string()),
+            &open
+        ));
+        // 标签页列表为空（工作区清空）时画布条目全部失效。
+        assert!(!canvas_scope_is_open(
+            &UndoScope::Tab("a.json".to_string()),
+            &[]
+        ));
+        // 其它分区条目不受影响。
+        assert!(canvas_scope_is_open(&UndoScope::Explorer, &open));
+        assert!(canvas_scope_is_open(
+            &UndoScope::EventFile("missions/missionsEvents/x.txt".to_string()),
+            &open
+        ));
+    }
+
+    #[test]
+    fn decision_scope_retention_follows_open_tabs() {
+        let open = vec!["decision:a/rainfall/rfEvent_decision.json".to_string()];
+        assert!(decision_scope_is_open(
+            &UndoScope::DecisionFile("decision:a/rainfall/rfEvent_decision.json".to_string()),
+            &open
+        ));
+        assert!(!decision_scope_is_open(
+            &UndoScope::DecisionFile("decision:b/rainfall/rfEvent_decision.json".to_string()),
+            &open
+        ));
+        // 其它分区条目不受该判定影响。
+        assert!(decision_scope_is_open(&UndoScope::Tab("a.json".to_string()), &open));
+        assert!(decision_scope_is_open(&UndoScope::Explorer, &[]));
+    }
 }

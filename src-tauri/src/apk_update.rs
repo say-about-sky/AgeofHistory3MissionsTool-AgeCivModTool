@@ -45,6 +45,9 @@ const ZIP32_LIMIT: u64 = 0xFFFF_FFFF;
 
 /// 从工作区目录推导「导出到 APK」的版块前缀（适配各模组自定义地图 / 剧本目录名）：
 /// - `assets/game/missions/`（目录存在时）；
+/// - `assets/game/events/`（目录存在时；决议事件热导入的文件落在
+///   `assets/game/events/common/`，须能随导出写回 APK）；
+/// - `assets/rainfall/` 与 `assets/gfx/decision/`（决议相关版块，目录存在时）；
 /// - 工作区里全部实际存在的 `assets/map/<地图>/scenarios/<剧本>/` 目录
 ///   （地图目录名由各模组的 `maps/Maps.json` 指定、剧本目录名由 `<地图>/Scenarios.txt`
 ///   指定；导出时按工作区里已有的目录识别，与导入时写入的内容一一对应）。
@@ -52,6 +55,15 @@ pub fn discover_workspace_section_prefixes(source_root: &Path) -> Vec<String> {
     let mut prefixes: Vec<String> = Vec::new();
     if source_root.join("assets/game/missions").is_dir() {
         prefixes.push("assets/game/missions/".to_string());
+    }
+    if source_root.join("assets/game/events").is_dir() {
+        prefixes.push("assets/game/events/".to_string());
+    }
+    if source_root.join("assets/rainfall").is_dir() {
+        prefixes.push("assets/rainfall/".to_string());
+    }
+    if source_root.join("assets/gfx/decision").is_dir() {
+        prefixes.push("assets/gfx/decision/".to_string());
     }
     let mut scenarios: Vec<String> = Vec::new();
     if let Ok(maps) = fs::read_dir(source_root.join("assets/map")) {
@@ -525,6 +537,10 @@ mod tests {
         assert!(discover_workspace_section_prefixes(&workspace).is_empty());
         write_file(&workspace.join("assets/game/missions/Missions.json"), "[]");
         write_file(
+            &workspace.join("assets/game/events/common/全局事件.txt"),
+            "{}",
+        );
+        write_file(
             &workspace.join("assets/map/Begonia/scenarios/RWS/missions/Missions.json"),
             "[]",
         );
@@ -539,8 +555,31 @@ mod tests {
             discover_workspace_section_prefixes(&workspace),
             vec![
                 "assets/game/missions/".to_string(),
+                "assets/game/events/".to_string(),
                 "assets/map/Begonia/scenarios/RWS/".to_string(),
                 "assets/map/Earth3/scenarios/TheGreatWar/".to_string(),
+            ]
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn discovers_workspace_decision_prefixes() {
+        // 决议相关版块目录存在时加入导出前缀（不存在的老模组工作区不受影响）。
+        let dir = temp_dir("discover-ws-decisions");
+        let workspace = dir.join("ws");
+        fs::create_dir_all(workspace.join("assets/rainfall")).unwrap();
+        fs::create_dir_all(workspace.join("assets/gfx/decision")).unwrap();
+        fs::write(
+            workspace.join("assets/rainfall/rfEvent_decision.json"),
+            "{}",
+        )
+        .unwrap();
+        assert_eq!(
+            discover_workspace_section_prefixes(&workspace),
+            vec![
+                "assets/rainfall/".to_string(),
+                "assets/gfx/decision/".to_string(),
             ]
         );
         let _ = fs::remove_dir_all(&dir);

@@ -1,4 +1,5 @@
 pub mod mind;
+pub mod decision;
 pub mod undo;
 pub mod work;
 pub mod files;
@@ -10,6 +11,8 @@ pub mod event_parser;
 pub mod event_schema;
 pub mod game_text;
 pub mod missions_roots;
+/// 平台分派文件操作（桌面真实路径 / 安卓 SAF 两套实现的集中地；新增文件操作请加在这里）。
+pub mod platform_fs;
 pub use mind::{FocusIcon, FocusTarget, MindClipboard, MindMapCanvas, MissionRecord, Shared};
 pub use work::Work;
 

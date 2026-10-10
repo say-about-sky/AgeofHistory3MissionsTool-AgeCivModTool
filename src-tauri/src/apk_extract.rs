@@ -182,12 +182,19 @@ pub fn extract_apk_sections_with_progress(
 /// `Begonia/RWS`、「暮色黄昏」用 `Earth3/TheGreatWar`）。这里直接按中央目录里
 /// 实际存在的 `assets/map/*/scenarios/*/` 组合识别（清单缺失 / 自定义的模组同样覆盖），
 /// 并固定包含 `assets/game/missions/`（全局国策）。
+/// 决议相关版块（Team Rainfall / rfEvent 插件数据）按条目存在性加入：
+/// `assets/rainfall/`（决议定义及其余配置）与 `assets/gfx/decision/`（决议图片）——
+/// 不含 rainfall 的模组不受影响。
 pub fn discover_section_prefixes(file: &File) -> Result<Vec<String>, String> {
     let entries = list_apk_entries(file)?;
     let mut prefixes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     prefixes.insert("assets/game/missions/".to_string());
     for entry in &entries {
-        if let Some(prefix) = section_prefix_of_entry(&entry.name) {
+        if entry.name.starts_with("assets/rainfall/") {
+            prefixes.insert("assets/rainfall/".to_string());
+        } else if entry.name.starts_with("assets/gfx/decision/") {
+            prefixes.insert("assets/gfx/decision/".to_string());
+        } else if let Some(prefix) = section_prefix_of_entry(&entry.name) {
             prefixes.insert(prefix);
         }
     }
@@ -763,7 +770,8 @@ fn copy_stream(reader: &mut dyn Read, writer: &mut File) -> io::Result<u64> {
 }
 
 /// 校验并规范化条目路径（防 zip-slip；Windows 非法字符替换为 `_`）。
-fn sanitize_entry_name(raw: &str) -> Option<PathBuf> {
+/// 热导入（单条按需解压）等内部按需读取场景直接复用本函数。
+pub(crate) fn sanitize_entry_name(raw: &str) -> Option<PathBuf> {
     let name = raw.trim_end_matches('/');
     if name.is_empty() {
         return None;
@@ -1182,6 +1190,40 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn discovers_decision_section_prefixes() {
+        // 决议相关版块（rainfall / gfx/decision）按条目存在性加入前缀；
+        // 不含这些内容的模组（如 road_to_56）导入范围不受影响。
+        let dir = temp_dir("discover-decisions");
+        let apk = dir.join("mod.apk");
+        {
+            let mut zip = zip::ZipWriter::new(File::create(&apk).unwrap());
+            for name in [
+                "assets/game/missions/Missions.json",
+                "assets/rainfall/rfEvent_decision.json",
+                "assets/rainfall/Startup.json",
+                "assets/gfx/decision/icon.png",
+                "assets/gfx/flags/x.png",
+            ] {
+                zip.start_file(name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                zip.write_all(b"x").unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        let file = File::open(&apk).unwrap();
+        let prefixes = discover_section_prefixes(&file).unwrap();
+        assert_eq!(
+            prefixes,
+            vec![
+                "assets/game/missions/".to_string(),
+                "assets/gfx/decision/".to_string(),
+                "assets/rainfall/".to_string(),
+            ]
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// 真实模组 APK 的版块识别（各模组自定义地图 / 剧本目录名）：
     /// `cargo test -p age_civ_mod_tool --lib discover_real_apk_section_prefixes -- --ignored`
     #[test]
@@ -1190,15 +1232,28 @@ mod tests {
         let cases: [(&str, &[&str]); 5] = [
             (
                 r"A:\android\GameCivs\暮色黄昏_世界大战0.25.1.apk",
-                &["assets/map/Earth3/scenarios/TheGreatWar/"],
+                &[
+                    "assets/map/Earth3/scenarios/TheGreatWar/",
+                    "assets/rainfall/",
+                    "assets/gfx/decision/",
+                ],
             ),
-            (r"A:\android\GameCivs\白日升.apk", &["assets/map/Begonia/scenarios/RWS/"]),
+            (
+                r"A:\android\GameCivs\白日升.apk",
+                &[
+                    "assets/map/Begonia/scenarios/RWS/",
+                    "assets/rainfall/",
+                    "assets/gfx/decision/",
+                ],
+            ),
             (r"A:\android\GameCivs\road_to_56.apk", &["assets/map/Earth3/scenarios/WW2/"]),
             (
                 r"A:\android\GameCivs\europe.apk",
                 &[
                     "assets/map/ES/scenarios/RusUkrWar/",
                     "assets/map/ES/scenarios/Ukr2014/",
+                    "assets/rainfall/",
+                    "assets/gfx/decision/",
                 ],
             ),
             (
@@ -1207,6 +1262,8 @@ mod tests {
                     "assets/map/Earth3/scenarios/ming/",
                     "assets/map/Earth3/scenarios/province/",
                     "assets/map/Earth3/scenarios/zhu/",
+                    "assets/rainfall/",
+                    "assets/gfx/decision/",
                 ],
             ),
         ];
@@ -1221,6 +1278,59 @@ mod tests {
                 assert!(
                     prefixes.iter().any(|item| item == prefix),
                     "{path} 缺 {prefix}（实际：{prefixes:?}）"
+                );
+            }
+        }
+    }
+
+    /// 热导入性能基准（ignored；需真实 APK）：打开源 APK 后「扫描中央目录 + 读取单条
+    /// 事件脚本」的耗时（含二次扫描 = 无缓存时重复调用命令的额外开销）。
+    /// 运行：`cargo test -p age_civ_mod_tool --lib bench_single_event_read -- --ignored --nocapture`
+    #[test]
+    #[ignore = "需要真实模组 APK（A:\\android\\GameCivs）"]
+    fn bench_single_event_read() {
+        let paths = [
+            r"A:\android\GameCivs\暮色黄昏_世界大战0.25.1.apk",
+            r"A:\android\GameCivs\1566AuroraPrever2.apk",
+            r"A:\android\GameCivs\road_to_56.apk",
+        ];
+        for path in paths {
+            let file = match File::open(path) {
+                Ok(file) => file,
+                Err(error) => {
+                    println!("跳过 {path}：{error}");
+                    continue;
+                }
+            };
+            let start = std::time::Instant::now();
+            let entries = list_apk_entries(&file).unwrap();
+            let first_scan_ms = start.elapsed().as_secs_f64() * 1000.0;
+            let start = std::time::Instant::now();
+            let _ = list_apk_entries(&file).unwrap();
+            let second_scan_ms = start.elapsed().as_secs_f64() * 1000.0;
+            let events: Vec<&ScanEntry> = entries
+                .iter()
+                .filter(|entry| {
+                    let lower = entry.name.to_ascii_lowercase();
+                    lower.ends_with(".txt")
+                        && (lower.contains("/events/") || lower.contains("missionsevents/"))
+                })
+                .collect();
+            println!(
+                "{path}\n  条目总数={} 事件脚本={} 首次扫描CD={first_scan_ms:.1}ms 再次扫描={second_scan_ms:.1}ms",
+                entries.len(),
+                events.len()
+            );
+            if let Some(entry) = events.first() {
+                let start = std::time::Instant::now();
+                let data = read_apk_entry_bytes(&file, entry, 8 * 1024 * 1024).unwrap();
+                let read_ms = start.elapsed().as_secs_f64() * 1000.0;
+                println!(
+                    "  样例条目 {}（method={} 压缩 {}B → 解压 {}B）读取耗时 {read_ms:.2}ms",
+                    entry.name,
+                    entry.method,
+                    entry.comp_size,
+                    data.len()
                 );
             }
         }

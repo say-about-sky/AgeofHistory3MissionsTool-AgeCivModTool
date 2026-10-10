@@ -115,3 +115,38 @@ pub struct MissionRecord {
 fn default_mission_ai() -> i32 {
     100
 }
+
+/// 单个决议组，对应 `rainfall/rfEvent_decision.json` 的 `decisions` 数组项。
+///
+/// 决议组 = 一组共享标题 / 图片 / 描述的可解锁决议（法院面板中的一栏）；
+/// `events` 中每一项为决议事件脚本名（去掉 `.txt` 后缀），运行时以
+/// 「组id:事件id」复合键开始 / 查询（`start_decision` / `taking_decision` 等）。
+#[derive(Clone, Deserialize, Serialize)]
+pub struct DecisionGroup {
+    /// 组 ID（`add_decision` 解锁时引用；与事件名组成复合键）。
+    #[serde(default)]
+    pub id: String,
+    /// 组标题（面板显示名；可写翻译键）。
+    #[serde(default)]
+    pub name: String,
+    /// 组描述，可多条（`decision_desc` 效果切换显示第几条，从 0 数）。
+    #[serde(default)]
+    pub desc: Vec<String>,
+    /// 组图片文件名（含扩展名，位于 `gfx/decision/`；可多条，`decision_image` 切换）。
+    #[serde(default)]
+    pub images: Vec<String>,
+    /// 组内决议事件脚本名列表（每项 = 一个可点击条目）。
+    #[serde(default)]
+    pub events: Vec<String>,
+    /// 工具尚未注册的未知字段（未来扩展键）：解析时按名收集、保存时原样写出。
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+/// 决议定义文件根对象（`rainfall/rfEvent_decision.json`）。
+#[derive(Clone, Deserialize, Serialize)]
+pub struct DecisionFile {
+    /// 决议组列表。
+    #[serde(default, alias = "Decisions")]
+    pub decisions: Vec<DecisionGroup>,
+}

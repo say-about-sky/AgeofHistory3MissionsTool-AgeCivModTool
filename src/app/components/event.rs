@@ -1,228 +1,42 @@
 use dioxus::prelude::*;
-use serde::Serialize;
-use wasm_bindgen_futures::JsFuture;
+use std::collections::BTreeMap;
 
 use super::event_lookup::{
 	game_dir_key, load_event_assets, load_event_lookup, scenario_map_key, EventAssets, EventLookup,
 };
+use super::missions_roots::missions_root_of_events_dir;
+use super::platform_fs::{load_event_text, save_event_text};
 use super::undo::{UndoRegistration, UndoScope};
 use super::{event_grid::EventGrid, event_parser::{diagnostics, MissionEvent}, mind::Shared, WorkDirectory};
-use crate::app::tauri_bridge::invoke;
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ScopedReadTextInDir {
-	folder_id: String,
-	dir_path: String,
-	file_name: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ScopedWriteTextInDir {
-	folder_id: String,
-	dir_path: String,
-	file_name: String,
-	contents: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct EventFileArgs {
-	work_directory: String,
-	missions_root: String,
-	file_name: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct EventFileWriteArgs {
-	work_directory: String,
-	missions_root: String,
-	file_name: String,
-	contents: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ScopedRemoveFile {
-	folder_id: String,
-	path: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ScopedMove {
-	from_folder_id: String,
-	from_path: String,
-	to_folder_id: String,
-	to_path: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct EventRenameArgs {
-	work_directory: String,
-	missions_root: String,
-	old_file_name: String,
-	new_file_name: String,
-}
-
-fn event_file_path(root_path: &str, missions_root: &str, file_name: &str) -> String {
-	if root_path.is_empty() {
-		format!("{missions_root}/missionsEvents/{file_name}")
-	} else {
-		format!("{root_path}/{missions_root}/missionsEvents/{file_name}")
-	}
-}
-
-fn event_dir_path(root_path: &str, missions_root: &str) -> String {
-	if root_path.is_empty() {
-		format!("{missions_root}/missionsEvents")
-	} else {
-		format!("{root_path}/{missions_root}/missionsEvents")
-	}
-}
-
-async fn load_event_text(
-	directory: &WorkDirectory,
-	missions_root: &str,
-	file_name: &str,
-) -> Result<String, String> {
-	if let Some(folder_id) = &directory.folder_id {
-		let args = serde_wasm_bindgen::to_value(&ScopedReadTextInDir {
-			folder_id: folder_id.clone(),
-			dir_path: event_dir_path(&directory.root_path, missions_root),
-			file_name: file_name.to_string(),
-		})
-		.map_err(|error| error.to_string())?;
-		let value = JsFuture::from(invoke("read_scoped_text_in_dir", args))
-			.await
-			.map_err(|error| format!("读取事件文件失败：{error:?}"))?;
-		value
-			.as_string()
-			.ok_or_else(|| "事件文件读取结果无效".to_string())
-	} else {
-		let args = serde_wasm_bindgen::to_value(&EventFileArgs {
-			work_directory: directory.root_path.clone(),
-			missions_root: missions_root.to_string(),
-			file_name: file_name.to_string(),
-		})
-		.map_err(|error| error.to_string())?;
-		let value = JsFuture::from(invoke("load_mission_event", args))
-			.await
-			.map_err(|error| format!("读取事件文件失败：{error:?}"))?;
-		value
-			.as_string()
-			.ok_or_else(|| "事件文件读取结果无效".to_string())
-	}
-}
-
-pub(crate) async fn save_event_text(
-	directory: &WorkDirectory,
-	missions_root: &str,
-	file_name: &str,
-	contents: &str,
-) -> Result<(), String> {
-	if let Some(folder_id) = &directory.folder_id {
-		let args = serde_wasm_bindgen::to_value(&ScopedWriteTextInDir {
-			folder_id: folder_id.clone(),
-			dir_path: event_dir_path(&directory.root_path, missions_root),
-			file_name: file_name.to_string(),
-			contents: contents.to_string(),
-		})
-		.map_err(|error| error.to_string())?;
-		JsFuture::from(invoke("write_scoped_text_in_dir", args))
-			.await
-			.map_err(|error| format!("保存事件文件失败：{error:?}"))?;
-		Ok(())
-	} else {
-		let args = serde_wasm_bindgen::to_value(&EventFileWriteArgs {
-			work_directory: directory.root_path.clone(),
-			missions_root: missions_root.to_string(),
-			file_name: file_name.to_string(),
-			contents: contents.to_string(),
-		})
-		.map_err(|error| error.to_string())?;
-		JsFuture::from(invoke("save_mission_event", args))
-			.await
-			.map_err(|error| format!("保存事件文件失败：{error:?}"))?;
-		Ok(())
-	}
-}
-
-pub(crate) async fn delete_event_text(
-	directory: &WorkDirectory,
-	missions_root: &str,
-	file_name: &str,
-) -> Result<(), String> {
-	if let Some(folder_id) = &directory.folder_id {
-		let path = event_file_path(&directory.root_path, missions_root, file_name);
-		let args = serde_wasm_bindgen::to_value(&ScopedRemoveFile {
-			folder_id: folder_id.clone(),
-			path,
-		})
-		.map_err(|error| error.to_string())?;
-		JsFuture::from(invoke("remove_scoped_file", args))
-			.await
-			.map_err(|error| format!("删除事件文件失败：{error:?}"))?;
-		Ok(())
-	} else {
-		let args = serde_wasm_bindgen::to_value(&EventFileArgs {
-			work_directory: directory.root_path.clone(),
-			missions_root: missions_root.to_string(),
-			file_name: file_name.to_string(),
-		})
-		.map_err(|error| error.to_string())?;
-		JsFuture::from(invoke("delete_mission_event", args))
-			.await
-			.map_err(|error| format!("删除事件文件失败：{error:?}"))?;
-		Ok(())
-	}
-}
-
-pub(crate) async fn rename_event_text(
-	directory: &WorkDirectory,
-	missions_root: &str,
-	old_file_name: &str,
-	new_file_name: &str,
-) -> Result<(), String> {
-	if let Some(folder_id) = &directory.folder_id {
-		let from_path = event_file_path(&directory.root_path, missions_root, old_file_name);
-		let to_path = event_file_path(&directory.root_path, missions_root, new_file_name);
-		let args = serde_wasm_bindgen::to_value(&ScopedMove {
-			from_folder_id: folder_id.clone(),
-			from_path,
-			to_folder_id: folder_id.clone(),
-			to_path,
-		})
-		.map_err(|error| error.to_string())?;
-		JsFuture::from(invoke("move_scoped_item", args))
-			.await
-			.map_err(|error| format!("重命名事件文件失败：{error:?}"))?;
-		Ok(())
-	} else {
-		let args = serde_wasm_bindgen::to_value(&EventRenameArgs {
-			work_directory: directory.root_path.clone(),
-			missions_root: missions_root.to_string(),
-			old_file_name: old_file_name.to_string(),
-			new_file_name: new_file_name.to_string(),
-		})
-		.map_err(|error| error.to_string())?;
-		JsFuture::from(invoke("rename_mission_event", args))
-			.await
-			.map_err(|error| format!("重命名事件文件失败：{error:?}"))?;
-		Ok(())
-	}
+/// 单会话（标签页）的事件编辑状态：切换标签时暂存 / 恢复，
+/// 让事件编辑器在标签之间相互隔离——打开文件、未保存草稿、补全资源根都随会话走。
+#[derive(Clone, PartialEq)]
+struct EventSessionState {
+	/// 当前打开的事件脚本文件名。
+	selected: String,
+	/// 事件脚本目录（工作区相对完整目录）。
+	events_dir: String,
+	/// 打开时的原文（脏标记基线）。
+	original: String,
+	/// 当前编辑文本（含未保存的草稿）。
+	text: String,
+	/// 打开时记录的补全资源根（恢复时优先按事件目录重推导，失败才回退此值）。
+	missions_root: Option<String>,
 }
 
 /// 国策事件脚本编辑面板，挂在主编辑区右侧；文件选择由资源管理器/思维导图联动。
 #[component]
 pub fn EventPanel(
 	work_directory: Option<WorkDirectory>,
+	/// 事件编辑器会话键（当前激活标签页 id；无标签时为 `explorer`）：
+	/// 切换标签时会话级隔离——每个标签独立保存打开文件与未保存草稿（见 `EventSessionState`）。
+	session_key: String,
 	missions_root: Signal<Option<String>>,
 	save_request: Signal<u64>,
-	open_request: Signal<Option<(String, u64)>>,
+	/// 打开请求：`(事件目录, 文件名, 自增序号)`——事件目录为工作区相对完整目录
+	/// （`…/missionsEvents` 或 `…/events/…`）。
+	open_request: Signal<Option<(String, String, u64)>>,
 	rename_request: Signal<Option<(String, String)>>,
 	release_request: Signal<u64>,
 	on_selection_change: EventHandler<Option<String>>,
@@ -238,10 +52,12 @@ pub fn EventPanel(
 	native_autocomplete: bool,
 ) -> Element {
 	let mut selected = use_signal(|| None::<String>);
+	// 当前打开文件所在的事件目录（工作区相对完整目录）：保存 / 重命名 / 撤销 scope 用。
+	let mut current_events_dir = use_signal(String::new);
 	let mut event = use_signal(|| None::<MissionEvent>);
 	let mut original = use_signal(String::new);
 	let mut status = use_signal(String::new);
-	let busy = use_signal(|| false);
+	let mut busy = use_signal(|| false);
 	let mut last_save_request = use_signal(|| *save_request.read());
 
 	// —— 文明/政体对照表（值单元格的自动补全与名称提示） ——
@@ -383,11 +199,11 @@ pub fn EventPanel(
 		let Some(file) = selected.read().clone() else {
 			return;
 		};
-		let root = missions_root
-			.read()
-			.clone()
-			.unwrap_or_else(|| "missions".to_string());
-		let scope_key = format!("{root}/missionsEvents/{file}");
+		let events_dir = current_events_dir.read().clone();
+		if events_dir.is_empty() {
+			return;
+		}
+		let scope_key = format!("{events_dir}/{file}");
 		let scope = UndoScope::EventFile(scope_key.clone());
 		// 执行器只在仍打开同一文件时应用快照（避免把内容串写到其它文件）；
 		// Work 层还会按「当前打开文件」过滤，这里为双保险。
@@ -412,40 +228,56 @@ pub fn EventPanel(
 		on_undo_push.call((scope, undo, redo));
 	});
 
+	// —— 会话隔离 ——
+	// 面板是单实例：所有跨标签共享的编辑状态在这里做「存 / 取」快照（见 EventSessionState）。
+	let mut sessions = use_signal(BTreeMap::<String, EventSessionState>::new);
+	let mut last_session_key = use_signal(String::new);
+	// 打开纪元：快速连续打开 / 切换会话时以最后一次请求为准（迟到的读取响应直接丢弃）。
+	let mut open_generation = use_signal(|| 0_u64);
+
 	let directory_for_open = work_directory.clone();
-	let open_event = use_callback(move |file_name: String| {
+	let open_event = use_callback(move |(events_dir, file_name): (String, String)| {
 		// 已是当前文件且已载入时跳过重读，避免覆盖未保存的编辑。
-		if selected.read().clone() == Some(file_name.clone()) && event.read().is_some() {
+		if selected.read().clone() == Some(file_name.clone())
+			&& event.read().is_some()
+			&& current_events_dir.read().as_str() == events_dir.as_str()
+		{
 			return;
 		}
 		let Some(directory) = directory_for_open.clone() else {
 			status.set("请先打开工作区".to_string());
 			return;
 		};
-		let missions_root = missions_root
-			.read()
-			.clone()
-			.unwrap_or_else(|| "missions".to_string());
 		let mut busy = busy;
 		let mut selected = selected;
 		let mut event = event;
 		let mut original = original;
 		let mut status = status;
+		let mut current_events_dir = current_events_dir;
+		let generation = open_generation.with_mut(|value| {
+			*value = value.wrapping_add(1);
+			*value
+		});
 		spawn(async move {
 			busy.set(true);
 			status.set("正在读取...".to_string());
 			event.set(None);
-			match load_event_text(&directory, &missions_root, &file_name).await {
+			let result = load_event_text(&directory, &events_dir, &file_name).await;
+			// 迟到的响应不能覆盖后发请求（快速连续打开 / 切换标签场景）。
+			if *open_generation.peek() != generation {
+				return;
+			}
+			match result {
 				Ok(text) => {
 					selected.set(Some(file_name.clone()));
 					original.set(text.clone());
 					event.set(Some(MissionEvent::parse(&text)));
 					status.set(String::new());
+					current_events_dir.set(events_dir.clone());
 					// 供 Work 判断事件分区的撤销可用性。
-					active_scope
-						.set(Some(format!("{missions_root}/missionsEvents/{file_name}")));
-					on_selection_change
-						.call(Some(format!("{missions_root}/missionsEvents/{file_name}")));
+					let scope_path = format!("{events_dir}/{file_name}");
+					active_scope.set(Some(scope_path.clone()));
+					on_selection_change.call(Some(scope_path));
 				}
 				Err(error) => status.set(error),
 			}
@@ -464,13 +296,13 @@ pub fn EventPanel(
 		let Some(directory) = directory_for_save.clone() else {
 			return;
 		};
-		let missions_root = missions_root
-			.read()
-			.clone()
-			.unwrap_or_else(|| "missions".to_string());
 		let Some(file_name) = selected.read().clone() else {
 			return;
 		};
+		let events_dir = current_events_dir.read().clone();
+		if events_dir.is_empty() {
+			return;
+		}
 		let Some(current) = event.read().clone() else {
 			return;
 		};
@@ -482,7 +314,7 @@ pub fn EventPanel(
 		let mut status = status;
 		spawn(async move {
 			status.set("正在保存...".to_string());
-			match save_event_text(&directory, &missions_root, &file_name, &text).await {
+			match save_event_text(&directory, &events_dir, &file_name, &text).await {
 				Ok(()) => {
 					original.set(text);
 					status.set("已保存".to_string());
@@ -503,19 +335,92 @@ pub fn EventPanel(
 		event.set(None);
 		original.set(String::new());
 		status.set("已关闭".to_string());
+		current_events_dir.set(String::new());
 		active_scope.set(None);
 		on_selection_change.call(None);
+		// 工作区已切换：丢弃全部会话快照与在途读取（新工作区从零开始）。
+		sessions.set(BTreeMap::new());
+		open_generation.with_mut(|value| *value = value.wrapping_add(1));
 	});
 
-	let mut last_open_request = use_signal(|| None::<(String, u64)>);
+	// —— 会话隔离：切换标签页时暂存旧会话 / 恢复新会话（见 EventSessionState）——
+	// 恢复用快照（不重读文件）保留未保存草稿；经 pending_apply 原子落地，不产生撤销步骤。
+	use_effect(use_reactive((&session_key,), move |(key,)| {
+		let key = key.to_string();
+		let previous = last_session_key.peek().clone();
+		if previous == key {
+			return;
+		}
+		last_session_key.set(key.clone());
+		// 1) 暂存旧会话：有打开文件才记（无文件不保留空条目）。
+		if !previous.is_empty() {
+			if let Some(file) = selected.peek().clone() {
+				let state = EventSessionState {
+					selected: file,
+					events_dir: current_events_dir.peek().clone(),
+					original: original.peek().clone(),
+					text: event
+						.peek()
+						.as_ref()
+						.map(MissionEvent::to_text)
+						.unwrap_or_default(),
+					missions_root: missions_root.peek().clone(),
+				};
+				sessions.with_mut(|map| {
+					map.insert(previous, state);
+				});
+			} else {
+				sessions.with_mut(|map| {
+					map.remove(&previous);
+				});
+			}
+		}
+		// 2) 恢复新会话；该标签没打开过事件则清空面板。
+		// 递增打开纪元：作废在途读取（避免旧响应落到新会话）。
+		open_generation.with_mut(|value| *value = value.wrapping_add(1));
+		let restored = sessions.peek().get(&key).cloned();
+		match restored {
+			Some(state) => {
+				current_events_dir.set(state.events_dir.clone());
+				selected.set(Some(state.selected.clone()));
+				original.set(state.original);
+				// 原子落地内容：基线先更新，不产生撤销步骤（与「应用撤销」同一通道）。
+				pending_apply.set(Some(MissionEvent::parse(&state.text)));
+				status.set(String::new());
+				// 被作废的在途读取不再负责复位忙碌态，这里统一收尾。
+				busy.set(false);
+				let scope_path = format!("{}/{}", state.events_dir, state.selected);
+				active_scope.set(Some(scope_path.clone()));
+				on_selection_change.call(Some(scope_path));
+				// 补全根优先按事件目录重推导（后续新工作区 / 新打开路径自动适用），
+				// 推导失败时回退打开时记录的值。
+				let root = missions_root_of_events_dir(&state.events_dir).or(state.missions_root);
+				if root.is_some() && missions_root.peek().clone() != root {
+					missions_root.set(root);
+				}
+			}
+			None => {
+				current_events_dir.set(String::new());
+				selected.set(None);
+				event.set(None);
+				original.set(String::new());
+				status.set(String::new());
+				busy.set(false);
+				active_scope.set(None);
+				on_selection_change.call(None);
+			}
+		}
+	}));
+
+	let mut last_open_request = use_signal(|| None::<(String, String, u64)>);
 	use_effect(move || {
 		let request = open_request.read().clone();
 		if request.is_none() || request == *last_open_request.read() {
 			return;
 		}
 		last_open_request.set(request.clone());
-		if let Some((file_name, _)) = request {
-			open_event.call(file_name);
+		if let Some((events_dir, file_name, _seq)) = request {
+			open_event.call((events_dir, file_name));
 		}
 	});
 
@@ -537,13 +442,25 @@ pub fn EventPanel(
 						"脚本已重命名为 {new_name}；当前未保存的修改仍指向旧文件"
 					));
 				} else {
-					open_event.call(new_name);
+					let events_dir = current_events_dir.read().clone();
+					open_event.call((events_dir, new_name));
 				}
 			}
 		}
 	});
 
 	let selected_name = selected.read().clone();
+	let file_display = selected_name
+		.as_deref()
+		.map(|file| {
+			let dir = current_events_dir.read().clone();
+			if dir.is_empty() {
+				file.to_string()
+			} else {
+				format!("{dir}/{file}")
+			}
+		})
+		.unwrap_or_default();
 	let original_text = original.read().clone();
 	let current_text = event.read().as_ref().map(MissionEvent::to_text);
 	let is_dirty = selected_name.is_some() && current_text.as_deref() != Some(original_text.as_str());
@@ -558,6 +475,28 @@ pub fn EventPanel(
 		.as_ref()
 		.map(diagnostics)
 		.unwrap_or((0, 0, 0));
+	// 决议事件提示（仅提示）：含 decision_dura 但没有任何触发器条件时，
+	// 引擎侧「空触发器恒为 false」——决议将无法开始 / 无法通过完成检查。
+	let decision_hint = event.read().as_ref().and_then(|parsed| {
+		let has_decision_dura = parsed
+			.header
+			.iter()
+			.any(|line| line.key == "decision_dura");
+		if !has_decision_dura {
+			return None;
+		}
+		let triggers_empty = parsed
+			.triggers
+			.iter()
+			.all(|block| block.conditions.is_empty());
+		if triggers_empty {
+			Some(
+				"这是决议事件：未检测到任何触发器条件——空触发器恒为 false，该决议将无法开始 / 无法通过完成检查（请至少写一个条件，如 is_player=true）",
+			)
+		} else {
+			None
+		}
+	});
 	let issue_count = invalid_count + unknown_count + typo_count;
 
 	rsx! {
@@ -570,9 +509,9 @@ pub fn EventPanel(
                     "{selected_name.as_deref().unwrap_or_default()}"
                 }
             }
-            if let Some(file_name) = selected_name.clone() {
+            if selected_name.is_some() {
                 div { class: "event-editor",
-                    label { "missionsEvents / {file_name}" }
+                    label { title: "{file_display}", "{file_display}" }
                     if event.read().is_some() {
                         EventGrid {
                             event,
@@ -639,10 +578,13 @@ pub fn EventPanel(
                             }
                         }
                     }
+                    if let Some(hint) = decision_hint {
+                        div { class: "event-lookup-hint", role: "status", "{hint}" }
+                    }
                 }
             } else if work_directory.is_some() {
                 div { class: "event-empty",
-                    "在资源管理器中双击 missionsEvents 下的 .txt 脚本进行编辑"
+                    "在资源管理器中双击 missionsEvents（或 events）下的 .txt 脚本进行编辑"
                 }
             } else {
                 div { class: "event-empty", "打开工作区后可编辑国策事件脚本" }
