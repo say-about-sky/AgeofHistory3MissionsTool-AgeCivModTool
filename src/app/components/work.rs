@@ -950,6 +950,7 @@ enum PendingApkOperation {
 }
 
 /// 检查工作区（或指定子目录）内 `missionsEvents` 中未被引用的脚本副本（返回相对路径列表）。
+/// 「被引用」= 国策树 / 脚本间 `run_event` / 决议 `events`（后端 `find_unused_event_scripts`）。
 async fn find_unused_event_scripts(
 	directory: &WorkDirectory,
 	scope: &str,
@@ -2127,7 +2128,7 @@ pub fn Work() -> Element {
 					return;
 				}
 			}
-			// 导出前检查：missionsEvents 内未被国策引用的脚本副本，交给用户处理后再继续。
+			// 导出前检查：missionsEvents 内未被国策 / 决议引用的脚本副本，交给用户处理后再继续。
 			let mut unused_scripts_prompt = unused_scripts_prompt;
 			let mut unused_scripts_checked = unused_scripts_checked;
 			let scan_note = if directory.folder_id.is_some() {
@@ -2262,7 +2263,7 @@ pub fn Work() -> Element {
 				return;
 			}
 			let source = source_directory.unwrap_or_default();
-			// 打包前检查：打包范围（源目录子树）内未被国策引用的脚本副本，交给用户处理后再继续。
+			// 打包前检查：打包范围（源目录子树）内未被国策 / 决议引用的脚本副本，交给用户处理后再继续。
 			let mut unused_scripts_prompt = unused_scripts_prompt;
 			let mut unused_scripts_checked = unused_scripts_checked;
 			// 检查期间显示加载进度（后端通过 apk-progress 事件上报扫描进度）。
@@ -3830,10 +3831,10 @@ pub fn Work() -> Element {
                 is_android: *android_platform.read(),
                 all_files_access_granted: *all_files_access_granted.read(),
                 tabs: open_tabs
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        .read()
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        .iter()
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        .map(|tab| (tab.id.clone(), tab.title.clone()))
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        .collect(),
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        .read()
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        .iter()
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        .map(|tab| (tab.id.clone(), tab.title.clone()))
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        .collect(),
                 active_tab_id: active_tab_id.read().clone(),
                 decision_tabs: decision_tab_entries,
                 on_select_tab,
@@ -4071,9 +4072,9 @@ pub fn Work() -> Element {
                             work_directory: current_directory.clone(),
                             // 会话隔离：每个标签页独立的事件编辑状态（打开文件 / 未保存草稿 / 补全根）。
                             session_key: active_tab_id
-                                                                                                                                                .read()
-                                                                                                                                                .clone()
-                                                                                                                                                .unwrap_or_else(|| "explorer".to_string()),
+                                                                                                                                                                            .read()
+                                                                                                                                                                            .clone()
+                                                                                                                                                                            .unwrap_or_else(|| "explorer".to_string()),
                             missions_root: events_root,
                             save_request,
                             open_request: open_event_request,
@@ -4278,7 +4279,7 @@ pub fn Work() -> Element {
                         div { class: "menu-dismiss", style: "z-index: 55;", aria_hidden: "true" }
                         div { class: "confirm-dialog", role: "alertdialog",
                             p { class: "confirm-message",
-                                "检测到 {unused_count} 个未被任何国策引用的脚本副本（missionsEvents，按创建/修改时间从新到旧排列）："
+                                "检测到 {unused_count} 个未被任何国策或决议引用的脚本副本（missionsEvents，按创建/修改时间从新到旧排列）："
                             }
                             UnusedScriptsList { scripts: unused_scripts, checked: unused_scripts_checked }
                             p { class: "confirm-message", style: "font-size: 12px; opacity: 0.75;",

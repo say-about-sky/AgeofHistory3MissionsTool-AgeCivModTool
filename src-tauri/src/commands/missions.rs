@@ -10,7 +10,9 @@ use rayon::prelude::*;
 use serde::Serialize;
 
 use super::apk::ProgressEmitter;
+use super::events::parse_event_id;
 
+use crate::decision_format::parse_decision_file_with_correction;
 use crate::mission_format::{parse_mission_file_with_correction, serialize_mission_file};
 use crate::models::MissionRecord;
 use crate::paths::{
@@ -111,12 +113,15 @@ pub fn save_missions_file(
     .map_err(|error| error.to_string())
 }
 
-/// 打包 / 导出前检查：列出 `missionsEvents` 目录内未被任何国策引用的脚本副本。
+/// 打包 / 导出前检查：列出 `missionsEvents` 目录内未被任何国策 / 决议引用的脚本副本。
 ///
 /// `scope` 为工作区相对目录（空串 = 整个工作区；打包时传打包源目录）。
 /// 「被引用」= 所在国策根的 `*.json` 国策树里出现 `MissionEvent`（缺省时回退
-/// 「标题.txt」），或同根事件脚本内被 `run_event` / `run_event_instantly` 引用
-/// （保守判断：宁可多算引用，避免误报导致误删）。
+/// 「标题.txt」），或同根事件脚本内被 `run_event` / `run_event_instantly` 引用，
+/// 或决议定义文件（`rainfall/rfEvent_decision.json`）的 `events` 项引用该脚本
+/// （按文件名主干或脚本内部 `id=` 行匹配；去尾部 `.txt`、大小写不敏感；
+/// 工作区内相关决议文件全部合并计入）。
+/// 保守判断：宁可多算引用，避免误报导致误删。
 /// 只读检查：宽松语法的文件不会在此被写回纠正。
 /// 没有任何可解析国策树的根不做判定（可能尚未导入完整，避免误导用户全删）。
 /// 返回顺序：按文件的「创建/修改时间」中较晚者倒序（最新的排最前；同一时间按路径升序；
@@ -145,6 +150,9 @@ type ScanProgress<'a> = &'a (dyn Fn(u64, u64) + Sync);
 
 /// `find_unused_event_scripts` 的同步实现（在 `spawn_blocking` 线程中运行）。
 /// `progress` 每扫描一个脚本回调一次（节流由调用方处理）。
+/// 检查期间同时收集决议文件（`rainfall/rfEvent_decision.json`）的 `events` 引用：
+/// scope 内遍历发现的 + 由各国策根向上逐级补查的（合并去重，见
+/// [`collect_decision_references`]）。
 fn find_unused_event_scripts_blocking(
     work_directory: String,
     scope: String,
@@ -159,8 +167,10 @@ fn find_unused_event_scripts_blocking(
     } else {
         workspace_abs_path(&work_directory, scope.trim())?
     };
-    // 先遍历出全部国策根（missions 与其 missionsEvents），随后并行处理。
+    // 先遍历出全部国策根（missions 与其 missionsEvents），随后并行处理；
+    // 同时收集 scope 内的决议定义文件（`rainfall/rfEvent_decision.json`）。
     let mut roots: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut decision_files: Vec<PathBuf> = Vec::new();
     // scope 本身就是 missions 根时直接检查（常规打包传入的是上级目录）。
     if scope_directory
         .file_name()
@@ -185,6 +195,13 @@ fn find_unused_event_scripts_blocking(
                     continue;
                 }
                 let name = entry.file_name().to_string_lossy().into_owned();
+                if name == "rainfall" {
+                    // 决议定义文件（模组资源根的 `rainfall/` 版块；不存在则跳过）。
+                    let decision_file = path.join("rfEvent_decision.json");
+                    if decision_file.is_file() {
+                        decision_files.push(decision_file);
+                    }
+                }
                 if name == "missions" {
                     // `missions` 下直接查找 missionsEvents（其内部不会再有国策根）。
                     let events = path.join("missionsEvents");
@@ -201,6 +218,28 @@ fn find_unused_event_scripts_blocking(
             }
         }
     }
+    // 决议文件也可能位于国策根的上层（如解包布局的 `<模组>/assets/rainfall/`，
+    // 或工作区根布局——scope 限定为子目录时遍历收集不到）：对每个根向上逐级
+    // 补查直到工作区根。全部去重后解析为引用集合（保守：相关决议全部合并计入）。
+    for (missions_root, _) in &roots {
+        let mut current = missions_root.parent();
+        while let Some(directory) = current {
+            if !directory.starts_with(&workspace_root) {
+                break;
+            }
+            let decision_file = directory.join("rainfall").join("rfEvent_decision.json");
+            if decision_file.is_file() {
+                decision_files.push(decision_file);
+            }
+            if directory == workspace_root {
+                break;
+            }
+            current = directory.parent();
+        }
+    }
+    decision_files.sort();
+    decision_files.dedup();
+    let decision_references = collect_decision_references(&decision_files);
     // 预列表各根脚本（并行）：得到进度条总数，列表随后直接用于扫描。
     let root_scans: Vec<(PathBuf, Vec<(String, PathBuf)>)> = roots
         .par_iter()
@@ -223,6 +262,7 @@ fn find_unused_event_scripts_blocking(
                 &workspace_root,
                 missions_root,
                 scripts,
+                &decision_references,
                 &completed,
                 total,
                 progress,
@@ -256,10 +296,13 @@ fn list_scripts(events_directory: &Path) -> Vec<(String, PathBuf)> {
 
 /// 单个国策根：收集被引用的脚本名并判定 `missionsEvents` 内未使用的 `.txt`（并行读取）。
 /// `scripts` 为预列表结果；每扫描一个脚本递增 `completed` 并回调 `progress`。
+/// `decision_references` 为决议 `events` 引用的归一化键（工作区级合并，见
+/// [`collect_decision_references`]）：命中脚本文件名主干或内部 `id` 时视为已使用。
 fn collect_unused_scripts(
     workspace_root: &Path,
     missions_root: &Path,
     scripts: &[(String, PathBuf)],
+    decision_references: &HashSet<String>,
     completed: &AtomicUsize,
     total: usize,
     progress: ScanProgress<'_>,
@@ -310,6 +353,7 @@ fn collect_unused_scripts(
     scanned
         .into_iter()
         .filter(|script| !referenced.contains(&script.name))
+        .filter(|script| !referenced_by_decision(script, decision_references))
         .filter_map(|script| {
             script
                 .relative
@@ -322,6 +366,9 @@ fn collect_unused_scripts(
 struct ScannedScript {
     /// 文件名（小写，用于与引用集合比对）。
     name: String,
+    /// 脚本内部 `id=` 行值（小写；无 id / 读取失败为 None——决议 `events`
+    /// 索引的是脚本内部 id）。
+    id: Option<String>,
     /// 「创建/修改时间」中较晚者（读取失败按最早处理）。
     latest_time: SystemTime,
     /// 工作区相对路径（`/` 分隔）；无法推导时为 None。
@@ -330,10 +377,18 @@ struct ScannedScript {
     references: Vec<String>,
 }
 
-/// 读取单个脚本：收集 run_event 引用 + 时间戳 + 相对路径（在并行 map 中调用）。
+/// 读取单个脚本：收集 run_event 引用 / 内部 id + 时间戳 + 相对路径（在并行 map 中调用）。
 fn scan_script(workspace_root: &Path, name: &str, path: &Path) -> ScannedScript {
-    let references = fs::read_to_string(path)
-        .map(|content| collect_run_event_references(&content))
+    let content = fs::read_to_string(path).ok();
+    // 决议 `events` 索引的是脚本内部 id（见 `commands::events` 模块头注释）。
+    let id = content
+        .as_deref()
+        .and_then(parse_event_id)
+        .map(|value| value.trim().to_lowercase())
+        .filter(|value| !value.is_empty());
+    let references = content
+        .as_deref()
+        .map(collect_run_event_references)
         .unwrap_or_default();
     // 「创建/修改时间」取两者中较晚者；读取失败按最早处理（排序时放最后）。
     // 创建时间在部分平台（Linux/Android）不支持，自动回退修改时间。
@@ -348,6 +403,7 @@ fn scan_script(workspace_root: &Path, name: &str, path: &Path) -> ScannedScript 
         .unwrap_or(SystemTime::UNIX_EPOCH);
     ScannedScript {
         name: name.to_ascii_lowercase(),
+        id,
         latest_time: modified.max(created),
         relative: path
             .strip_prefix(workspace_root)
@@ -372,6 +428,56 @@ fn parse_tree_references(path: &Path) -> Option<Vec<String>> {
         }
     }
     Some(references)
+}
+
+/// 解析决议文件集合，合并其声明的脚本引用（归一化键，见
+/// [`normalize_decision_reference`]）。文件读取或解析失败时忽略该文件
+/// （与国策树 / 脚本扫描的容错一致，单个坏文件不中断检查）。
+fn collect_decision_references(decision_files: &[PathBuf]) -> HashSet<String> {
+    let mut references = HashSet::new();
+    for path in decision_files {
+        let Ok(content) = fs::read_to_string(path) else {
+            continue;
+        };
+        let Ok((file, _)) = parse_decision_file_with_correction(&content) else {
+            continue;
+        };
+        for group in &file.decisions {
+            for event in &group.events {
+                let key = normalize_decision_reference(event);
+                if !key.is_empty() {
+                    references.insert(key);
+                }
+            }
+        }
+    }
+    references
+}
+
+/// 决议 `events` 项归一化：去首尾空白 → 去尾部 `.txt`（大小写不敏感）→ 小写。
+/// 与脚本侧（文件名主干 / 内部 id 的小写形式）比对；宽松口径（宁多算引用）。
+fn normalize_decision_reference(value: &str) -> String {
+    let trimmed = value.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let core = if lower.ends_with(".txt") {
+        &trimmed[..trimmed.len() - 4]
+    } else {
+        trimmed
+    };
+    core.trim().to_lowercase()
+}
+
+/// 脚本副本是否被决议引用：文件名主干或内部 `id` 命中决议引用集合。
+fn referenced_by_decision(script: &ScannedScript, decision_references: &HashSet<String>) -> bool {
+    if decision_references.is_empty() {
+        return false;
+    }
+    let stem = script.name.strip_suffix(".txt").unwrap_or(&script.name);
+    decision_references.contains(stem)
+        || script
+            .id
+            .as_deref()
+            .is_some_and(|id| decision_references.contains(id))
 }
 
 /// 未使用脚本排序：按「创建/修改时间」中较晚者倒序（最新的排最前）；时间相同按路径升序保证稳定。
@@ -499,6 +605,48 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// 决议引用（`rainfall/rfEvent_decision.json` 的 `events`）：脚本文件名主干 /
+    /// 内部 id / 尾部 `.txt` / 大小写不敏感都算「已使用」；决议文件位于工作区根
+    /// （打包 scope 外）时由国策根向上逐级补查找到；宽松语法决议文件可解析。
+    #[test]
+    fn decision_references_mark_scripts_as_used() {
+        let dir = temp_dir("decision");
+        let events = dir.join("modX/assets/game/missions/missionsEvents");
+        fs::create_dir_all(&events).unwrap();
+        fs::create_dir_all(dir.join("modX/assets/rainfall")).unwrap();
+        fs::create_dir_all(dir.join("rainfall")).unwrap();
+        fs::write(
+            dir.join("modX/assets/game/missions/Missions.json"),
+            r#"{"Mission":[{"ID":0,"Name":"甲","MissionEvent":"base_used.txt"}]}"#,
+        )
+        .unwrap();
+        // 模组级决议（宽松语法：对象间缺逗号 + 尾随逗号）：按带后缀 / 主干匹配。
+        fs::write(
+            dir.join("modX/assets/rainfall/rfEvent_decision.json"),
+            "{\n\t\"decisions\":[\n\t{\n\t\t\"id\":\"A\",\n\t\t\"name\":\"甲\",\n\t\t\"events\":[\"  MODNAME.txt \"],\n\t}\n\t{\n\t\t\"id\":\"B\",\n\t\t\"name\":\"乙\",\n\t\t\"events\":[\"脚本三\"],\n\t}\n\t]\n}",
+        )
+        .unwrap();
+        // 工作区根级决议（打包 scope = modX 时不在遍历范围内 → 由根上溯补查）。
+        fs::write(
+            dir.join("rainfall/rfEvent_decision.json"),
+            r#"{"decisions":[{"id":"R","name":"根","events":["root_ref","根id引用"]}]}"#,
+        )
+        .unwrap();
+        fs::write(events.join("base_used.txt"), "id=base\n").unwrap();
+        fs::write(events.join("root_ref.txt"), "id=r1\n").unwrap();
+        fs::write(events.join("根id脚本.txt"), "id=根id引用\n").unwrap();
+        fs::write(events.join("ModName.txt"), "id=m1\n").unwrap();
+        fs::write(events.join("脚本三.txt"), "id=m3\n").unwrap();
+        fs::write(events.join("未使用.txt"), "id=o\n").unwrap();
+
+        let work = dir.to_string_lossy().into_owned();
+        assert_eq!(
+            find_unused_event_scripts_blocking(work, "modX".to_string(), &|_, _| {}).unwrap(),
+            vec!["modX/assets/game/missions/missionsEvents/未使用.txt"]
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// 实测扫描速度（忽略）：对本机真实工作区运行；
     /// `cargo test -p age_civ_mod_tool --lib benchmark_unused_scripts_scan -- --ignored --nocapture`
     #[test]
@@ -525,5 +673,34 @@ mod tests {
                 .unwrap();
             eprintln!("BENCH {scope}: unused {} in {:?}", unused.len(), start.elapsed());
         }
+    }
+
+    /// 真实工作区回归（忽略）：决议引用的脚本副本不得出现在未使用列表——
+    /// 暮色黄昏 TheGreatWar 剧本的 3 个决议事件脚本（对照数据实测：不被国策树
+    /// 引用、不被 run_event 引用，仅被 `rainfall/rfEvent_decision.json` 的
+    /// `events` 按文件名引用），去掉决议检查后必被误报。
+    /// `cargo test -p age_civ_mod_tool --lib verify_decision_references_against_real_workspace -- --ignored --nocapture`
+    #[test]
+    #[ignore = "需要真实工作区 A:\\android\\GameCivs"]
+    fn verify_decision_references_against_real_workspace() {
+        let work_directory = r"A:\android\GameCivs".to_string();
+        let unused = find_unused_event_scripts_blocking(
+            work_directory,
+            "暮色黄昏_世界大战0.25.1".to_string(),
+            &|_, _| {},
+        )
+        .unwrap();
+        let decision_used = [
+            "暮色黄昏_世界大战0.25.1/assets/map/Earth3/scenarios/TheGreatWar/missions/missionsEvents/罗马尼亚解放保加利亚.txt",
+            "暮色黄昏_世界大战0.25.1/assets/map/Earth3/scenarios/TheGreatWar/missions/missionsEvents/罗马尼亚解放希腊.txt",
+            "暮色黄昏_世界大战0.25.1/assets/map/Earth3/scenarios/TheGreatWar/missions/missionsEvents/罗马尼亚解放阿尔巴尼亚.txt",
+        ];
+        for path in decision_used {
+            assert!(
+                !unused.iter().any(|item| item == path),
+                "决议引用的脚本副本被误报为未使用：{path}"
+            );
+        }
+        eprintln!("REAL: unused {}（决议引用的 3 个脚本副本均未被误报）", unused.len());
     }
 }
