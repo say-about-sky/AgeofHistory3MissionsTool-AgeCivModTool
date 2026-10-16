@@ -11,3 +11,6 @@
 *.apk
 *.corrupt-backup
 .npmrc
+
+# 本地插件开发说明(含本机路径与本地部署细节,不上传)
+/docs/Finality插件开发说明.md
