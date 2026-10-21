@@ -22,9 +22,8 @@ use super::{
 	platform_fs::{
 		create_scoped_workspace_skeleton, delete_event_text, import_source_apk_event_text,
 		invoke_scoped, join_scoped_path, load_decision_groups, load_single_icon, load_tree_icons,
-		load_tree_records, load_workspace_files, rename_event_text, save_decision_groups,
-		save_event_text, save_tree_file, scan_scoped_workspace_files, LoadProgress,
-		WorkDirectoryArgs,
+		load_tree_records, load_workspace_files, save_decision_groups, save_event_text,
+		save_tree_file, scan_scoped_workspace_files, LoadProgress, WorkDirectoryArgs,
 	},
 	undo::{
 		canvas_scope_is_open, decision_scope_is_open, focus_wants_native_undo, now_ms,
@@ -1293,11 +1292,14 @@ fn TreeCanvas(
 	on_edit_event: EventHandler<(String, String)>,
 	on_create_event_file: EventHandler<(String, String, String)>,
 	on_delete_event_file: EventHandler<(String, String)>,
-	on_rename_event_file: EventHandler<(String, String, String)>,
-	on_nodes_change: EventHandler<(Vec<String>, Vec<String>)>,
+	on_nodes_change: EventHandler<(Vec<String>, Vec<String>, Vec<String>)>,
 	on_dirty_change: EventHandler<(String, bool)>,
 	// 工作区现有事件脚本相对路径（画布判断「空国策」用）。
 	event_files: Shared<Vec<String>>,
+	// 工作区现有国策图标相对路径（卡片菜单「链接图片」写入 ImageName 用）。
+	image_files: Shared<Vec<String>>,
+	// 当前工作区：「链接图片」按需读取图标数据（桌面 / SAF 分派）。
+	work_directory: Option<WorkDirectory>,
 ) -> Element {
 	let save_tab_id = tab.id.clone();
 	let dirty_tab_id = tab.id.clone();
@@ -1307,7 +1309,6 @@ fn TreeCanvas(
 	let event_root_edit = tab_missions_root.clone();
 	let event_root_create = tab_missions_root.clone();
 	let event_root_delete = tab_missions_root.clone();
-	let event_root_rename = tab_missions_root.clone();
 	let is_active = active_tab_id.read().as_deref() == Some(tab.id.as_str());
 	rsx! {
         div {
@@ -1318,6 +1319,8 @@ fn TreeCanvas(
                 missions: tab.missions.clone(),
                 missions_root: tab_missions_root.clone(),
                 event_files: event_files.clone(),
+                image_files: image_files.clone(),
+                work_directory: work_directory.clone(),
                 clipboard: mind_clipboard,
                 on_copy_event_script,
                 active_tab_id,
@@ -1333,9 +1336,6 @@ fn TreeCanvas(
                 },
                 on_delete_event_file: move |file_name: String| {
                     on_delete_event_file.call((event_root_delete.clone(), file_name))
-                },
-                on_rename_event_file: move |(old_name, new_name): (String, String)| {
-                    on_rename_event_file.call((event_root_rename.clone(), old_name, new_name))
                 },
                 focus_request,
                 on_undo_push,
@@ -1424,6 +1424,8 @@ pub fn Work() -> Element {
 	let mind_clipboard = use_signal(|| None::<MindClipboard>);
 	let mut mind_node_names = use_signal(Vec::<String>::new);
 	let mut mind_node_images = use_signal(Vec::<String>::new);
+	// 当前画布卡片的事件脚本名（与标题平行；删除脚本前判断占用用）。
+	let mut mind_node_events = use_signal(Vec::<String>::new);
 	let mut delete_prompt = use_signal(|| None::<(String, String)>);
 	let mind_focus_request = use_signal(|| None::<(FocusTarget, u64)>);
 	let focus_seq = use_signal(|| 0_u64);
@@ -1777,6 +1779,7 @@ pub fn Work() -> Element {
 		let mut event_release_request = event_release_request;
 		let mut mind_node_names = mind_node_names;
 		let mut mind_node_images = mind_node_images;
+		let mut mind_node_events = mind_node_events;
 		let mut events_root = events_root;
 		let mut undo_depths = undo_depths;
 		let undo_stacks = undo_stacks.clone();
@@ -1800,6 +1803,7 @@ pub fn Work() -> Element {
 							});
 							mind_node_names.set(Vec::new());
 							mind_node_images.set(Vec::new());
+							mind_node_events.set(Vec::new());
 							events_root.set(None);
 							// 切换工作区后旧撤销步骤不再可用。
 							undo_stacks.borrow_mut().clear();
@@ -1830,6 +1834,7 @@ pub fn Work() -> Element {
 		let mut event_release_request = event_release_request;
 		let mut mind_node_names = mind_node_names;
 		let mut mind_node_images = mind_node_images;
+		let mut mind_node_events = mind_node_events;
 		let mut events_root = events_root;
 		let mut loading = loading;
 		let mut load_progress = load_progress;
@@ -1915,6 +1920,7 @@ pub fn Work() -> Element {
 							});
 							mind_node_names.set(Vec::new());
 							mind_node_images.set(Vec::new());
+							mind_node_events.set(Vec::new());
 							events_root.set(None);
 							// 切换工作区后旧撤销步骤不再可用。
 							undo_stacks.borrow_mut().clear();
@@ -2581,6 +2587,7 @@ pub fn Work() -> Element {
 		if open_tabs.read().is_empty() {
 			mind_node_names.set(Vec::new());
 			mind_node_images.set(Vec::new());
+			mind_node_events.set(Vec::new());
 		}
 		// 丢弃该标签页的画布撤销步骤（画布已卸载，其信号不再有界面）。
 		{
@@ -2790,6 +2797,7 @@ pub fn Work() -> Element {
 		if open_tabs.read().is_empty() {
 			mind_node_names.set(Vec::new());
 			mind_node_images.set(Vec::new());
+			mind_node_events.set(Vec::new());
 		}
 		release_event_if_unused.call(());
 	});
@@ -3028,39 +3036,6 @@ pub fn Work() -> Element {
 		});
 	};
 
-	let on_rename_event_file =
-		move |(missions_root, old_name, new_name): (String, String, String)| {
-			if old_name == new_name {
-				return;
-			}
-			let Some(directory) = work_directory.read().clone() else {
-				return;
-			};
-			let events_dir = format!("{missions_root}/missionsEvents");
-			spawn(async move {
-				let mut load_error = load_error;
-				let mut workspace_files = workspace_files;
-				let mut rename_event_request = rename_event_request;
-				match rename_event_text(&directory, &events_dir, &old_name, &new_name).await {
-					Ok(()) => {
-						workspace_files.with_mut(|files| {
-							let old_relative_path =
-								format!("{missions_root}/missionsEvents/{old_name}");
-							for file in files.iter_mut() {
-								if file.relative_path == old_relative_path {
-									file.name = new_name.clone();
-									file.relative_path =
-										format!("{missions_root}/missionsEvents/{new_name}");
-								}
-							}
-						});
-						rename_event_request.set(Some((old_name, new_name)));
-					}
-					Err(error) => load_error.set(format!("重命名事件脚本失败：{error}")),
-				}
-			});
-		};
-
 	// 画布粘贴事件脚本（「粘贴国策+事件」/「粘贴事件」共用）：复制到目标树资源根下的新脚本
 	//（文件名已由画布按计数后缀生成，如 事件脚本.txt → 事件脚本0.txt → 事件脚本1.txt）。
 	let on_copy_event_script = EventHandler::new(
@@ -3254,15 +3229,19 @@ pub fn Work() -> Element {
 		selected_file.set(path);
 	});
 
-	// 思维导图节点变化 → 记录当前使用的标题与图标（删除前占用检查用）。
-	let on_nodes_change = move |(names, images): (Vec<String>, Vec<String>)| {
+	// 思维导图节点变化 → 记录当前使用的标题 / 图标 / 事件脚本（删除前占用检查用）。
+	let on_nodes_change = move |(names, images, events): (Vec<String>, Vec<String>, Vec<String>)| {
 		let mut mind_node_names = mind_node_names;
 		let mut mind_node_images = mind_node_images;
+		let mut mind_node_events = mind_node_events;
 		if *mind_node_names.read() != names {
 			mind_node_names.set(names);
 		}
 		if *mind_node_images.read() != images {
 			mind_node_images.set(images);
+		}
+		if *mind_node_events.read() != events {
+			mind_node_events.set(events);
 		}
 	};
 
@@ -3289,10 +3268,13 @@ pub fn Work() -> Element {
 			let events_dir = format!("{missions_root}/missionsEvents");
 			on_open_script.call((events_dir, file_name.clone()));
 
-			// 双击事件文件时聚焦思维导图上的对应卡片。
-			let title = file_name.strip_suffix(".txt").unwrap_or(&file_name).to_string();
+			// 双击事件文件时聚焦思维导图上的对应卡片：按卡片的 MissionEvent 字段匹配
+			//（文件名与国策标题互不绑定，不再把脚本名当标题用）。
 			let mut mind_focus_request = mind_focus_request;
-			mind_focus_request.set(Some((FocusTarget::Title(title), *focus_seq.peek())));
+			mind_focus_request.set(Some((
+				FocusTarget::Event(file_name.clone()),
+				*focus_seq.peek(),
+			)));
 			return;
 		}
 		// 决议 / 全局事件脚本：任意 `…/events/…` 目录下的 .txt（如 events/common），
@@ -3516,7 +3498,6 @@ pub fn Work() -> Element {
 			}
 			ExplorerCommand::Delete => {
 				let name = argument.rsplit('/').next().unwrap_or(&argument).to_string();
-				let stem = name.strip_suffix(".txt").unwrap_or(&name).to_string();
 				let is_events = missions_subfile(&argument, "missionsEvents").is_some();
 				let is_image = missions_subfile(&argument, "missionsImages").is_some();
 
@@ -3531,10 +3512,19 @@ pub fn Work() -> Element {
 						"Missions.json 是国策树画布配置文件，删除后画布将无法加载。".to_string();
 				} else if is_open_tree {
 					warning = "该文件已作为国策树在标签页中打开，删除后对应标签页将关闭。".to_string();
-				} else if is_events && mind_node_names.read().contains(&stem) {
-					warning = format!(
-						"该脚本正被国策「{stem}」使用，删除后对应国策将没有事件脚本。"
-					);
+				} else if is_events && mind_node_events.read().iter().any(|event| event == &name) {
+					// 脚本名只与卡片的 MissionEvent 字段比对（标题不参与）。
+					let owner = mind_node_events
+						.read()
+						.iter()
+						.position(|event| event == &name)
+						.and_then(|index| mind_node_names.read().get(index).cloned());
+					warning = match owner {
+						Some(title) => format!(
+							"该脚本正被国策「{title}」的事件字段引用，删除后对应国策将没有事件脚本。"
+						),
+						None => "该事件脚本正被国策使用，删除后对应国策将没有事件脚本。".to_string(),
+					};
 				} else if is_image && mind_node_images.read().contains(&name) {
 					warning = format!("该图标正被国策使用，删除后对应国策将无法显示图标。");
 				}
@@ -3697,6 +3687,18 @@ pub fn Work() -> Element {
 				.collect::<Vec<String>>(),
 		)
 	});
+	// 工作区现有国策图标（相对路径）：传给画布供卡片菜单「链接图片」选择，
+	// 选中后只写卡片的 ImageName 字段。
+	let image_files = use_memo(move || {
+		Shared::new(
+			workspace_files
+				.read()
+				.iter()
+				.filter(|file| missions_subfile(&file.relative_path, "missionsImages").is_some())
+				.map(|file| file.relative_path.clone())
+				.collect::<Vec<String>>(),
+		)
+	});
 	// 决议编辑器候选来源：工作区全部文件的相对路径（图片 / 事件脚本候选在组件内过滤）。
 	let decision_files = use_memo(move || {
 		Shared::new(
@@ -3708,6 +3710,7 @@ pub fn Work() -> Element {
 		)
 	});
 	let event_files_snapshot = (*event_files.read()).clone();
+	let image_files_snapshot = (*image_files.read()).clone();
 	let decision_files_snapshot = (*decision_files.read()).clone();
 	let decision_canvas_tabs: Vec<(String, DecisionTab)> = decision_tabs
 		.read()
@@ -3831,10 +3834,10 @@ pub fn Work() -> Element {
                 is_android: *android_platform.read(),
                 all_files_access_granted: *all_files_access_granted.read(),
                 tabs: open_tabs
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        .read()
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        .iter()
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        .map(|tab| (tab.id.clone(), tab.title.clone()))
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        .collect(),
+                    .read()
+                    .iter()
+                    .map(|tab| (tab.id.clone(), tab.title.clone()))
+                    .collect(),
                 active_tab_id: active_tab_id.read().clone(),
                 decision_tabs: decision_tab_entries,
                 on_select_tab,
@@ -3941,6 +3944,8 @@ pub fn Work() -> Element {
                                     key: "{tab_id}",
                                     tab,
                                     event_files: event_files_snapshot.clone(),
+                                    image_files: image_files_snapshot.clone(),
+                                    work_directory: current_directory.clone(),
                                     active_tab_id,
                                     save_request,
                                     save_status: save_status.read().clone(),
@@ -3953,7 +3958,6 @@ pub fn Work() -> Element {
                                     on_edit_event,
                                     on_create_event_file,
                                     on_delete_event_file,
-                                    on_rename_event_file,
                                     on_nodes_change,
                                     on_dirty_change,
                                 }
@@ -4072,9 +4076,9 @@ pub fn Work() -> Element {
                             work_directory: current_directory.clone(),
                             // 会话隔离：每个标签页独立的事件编辑状态（打开文件 / 未保存草稿 / 补全根）。
                             session_key: active_tab_id
-                                                                                                                                                                            .read()
-                                                                                                                                                                            .clone()
-                                                                                                                                                                            .unwrap_or_else(|| "explorer".to_string()),
+                                .read()
+                                .clone()
+                                .unwrap_or_else(|| "explorer".to_string()),
                             missions_root: events_root,
                             save_request,
                             open_request: open_event_request,

@@ -413,6 +413,33 @@ body {
   white-space: nowrap;
 }
 
+/* 「链接图片」候选列表：本资源根 missionsImages/H 下的图标（写入卡片 ImageName）。 */
+.context-image-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 200px;
+  padding: 3px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  border-radius: 4px;
+  background: var(--surface-blue);
+}
+
+.context-image-list button {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 6px;
+  overflow: hidden;
+  text-align: left;
+}
+
+.context-image-list button span {
+  flex: 1;
+  min-width: 0;
+}
+
 .header-status {
   margin-left: 10px;
   color: #fff0f5;

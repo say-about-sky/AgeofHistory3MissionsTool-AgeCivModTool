@@ -104,24 +104,6 @@ struct ScopedRemoveFile {
 	path: String,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ScopedMove {
-	from_folder_id: String,
-	from_path: String,
-	to_folder_id: String,
-	to_path: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct EventRenameArgs {
-	work_directory: String,
-	events_dir: String,
-	old_file_name: String,
-	new_file_name: String,
-}
-
 /// 事件文件路径（`events_dir` 为完整的工作区相对事件目录，如
 /// `assets/game/missions/missionsEvents` 或 `assets/game/events/common`）。
 fn event_file_path(root_path: &str, events_dir: &str, file_name: &str) -> String {
@@ -306,42 +288,6 @@ pub(crate) async fn delete_event_text(
 		JsFuture::from(invoke("delete_mission_event", args))
 			.await
 			.map_err(|error| format!("删除事件文件失败：{error:?}"))?;
-		Ok(())
-	}
-}
-
-/// 重命名事件脚本：桌面 `rename_mission_event` / SAF `move_scoped_item`。
-pub(crate) async fn rename_event_text(
-	directory: &WorkDirectory,
-	events_dir: &str,
-	old_file_name: &str,
-	new_file_name: &str,
-) -> Result<(), String> {
-	if let Some(folder_id) = &directory.folder_id {
-		let from_path = event_file_path(&directory.root_path, events_dir, old_file_name);
-		let to_path = event_file_path(&directory.root_path, events_dir, new_file_name);
-		let args = serde_wasm_bindgen::to_value(&ScopedMove {
-			from_folder_id: folder_id.clone(),
-			from_path,
-			to_folder_id: folder_id.clone(),
-			to_path,
-		})
-		.map_err(|error| error.to_string())?;
-		JsFuture::from(invoke("move_scoped_item", args))
-			.await
-			.map_err(|error| format!("重命名事件文件失败：{error:?}"))?;
-		Ok(())
-	} else {
-		let args = serde_wasm_bindgen::to_value(&EventRenameArgs {
-			work_directory: directory.root_path.clone(),
-			events_dir: events_dir.to_string(),
-			old_file_name: old_file_name.to_string(),
-			new_file_name: new_file_name.to_string(),
-		})
-		.map_err(|error| error.to_string())?;
-		JsFuture::from(invoke("rename_mission_event", args))
-			.await
-			.map_err(|error| format!("重命名事件文件失败：{error:?}"))?;
 		Ok(())
 	}
 }

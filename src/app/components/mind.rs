@@ -5,7 +5,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
 use super::event_parser::default_event;
+use super::platform_fs::load_single_icon;
 use super::undo::{UndoRegistration, UndoScope};
+use super::WorkDirectory;
 
 const GRID_COLUMN_STEP: f64 = 340.0;
 const GRID_ROW_STEP: f64 = 220.0;
@@ -194,14 +196,34 @@ impl PartialEq for SharedIconData {
     }
 }
 
-/// 解析卡片实际使用的事件脚本文件名：优先使用 MissionEvent 字段，缺失时回退为「标题.txt」。
-fn mission_event_file(mission_event: &str, name: &str) -> String {
+/// 卡片关联的事件脚本文件名：**只**取 `MissionEvent` 字段（缺失 / 空白 = 没有事件）。
+///
+/// 标题（`Name` 字段）与事件脚本名互不绑定：修改标题不会改写 `MissionEvent`，
+/// 也不会重命名磁盘上的脚本；链接 / 新建事件才会显式写入该字段。
+fn mission_event_name(mission_event: &str) -> Option<String> {
     let trimmed = mission_event.trim();
-    if trimmed.is_empty() {
-        format!("{}.txt", name)
-    } else {
-        trimmed.to_string()
-    }
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// 卡片当前关联的事件脚本（无 `MissionEvent` 时为 `None`）。
+fn node_event_file(node: &MindNode) -> Option<String> {
+    mission_event_name(&node.mission_event)
+}
+
+/// 「链接图片」候选：`<资源根>/missionsImages/H/*.png` 下的图标文件名（排序去重）。
+/// 只接收 H 子目录下的图片——与游戏 / 图标加载器（`load_mission_icons`）的查找位置一致。
+fn image_candidate_names(image_files: &[String], missions_root: &str) -> Vec<String> {
+    let prefix = format!("{missions_root}/missionsImages/H/");
+    let mut names: Vec<String> = image_files
+        .iter()
+        .filter_map(|path| path.strip_prefix(&prefix).map(str::to_string))
+        .filter(|name| {
+            !name.is_empty() && !name.contains('/') && name.to_ascii_lowercase().ends_with(".png")
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    names
 }
 
 /// 画布卡片剪贴板：跨标签页可用。图标数据随剪贴板携带，
@@ -355,7 +377,8 @@ impl MindMapState {
                 id,
                 text: mission.name.clone(),
                 image_name: mission.image_name.clone(),
-                mission_event: mission_event_file(&mission.mission_event, &mission.name),
+                // 事件脚本只认 MissionEvent 字段：`Name` 不参与派生。
+                mission_event: mission.mission_event.trim().to_string(),
                 // 找不到图片（图标文件缺失 / ImageName 为空）标记为「无图标」：
                 // 按游戏原版逻辑，没有图片的国策显示为纯黑卡片。
                 icon_index: icon_index_by_name
@@ -426,11 +449,14 @@ fn apply_nodes_snapshot(state: &mut Signal<MindMapState>, nodes: Vec<MindNode>) 
     });
 }
 
-/// 思维导图聚焦目标：按卡片标题或按图标文件名定位。
+/// 思维导图聚焦目标：按图标文件名或事件脚本名定位。
+///
+/// `Event` 用于资源管理器双击事件脚本：只按卡片自己的 `MissionEvent` 字段匹配，
+/// 不再把脚本文件名当作标题（标题与事件脚本名互不绑定）。
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum FocusTarget {
-    Title(String),
     Image(String),
+    Event(String),
 }
 
 #[component]
@@ -441,6 +467,11 @@ pub fn MindMapCanvas(
     missions_root: String,
     // 工作区现有事件脚本的相对路径（判断「空国策」并提供 新建事件 / 链接事件）。
     event_files: Shared<Vec<String>>,
+    // 工作区现有国策图标（`missionsImages/H/*.png`）的相对路径，
+    // 供卡片菜单「链接图片」选择并写入 `ImageName`。
+    image_files: Shared<Vec<String>>,
+    // 当前工作区（「链接图片」按需读取图标数据；桌面 / SAF 分派见 platform_fs）。
+    work_directory: Option<WorkDirectory>,
     // 画布卡片剪贴板（跨标签页复制/粘贴）。
     clipboard: Signal<Option<MindClipboard>>,
     // 「粘贴国策+事件」/「粘贴事件」：把源事件脚本复制到目标资源根下的新脚本
@@ -454,9 +485,9 @@ pub fn MindMapCanvas(
     on_edit_event: EventHandler<String>,
     on_create_event_file: EventHandler<(String, String)>,
     on_delete_event_file: EventHandler<String>,
-    on_rename_event_file: EventHandler<(String, String)>,
     focus_request: Signal<Option<(FocusTarget, u64)>>,
-    on_nodes_change: EventHandler<(Vec<String>, Vec<String>)>,
+    // 节点变化上报：(标题列表, 图标名列表, 事件脚本名列表)，均为与节点一一对应的平行列表。
+    on_nodes_change: EventHandler<(Vec<String>, Vec<String>, Vec<String>)>,
     on_dirty_change: EventHandler<bool>,
     // 资源管理器双击 .png 手动载入的图标：(目标标签页 id, 图标)。
     pending_icon: Signal<Option<(String, FocusIcon)>>,
@@ -490,6 +521,8 @@ pub fn MindMapCanvas(
     let mut icon_picker_open = use_signal(|| false);
     // 「链接事件」选择器：为没有事件的空国策列出本资源根下现有的事件脚本。
     let mut linking_event_open = use_signal(|| false);
+    // 「链接图片」选择器：把本资源根下的图标文件名写入卡片 `ImageName`（与标题、事件无关）。
+    let mut linking_image_open = use_signal(|| false);
     // 「粘贴」子菜单：空白位置 = 粘贴国策 / 粘贴国策+事件；国策上 = 粘贴国策 / 粘贴事件（只应用到该卡）。
     let mut paste_open = use_signal(|| false);
     let mut editing_node = use_signal(|| None::<usize>);
@@ -542,9 +575,9 @@ pub fn MindMapCanvas(
         on_undo_push.call((UndoScope::Tab(tab_id.read().clone()), undo, redo));
     });
 
-    // 节点变化时上报（标题列表、图标列表），供资源管理器删除前检查占用。
+    // 节点变化时上报（标题 / 图标 / 事件脚本），供资源管理器删除前检查占用。
     // 仅激活中的标签页上报，避免多个挂载中的画布互相覆盖。
-    let last_reported_nodes = use_signal(|| None::<(Vec<String>, Vec<String>)>);
+    let last_reported_nodes = use_signal(|| None::<(Vec<String>, Vec<String>, Vec<String>)>);
     use_effect(move || {
         let mut last_reported_nodes = last_reported_nodes;
         let is_active =
@@ -560,14 +593,19 @@ pub fn MindMapCanvas(
         let reported_matches = last_reported_nodes
             .read()
             .as_ref()
-            .is_some_and(|(names, images)| {
+            .is_some_and(|(names, images, events)| {
                 names.len() == current.nodes.len()
                     && images.len() == current.nodes.len()
+                    && events.len() == current.nodes.len()
                     && names.iter().zip(&current.nodes).all(|(name, node)| *name == node.text)
                     && images
                         .iter()
                         .zip(&current.nodes)
                         .all(|(image, node)| *image == node.image_name)
+                    && events
+                        .iter()
+                        .zip(&current.nodes)
+                        .all(|(event, node)| *event == node.mission_event.trim())
             });
         if reported_matches {
             return;
@@ -578,7 +616,12 @@ pub fn MindMapCanvas(
             .iter()
             .map(|node| node.image_name.clone())
             .collect();
-        let snapshot = (names, images);
+        let events: Vec<String> = current
+            .nodes
+            .iter()
+            .map(|node| node.mission_event.trim().to_string())
+            .collect();
+        let snapshot = (names, images, events);
         last_reported_nodes.set(Some(snapshot.clone()));
         on_nodes_change.call(snapshot);
     });
@@ -662,7 +705,8 @@ pub fn MindMapCanvas(
                     id: index as i64,
                     name: node.text.clone(),
                     image_name: node.image_name.clone(),
-                    mission_event: mission_event_file(&node.mission_event, &node.text),
+                    // 原样写回 MissionEvent（不再按标题补「<标题>.txt」）。
+                    mission_event: node.mission_event.trim().to_string(),
                     tree_column: node.tree_column,
                     tree_row: node.tree_row,
                     required_mission,
@@ -710,15 +754,16 @@ pub fn MindMapCanvas(
         let (target, _) = request;
         let mut current = state.write();
         let focus_target = match &target {
-            FocusTarget::Title(title) => current
-                .nodes
-                .iter()
-                .find(|node| node.text == *title)
-                .map(|node| (node.tree_column, node.tree_row, node.id)),
             FocusTarget::Image(image) => current
                 .nodes
                 .iter()
                 .find(|node| node.image_name == *image)
+                .map(|node| (node.tree_column, node.tree_row, node.id)),
+            // 事件脚本按 MissionEvent 字段定位（不再假设「文件名主干 = 标题」）。
+            FocusTarget::Event(event) => current
+                .nodes
+                .iter()
+                .find(|node| node.mission_event.trim() == event)
                 .map(|node| (node.tree_column, node.tree_row, node.id)),
         };
         if let Some((column, row, node_id)) = focus_target {
@@ -905,6 +950,7 @@ pub fn MindMapCanvas(
         selected_icon.set(0);
         icon_picker_open.set(false);
         linking_event_open.set(false);
+        linking_image_open.set(false);
         paste_open.set(false);
         editing_node.set(None);
         confirming_delete.set(None);
@@ -923,6 +969,7 @@ pub fn MindMapCanvas(
         new_node_text.set("新国策".to_string());
         icon_picker_open.set(false);
         linking_event_open.set(false);
+        linking_image_open.set(false);
         paste_open.set(false);
         editing_node.set(None);
         confirming_delete.set(None);
@@ -944,6 +991,8 @@ pub fn MindMapCanvas(
         let Some(clip) = clipboard.read().clone() else {
             return;
         };
+        // 来源卡片本就没有事件（MissionEvent 为空）：不派生脚本名，只贴图标。
+        let with_event = with_event && !clip.event_file.trim().is_empty();
         let mut icons = icons;
         let mut state = state;
         let mut context_menu = context_menu;
@@ -960,7 +1009,7 @@ pub fn MindMapCanvas(
                         .iter()
                         .any(|existing| existing == &format!("{prefix}{stem}.txt"))
             };
-            // 新卡的事件脚本：默认不关联（保存时按「<标题>.txt」回退），
+            // 新卡的事件脚本：默认不关联（MissionEvent 留空），
             // 仅「粘贴国策+事件」指向复制出来的编号副本。
             let event_file = if with_event {
                 next_numbered_script_name(&clip.event_file, |candidate| {
@@ -1058,6 +1107,15 @@ pub fn MindMapCanvas(
         let Some(clip) = clipboard.read().clone() else {
             return;
         };
+        let mut state = state;
+        let mut context_menu = context_menu;
+        let mut paste_open = paste_open;
+        if clip.event_file.trim().is_empty() {
+            // 来源卡片未关联事件：没有可粘贴的脚本，保持卡片不变。
+            paste_open.set(false);
+            context_menu.set(None);
+            return;
+        }
         let prefix = format!("{paste_missions_root_for_node}/missionsEvents/");
         let event_file = next_numbered_script_name(&clip.event_file, |candidate| {
             paste_event_files_for_node
@@ -1068,9 +1126,6 @@ pub fn MindMapCanvas(
         let source_exists = paste_event_files_for_node
             .iter()
             .any(|existing| existing == &source_path);
-        let mut state = state;
-        let mut context_menu = context_menu;
-        let mut paste_open = paste_open;
         if source_exists {
             commit_history();
             let mut current = state.write();
@@ -1159,14 +1214,17 @@ pub fn MindMapCanvas(
     let selected_icon_index = *selected_icon.read();
     let picker_open = *icon_picker_open.read();
     let linking_open = *linking_event_open.read();
+    let linking_image_open_snapshot = *linking_image_open.read();
     // 右键目标卡片是否没有事件脚本（空国策：菜单提供 新建事件 / 链接事件）。
+    // 事件只看卡片自己的 `MissionEvent` 字段：为空或对应脚本不存在都算「空国策」。
     let target_event_missing = menu_position
         .and_then(|(_, _, target)| target)
         .is_some_and(|node_id| {
-            state.read().node(node_id).is_some_and(|node| {
-                let file = mission_event_file(&node.mission_event, &node.text);
-                let path = format!("{missions_root}/missionsEvents/{file}");
-                !event_files.iter().any(|existing| existing == &path)
+            state.read().node(node_id).is_some_and(|node| match node_event_file(node) {
+                None => true,
+                Some(file) => !event_files
+                    .iter()
+                    .any(|existing| existing == &format!("{missions_root}/missionsEvents/{file}")),
             })
         });
     // 右键目标卡片是否连有依赖线（双向）：「取消连接」据此决定是否可用。
@@ -1213,6 +1271,101 @@ pub fn MindMapCanvas(
     } else {
         Vec::new()
     };
+    // 「链接图片」候选：本资源根 `missionsImages/H` 下的图标文件名（仅在选择器打开时快照）。
+    // 选中后只写入卡片的 `ImageName` 字段（不动标题、不动事件），
+    // 图标数据未载入时按需读取并并入本画布图标库。
+    let link_image_items: Vec<(String, String, EventHandler<()>)> = if linking_image_open_snapshot {
+        let prefix = format!("{missions_root}/missionsImages/H/");
+        let names = image_candidate_names(&image_files, &missions_root);
+        // 已载入图标的下标表（预览图按需取用，避免逐个深比较整张列表）。
+        let loaded_index: HashMap<String, usize> = icons
+            .read()
+            .iter()
+            .enumerate()
+            .map(|(index, icon)| (format!("{}.png", icon.name), index))
+            .collect();
+        let target = menu_position.and_then(|(_, _, target)| target);
+        names
+            .into_iter()
+            .map(|name| {
+                let preview = loaded_index
+                    .get(&name)
+                    .and_then(|index| {
+                        let loaded = icons.read();
+                        loaded.get(*index).map(|icon| icon.data_url.clone())
+                    })
+                    .unwrap_or_default();
+                let chosen = name.clone();
+                let relative_path = format!("{prefix}{chosen}");
+                let directory = work_directory.clone();
+                let mut state = state;
+                let mut icons = icons;
+                let mut context_menu = context_menu;
+                let mut linking_image_open = linking_image_open;
+                let commit_history = commit_history;
+                let target = target;
+                let handler = EventHandler::new(move |_: ()| {
+                    linking_image_open.set(false);
+                    context_menu.set(None);
+                    let Some(node_id) = target else {
+                        return;
+                    };
+                    let existing = icons
+                        .read()
+                        .iter()
+                        .position(|icon| format!("{}.png", icon.name) == chosen);
+                    commit_history();
+                    {
+                        let mut current = state.write();
+                        if let Some(node) = current.node_mut(node_id) {
+                            node.image_name = chosen.clone();
+                            // 未载入时先标记「无图标」，读取成功后回填下标。
+                            node.icon_index = existing.unwrap_or(usize::MAX);
+                        }
+                    }
+                    if existing.is_some() {
+                        return;
+                    }
+                    let Some(directory) = directory.as_ref() else {
+                        return;
+                    };
+                    let stem = chosen
+                        .rsplit_once('.')
+                        .map_or(chosen.clone(), |(stem, _)| stem.to_string());
+                    let chosen_for_load = chosen.clone();
+                    let relative_for_load = relative_path.clone();
+                    let directory = directory.clone();
+                    // 按需读取图标数据：缺失 / 失败保持「无图标」（游戏侧同样显示黑卡）。
+                    spawn(async move {
+                        let Ok(Some(icon)) =
+                            load_single_icon(&directory, &stem, &relative_for_load).await
+                        else {
+                            return;
+                        };
+                        let index = {
+                            let mut own = icons.write();
+                            own.iter()
+                                .position(|item| item.name == icon.name)
+                                .unwrap_or_else(|| {
+                                    own.push(icon);
+                                    own.len() - 1
+                                })
+                        };
+                        let mut current = state.write();
+                        // 读图期间用户可能又换了图片：只在仍是这张图时套用下标。
+                        if let Some(node) = current.node_mut(node_id) {
+                            if node.image_name == chosen_for_load {
+                                node.icon_index = index;
+                            }
+                        }
+                    });
+                });
+                (name, preview, handler)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     // 仅在图标选择器打开时快照图标列表，避免画布平移/缩放时反复克隆所有图标数据。
     // 图标来源：本树已载入的图标 + 用户在资源管理器中双击手动载入的图标；
     // 不再自动加载完整图标目录，避免图标过多时渲染卡死。
@@ -1243,7 +1396,12 @@ pub fn MindMapCanvas(
     };
     let editing_node_id = *editing_node.read();
     let paste_open_snapshot = *paste_open.read();
-    let menu_max_height = if picker_open || linking_open {
+    // 剪贴板来源卡片是否带事件脚本（无事件时隐藏「粘贴事件 / 粘贴国策+事件」）。
+    let clipboard_has_event = clipboard
+        .read()
+        .as_ref()
+        .is_some_and(|clip| !clip.event_file.trim().is_empty());
+    let menu_max_height = if picker_open || linking_open || linking_image_open_snapshot {
         344
     } else if paste_open_snapshot {
         // 粘贴子菜单：返回 + 粘贴选项（两个菜单均 2 项，或空剪贴板提示）。
@@ -1251,11 +1409,12 @@ pub fn MindMapCanvas(
     } else if editing_node_id.is_some() {
         150
     } else if matches!(menu_position, Some((_, _, Some(_)))) {
-        // 卡片菜单：空国策多出「新建事件 / 链接事件」两项（每项约 34px）。
+        // 卡片菜单：每项约 34px。空国策多出「新建事件 / 链接事件」两项，
+        // 「链接图片」两类菜单都存在（各多一项）。
         if target_event_missing {
-            244
+            278
         } else {
-            210
+            244
         }
     } else {
         // 画布菜单：创建国策 + 粘贴。
@@ -1265,9 +1424,6 @@ pub fn MindMapCanvas(
     let is_connecting = state.read().connecting_from.is_some();
     // 卡片菜单「复制」按钮按值捕获资源根，需独立克隆（粘贴闭包已持有自己的克隆）。
     let copy_missions_root = missions_root.clone();
-    // 「保存标题」改名时检查旧脚本存在性（避免对无事件的国策报无意义的改名失败）的克隆。
-    let rename_event_files = event_files.clone();
-    let rename_missions_root = missions_root.clone();
     // 本组件不再自管撤销历史：所有编辑操作已注册到 Work 的全局撤销栈。
 
     let grid_x = -pan_x - GRID_COLUMN_STEP;
@@ -1519,6 +1675,36 @@ pub fn MindMapCanvas(
                                 }
                             }
                         }
+                    } else if linking_image_open_snapshot {
+                        button {
+                            r#type: "button",
+                            onclick: move |_| linking_image_open.set(false),
+                            "返回"
+                        }
+                        div { class: "context-image-list",
+                            if link_image_items.is_empty() {
+                                span { style: "padding: 6px 4px; font-size: 11px; line-height: 1.4; text-align: center; opacity: 0.75;",
+                                    "该资源根下暂无可用的图标（missionsImages/H/*.png）"
+                                }
+                            }
+                            for (image_name , preview , link_handler) in link_image_items {
+                                button {
+                                    r#type: "button",
+                                    title: "{image_name}",
+                                    onclick: move |_| link_handler.call(()),
+                                    if !preview.is_empty() {
+                                        img {
+                                            src: "{preview}",
+                                            alt: "",
+                                            style: "flex: none; width: 40px; height: 26px; object-fit: contain; pointer-events: none;",
+                                        }
+                                    }
+                                    span { style: "overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
+                                        "{image_name}"
+                                    }
+                                }
+                            }
+                        }
                     } else if paste_open_snapshot {
                         button {
                             r#type: "button",
@@ -1537,11 +1723,13 @@ pub fn MindMapCanvas(
                                 onclick: move |_| paste_policy_only_for_card(),
                                 "粘贴国策"
                             }
-                            button {
-                                r#type: "button",
-                                title: "把复制的事件脚本另存为带计数的新文件，并应用到这张国策（不涉及图标）",
-                                onclick: move |_| paste_event_onto_node(node_id),
-                                "粘贴事件"
+                            if clipboard_has_event {
+                                button {
+                                    r#type: "button",
+                                    title: "把复制的事件脚本另存为带计数的新文件，并应用到这张国策（不涉及图标）",
+                                    onclick: move |_| paste_event_onto_node(node_id),
+                                    "粘贴事件"
+                                }
                             }
                         } else {
                             // 空白菜单：在点击位置新建国策。
@@ -1551,11 +1739,13 @@ pub fn MindMapCanvas(
                                 onclick: move |_| paste_policy_only(),
                                 "粘贴国策"
                             }
-                            button {
-                                r#type: "button",
-                                title: "以「来源标题+计数」新建国策，并把事件脚本复制为带计数的新文件",
-                                onclick: move |_| paste_policy_with_event(),
-                                "粘贴国策+事件"
+                            if clipboard_has_event {
+                                button {
+                                    r#type: "button",
+                                    title: "以「来源标题+计数」新建国策，并把事件脚本复制为带计数的新文件",
+                                    onclick: move |_| paste_policy_with_event(),
+                                    "粘贴国策+事件"
+                                }
                             }
                         }
                     } else if let Some(edit_node_id) = editing_node_id {
@@ -1570,34 +1760,17 @@ pub fn MindMapCanvas(
                             onclick: move |_| {
                                 let text = new_node_text.read().trim().to_string();
                                 if !text.is_empty() {
-                                    let old_state = state
+                                    // 只改标题（JSON 的 Name 字段）：不联动 MissionEvent，
+                                    // 也不重命名 missionsEvents 下的脚本文件。
+                                    let old_text = state
                                         .read()
                                         .node(edit_node_id)
-                                        .map(|node| (node.text.clone(), node.mission_event.clone()));
-                                    if let Some((old_text, old_event_file)) = old_state {
-                                        if old_text != text {
-                                            commit_history();
-                                            let new_event_file = format!("{text}.txt");
-                                            let mut current = state.write();
-                                            if let Some(node) = current.node_mut(edit_node_id) {
-                                                node.text = text.clone();
-                                                node.mission_event = new_event_file.clone();
-                                            }
-                                            // 仅当旧脚本确实存在时才请求改名：对无事件的国策
-                                            //（如刚粘贴的图标卡）避免报出无意义的改名失败提示。
-                                            let old_file = mission_event_file(&old_event_file, &old_text);
-                                            let old_script_exists = rename_event_files
-                                                .iter()
-                                                .any(|existing| {
-                                                    existing
-                                                        == &format!(
-                                                            "{rename_missions_root}/missionsEvents/{old_file}",
-                                                        )
-                                                });
-                                            if old_script_exists {
-                                                on_rename_event_file
-                                                    .call((old_file, new_event_file));
-                                            }
+                                        .map(|node| node.text.clone());
+                                    if old_text.as_deref() != Some(text.as_str()) {
+                                        commit_history();
+                                        let mut current = state.write();
+                                        if let Some(node) = current.node_mut(edit_node_id) {
+                                            node.text = text.clone();
                                         }
                                     }
                                 }
@@ -1633,14 +1806,15 @@ pub fn MindMapCanvas(
                             },
                             "删除国策"
                         }
-                        // 仅删除事件脚本文件：保留卡片（卡片仍指向同名脚本）。
+                        // 仅删除事件脚本文件：保留卡片（卡片的 MissionEvent 不变，仍指向该脚本）。
                         button {
                             r#type: "button",
                             onclick: move |_| {
+                                // 只删卡片自己的 MissionEvent 指向的脚本（无关联则不删）。
                                 let event_file_name = state
                                     .read()
                                     .node(confirm_id)
-                                    .map(|node| mission_event_file(&node.mission_event, &node.text));
+                                    .and_then(node_event_file);
                                 if let Some(file_name) = event_file_name {
                                     on_delete_event_file.call(file_name);
                                 }
@@ -1653,10 +1827,11 @@ pub fn MindMapCanvas(
                         button {
                             r#type: "button",
                             onclick: move |_| {
+                                // 只删卡片自己的 MissionEvent 指向的脚本（无关联则不删）。
                                 let event_file_name = state
                                     .read()
                                     .node(confirm_id)
-                                    .map(|node| mission_event_file(&node.mission_event, &node.text));
+                                    .and_then(node_event_file);
                                 commit_history();
                                 let mut current = state.write();
                                 current.nodes.retain(|node| node.id != confirm_id);
@@ -1688,13 +1863,27 @@ pub fn MindMapCanvas(
                             button {
                                 r#type: "button",
                                 onclick: move |_| {
-                                    let node_info = state
+                                    // 已有关联但脚本缺失 → 按原 MissionEvent 新建；
+                                    // 完全没有 MissionEvent → 以「<标题>.txt」新建，
+                                    // 并一次性写入 MissionEvent（显式链接，标题本身不参与后续改名）。
+                                    let info = state
                                         .read()
                                         .node(parent_id)
-                                        .map(|node| {
-                                            (mission_event_file(&node.mission_event, &node.text), node.text.clone())
-                                        });
-                                    if let Some((file_name, text)) = node_info {
+                                        .map(|node| (node_event_file(node), node.text.clone()));
+                                    if let Some((existing_file, text)) = info {
+                                        let file_name = existing_file
+                                            .unwrap_or_else(|| format!("{text}.txt"));
+                                        let needs_link = state
+                                            .read()
+                                            .node(parent_id)
+                                            .is_some_and(|node| node.mission_event.trim().is_empty());
+                                        if needs_link {
+                                            commit_history();
+                                            let mut current = state.write();
+                                            if let Some(node) = current.node_mut(parent_id) {
+                                                node.mission_event = file_name.clone();
+                                            }
+                                        }
                                         on_create_event_file
                                             .call((file_name, default_event(&text).to_text()));
                                     }
@@ -1712,12 +1901,22 @@ pub fn MindMapCanvas(
                                 r#type: "button",
                                 onclick: move |_| {
                                     if let Some(node) = state.read().node(parent_id) {
-                                        on_edit_event.call(mission_event_file(&node.mission_event, &node.text));
+                                        if let Some(file) = node_event_file(node) {
+                                            on_edit_event.call(file);
+                                        }
                                     }
                                     context_menu.set(None);
                                 },
                                 "编辑事件"
                             }
+                        }
+                        // 「链接图片」：紧邻事件入口，只写卡片的 ImageName 字段
+                        //（不改标题 Name，也不改事件 MissionEvent）。
+                        button {
+                            r#type: "button",
+                            title: "选择 missionsImages/H 下的图片写入 ImageName（不改标题与事件）",
+                            onclick: move |_| linking_image_open.set(true),
+                            "链接图片"
                         }
                         button {
                             r#type: "button",
@@ -1790,7 +1989,10 @@ pub fn MindMapCanvas(
                                                     .map(|icon| icon.data_url)
                                                     .unwrap_or_default(),
                                                 ai: node.ai,
-                                                event_file: mission_event_file(&node.mission_event, &node.text),
+                                                // 只复制 MissionEvent 指向的脚本（未关联时为
+                                                // 空串：粘贴方不会为此卡复制事件）。
+                                                event_file: node_event_file(node)
+                                                    .unwrap_or_default(),
                                                 missions_root: copy_missions_root.clone(),
                                             }),
                                         );
@@ -2040,5 +2242,60 @@ mod tests {
         );
         // 标题不拆分扩展名：带点 / 带数字的来源标题原样保留后再追加计数。
         assert_eq!(next_numbered_title("甲v1.0", |_| false), "甲v1.00");
+    }
+
+    #[test]
+    fn mission_event_name_only_reads_mission_event_field() {
+        // 事件脚本名只取 MissionEvent（去首尾空白）；缺失 / 空白 = 没有事件，
+        // 绝不再按标题派生「<标题>.txt」。
+        assert_eq!(mission_event_name("  甲.txt  ").as_deref(), Some("甲.txt"));
+        assert_eq!(mission_event_name(""), None);
+        assert_eq!(mission_event_name("   "), None);
+    }
+
+    #[test]
+    fn from_missions_keeps_title_and_event_independent() {
+        // 标题与事件脚本名互不绑定：MissionEvent 缺失时卡片没有事件，
+        // 标题也不参与派生（旧实现会回退为「乙.txt」）。
+        let record: MissionRecord = serde_json::from_str(
+            r#"{"ID":0,"Name":"乙","ImageName":"i.png","TreeColumn":0,"TreeRow":0}"#,
+        )
+        .expect("缺 MissionEvent 的条目应可解析");
+        let state = MindMapState::from_missions(&[record], &[]);
+        assert_eq!(state.nodes[0].text, "乙");
+        assert_eq!(state.nodes[0].mission_event, "");
+        assert_eq!(node_event_file(&state.nodes[0]), None);
+
+        // 写了 MissionEvent 的条目原样保留（与标题不同名也照常读取）。
+        let record: MissionRecord = serde_json::from_str(
+            r#"{"ID":0,"Name":"甲","MissionEvent":"脚本.txt","TreeColumn":0,"TreeRow":0}"#,
+        )
+        .unwrap();
+        let state = MindMapState::from_missions(&[record], &[]);
+        assert_eq!(state.nodes[0].text, "甲");
+        assert_eq!(node_event_file(&state.nodes[0]).as_deref(), Some("脚本.txt"));
+    }
+
+    #[test]
+    fn image_candidates_only_list_root_h_icons() {
+        let files = vec![
+            "missions/missionsImages/H/a.png".to_string(),
+            "missions/missionsImages/H/b.PNG".to_string(),
+            "missions/missionsImages/H/nested/c.png".to_string(),
+            "missions/missionsImages/H/note.txt".to_string(),
+            "missions/missionsImages/root.png".to_string(),
+            "missions/missionsEvents/a.txt".to_string(),
+            "other/assets/game/missions/missionsImages/H/d.png".to_string(),
+        ];
+        // 只取本资源根 missionsImages/H 下的 png（排序、去重、忽略其它资源根与子目录）。
+        assert_eq!(
+            image_candidate_names(&files, "missions"),
+            vec!["a.png".to_string(), "b.PNG".to_string()]
+        );
+        assert_eq!(
+            image_candidate_names(&files, "other/assets/game/missions"),
+            vec!["d.png".to_string()]
+        );
+        assert!(image_candidate_names(&files, "missing").is_empty());
     }
 }

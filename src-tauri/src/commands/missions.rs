@@ -38,14 +38,14 @@ pub fn parse_missions(contents: String) -> Result<ParsedMissions, String> {
     })
 }
 
-/// 规范化并序列化国策列表（按顺序重写 ID、补默认事件文件名；AI 等其余字段原样保留）。
+/// 规范化并序列化国策列表（按顺序重写 ID；`MissionEvent` 等其余字段原样保留）。
+///
+/// 注意：不再按标题补 `MissionEvent`。标题（`Name`）与事件脚本名（`MissionEvent`）
+/// 是两个独立字段，工具不得在保存时把它们隐式绑定起来。
 #[tauri::command]
 pub fn serialize_missions(mut missions: Vec<MissionRecord>) -> Result<String, String> {
     for (index, mission) in missions.iter_mut().enumerate() {
         mission.id = index as i64;
-        if mission.mission_event.trim().is_empty() {
-            mission.mission_event = format!("{}.txt", mission.name);
-        }
     }
     serialize_mission_file(&missions)
 }
@@ -116,8 +116,8 @@ pub fn save_missions_file(
 /// 打包 / 导出前检查：列出 `missionsEvents` 目录内未被任何国策 / 决议引用的脚本副本。
 ///
 /// `scope` 为工作区相对目录（空串 = 整个工作区；打包时传打包源目录）。
-/// 「被引用」= 所在国策根的 `*.json` 国策树里出现 `MissionEvent`（缺省时回退
-/// 「标题.txt」），或同根事件脚本内被 `run_event` / `run_event_instantly` 引用，
+/// 「被引用」= 所在国策根的 `*.json` 国策树里出现 `MissionEvent`（缺省时**保守地**把
+/// 「标题.txt」也算作引用，避免误报导致误删；编辑器本身不采用该回退），或同根事件脚本内被 `run_event` / `run_event_instantly` 引用，
 /// 或决议定义文件（`rainfall/rfEvent_decision.json`）的 `events` 项引用该脚本
 /// （按文件名主干或脚本内部 `id=` 行匹配；去尾部 `.txt`、大小写不敏感；
 /// 工作区内相关决议文件全部合并计入）。
@@ -307,7 +307,8 @@ fn collect_unused_scripts(
     total: usize,
     progress: ScanProgress<'_>,
 ) -> Vec<(SystemTime, String)> {
-    // 1) 并行解析根内全部国策树，合并引用（MissionEvent，缺省回退「标题.txt」）。
+    // 1) 并行解析根内全部国策树，合并引用（MissionEvent；缺省时保守地把「标题.txt」
+    //    也算作引用——仅用于「未使用脚本」检查，编辑器不采用该回退）。
     let mut tree_references = Vec::new();
     let mut tree_parsed = false;
     if let Ok(entries) = fs::read_dir(missions_root) {
@@ -423,7 +424,9 @@ fn parse_tree_references(path: &Path) -> Option<Vec<String>> {
         if !event.is_empty() {
             references.push(event.to_ascii_lowercase());
         } else if !record.name.trim().is_empty() {
-            // 与工具 / 游戏一致：MissionEvent 缺省时回退「标题.txt」。
+            // 保守口径（仅用于「未使用脚本」检查）：MissionEvent 缺省时仍把「标题.txt」
+            // 算作引用，宁可多算，避免误报导致误删脚本。
+            // 编辑器不采用该回退：标题（Name）与 MissionEvent 是两个独立字段。
             references.push(format!("{}.txt", record.name.trim()).to_ascii_lowercase());
         }
     }

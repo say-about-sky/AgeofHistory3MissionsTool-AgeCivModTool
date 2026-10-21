@@ -351,6 +351,20 @@ struct GroupDraft {
 	original: Option<String>,
 }
 
+/// 「新建决议组」重复点击判定：上一次建出的新建草稿组还没输入名称（输入框也还没获得
+/// 焦点、没有触发失焦结算）时返回其下标，调用方直接复用该组而不是再推一个新的——
+/// 否则旧组会以「（未命名）」留在列表里，连点几次就累积几个空组。
+fn pending_new_group(groups: &[DecisionGroup], draft: Option<&GroupDraft>) -> Option<usize> {
+	let draft = draft?;
+	if !draft.is_new {
+		return None;
+	}
+	groups
+		.get(draft.index)
+		.filter(|group| group.name.trim().is_empty())
+		.map(|_| draft.index)
+}
+
 /// 条目列表长度（拖拽边界判断）。
 fn entry_len(state: &Signal<Vec<DecisionGroup>>, kind: EntryKind, group: usize) -> usize {
 	state.peek().get(group).map_or(0, |entry| match kind {
@@ -1651,1120 +1665,1128 @@ pub fn DecisionPanel(
 	});
 
 	rsx! {
-        div {
-            class: "decision-stage",
-            style: if is_active { "display: flex;" } else { "display: none;" },
-            // 候选列表（图片名 / 事件脚本名），供占位条目行内输入与「添加」补全。
-            datalist { id: "{dom_scope}-image-candidates",
-                for name in image_candidates.read().iter() {
-                    option { key: "img-{name}", value: "{name}" }
-                }
-            }
-            datalist { id: "{dom_scope}-event-candidates",
-                for (name , _path) in event_candidates.read().iter().take(1000) {
-                    option { key: "evt-{name}-{_path}", value: "{name}" }
-                }
-            }
-            div { class: "decision-layout",
-                aside {
-                    class: "decision-groups",
-                    id: "{dom_scope}-groups-pane",
-                    style: "width: {groups_width}px;",
-                    div { class: "decision-groups-head",
-                        span {
-                            if is_filtering {
-                                "决议组（{visible_indices.len()} / {groups.len()}）"
-                            } else {
-                                "决议组（{groups.len()}）"
-                            }
-                        }
-                        if let Some((completed, total)) = image_progress {
-                            div {
-                                class: "decision-groups-progress",
-                                role: "progressbar",
-                                aria_valuemin: "0",
-                                aria_valuemax: "{total}",
-                                aria_valuenow: "{completed}",
-                                div { class: "decision-groups-progress-label",
-                                    "图片加载中 {completed} / {total}"
-                                }
-                                div { class: "decision-groups-progress-track",
-                                    div {
-                                        class: "decision-groups-progress-fill",
-                                        style: "width: {image_progress_percent:.1}%;",
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    div { class: "decision-groups-filter",
-                        input {
-                            r#type: "text",
-                            class: "decision-input",
-                            value: "{group_filter}",
-                            placeholder: "筛选组（ID / 名称 / 事件）...",
-                            spellcheck: "false",
-                            autocomplete: "off",
-                            "data-native-undo": "true",
-                            oninput: move |evt: FormEvent| {
-                                group_filter.set(evt.value());
-                                group_row_heights.set(HashMap::new());
-                                group_list_scroll.set(0.0);
-                                reset_group_list_scroll(&format!("{scope_filter}-groups-list"));
-                            },
-                        }
-                        if is_filtering {
-                            button {
-                                class: "decision-filter-clear",
-                                r#type: "button",
-                                aria_label: "清除筛选",
-                                onclick: move |_| {
-                                    group_filter.set(String::new());
-                                    group_row_heights.set(HashMap::new());
-                                    group_list_scroll.set(0.0);
-                                    reset_group_list_scroll(&format!("{scope_filter_clear}-groups-list"));
-                                },
-                                "✕"
-                            }
-                        }
-                    }
-                    if !message.read().is_empty() {
-                        div {
-                            class: "decision-warnings decision-side-message",
-                            role: "status",
-                            title: "点击关闭",
-                            onclick: move |_| message.set(String::new()),
-                            "⚠ {message}"
-                        }
-                    }
-                    div {
-                        class: "decision-groups-list",
-                        id: "{dom_scope}-groups-list",
-                        onscroll: move |evt: Event<ScrollData>| {
-                            let top = evt.scroll_top();
-                            // 记录滚动活跃时间：行高实测在滚动停止后再补测（见测量 effect）。
-                            scroll_activity.set(performance_now());
-                            if (top - *group_list_scroll.peek()).abs() >= GROUP_SCROLL_STEP {
-                                group_list_scroll.set(top);
-                            }
-                        },
-                        // 条目外松手 / 触摸手势被浏览器接管（如开始滚动）时兑底清理按下状态。
-                        onpointerup: move |_| entry_press_cleanup(press_state),
-                        onpointercancel: move |_| entry_press_cleanup(press_state),
-                        if is_filtering && visible_indices.is_empty() {
-                            div { class: "decision-empty", "无匹配的决议组" }
-                        }
-                        if window_start > 0 {
-                            div {
-                                class: "decision-group-spacer",
-                                style: "height: {top_spacer:.1}px;",
-                                aria_hidden: "true",
-                            }
-                        }
-                        for position in window_start..render_end {
-                            {
-                                let index = visible_indices[position];
-                                let group = &groups[index];
-                                let is_selected = index == *selected.read();
-                                let is_expanded = expanded_snapshot.contains(&index);
-                                rsx! {
-                                    div {
-                                        key: "group-{index}",
-                                        id: "{dom_scope}-group-row-{position}",
-                                        class: if is_selected { "decision-group-block active" } else { "decision-group-block" },
-                                        // ===== 图片预览（无图片不显示；长按拖动排序/菜单，双击定位）=====
-                                        if !group.images.is_empty() {
-                                            div { class: "decision-group-images",
-                                                for (image_index , image) in group.images.iter().enumerate() {
-                                                    if image.trim().is_empty()
-                                                        || entry_draft_snapshot
-                                                            .as_ref()
-                                                            .is_some_and(|draft| {
-                                                                draft.kind == EntryKind::Image && draft.group == index
-                                                                    && draft.index == image_index
-                                                            })
-                                                    {
-                                                        input {
-                                                            key: "image-input-{index}-{image_index}",
-                                                            id: "{dom_scope}-entry-img-{index}-{image_index}",
-                                                            class: "decision-input decision-entry-input",
-                                                            list: "{dom_scope}-image-candidates",
-                                                            placeholder: "图片文件名（如 none.png）",
-                                                            value: "{image}",
-                                                            "data-native-undo": "true",
-                                                            onfocus: move |_| {
-                                                                if !entry_draft
-                                                                    .peek()
-                                                                    .as_ref()
-                                                                    .is_some_and(|draft| {
-                                                                        draft.kind == EntryKind::Image && draft.group == index
-                                                                            && draft.index == image_index
-                                                                    })
-                                                                {
-                                                                    entry_draft
-                                                                        .set(
-                                                                            Some(EntryDraft {
-                                                                                kind: EntryKind::Image,
-                                                                                group: index,
-                                                                                index: image_index,
-                                                                                is_new: false,
-                                                                                original: None,
-                                                                            }),
-                                                                        );
-                                                                }
-                                                            },
-                                                            oninput: {
-                                                                let scope_id = scope_id;
-                                                                move |evt: FormEvent| {
-                                                                    let value = evt.value();
-                                                                    apply_group_edit(
-                                                                        state,
-                                                                        on_undo_push,
-                                                                        &scope_id.read(),
-                                                                        move |groups| {
-                                                                            if let Some(entry) = groups.get_mut(index) {
-                                                                                if let Some(slot) = entry.images.get_mut(image_index) {
-                                                                                    *slot = value.clone();
-                                                                                }
-                                                                            }
-                                                                        },
-                                                                    );
-                                                                }
-                                                            },
-                                                            onblur: move |_| {
-                                                                finalize_entry_draft(state, on_undo_push, entry_draft, &scope_id.read());
-                                                            },
-                                                            onkeydown: move |evt: Event<KeyboardData>| {
-                                                                if evt.data().key().to_string() == "Enter" {
-                                                                    evt.prevent_default();
-                                                                    finalize_entry_draft(state, on_undo_push, entry_draft, &scope_id.read());
-                                                                }
-                                                            },
-                                                        }
-                                                    } else {
-                                                        {
-                                                            let stem = image_stem(image);
-                                                            let data = sidebar_images.get(&stem);
-                                                            let dragging = press_state
-                                                                .read()
-                                                                .is_some_and(|press| {
-                                                                    press.started && press.kind == EntryKind::Image && press.group == index
-                                                                        && press.index == image_index
-                                                                });
-                                                            let capture_id = format!("{dom_scope}-entry-img-{index}-{image_index}");
-                                                            let reveal = image_dir
-                                                                .as_ref()
-                                                                .map(|dir| format!("{dir}/{image}"));
-                                                            rsx! {
-                                                                div {
-                                                                    key: "image-{index}-{image}",
-                                                                    id: "{capture_id}",
-                                                                    class: if dragging { "decision-image-entry dragging" } else { "decision-image-entry" },
-                                                                    role: "button",
-                                                                    title: "长按拖动排序；右键或长按弹出菜单；双击在内置资源管理器中定位",
-                                                                    oncontextmenu: move |evt: Event<MouseData>| {
-                                                                        evt.prevent_default();
-                                                                        let client = evt.client_coordinates();
-                                                                        entry_menu
-                                                                            .set(
-                                                                                Some((EntryKind::Image, index, image_index, client.x, client.y)),
-                                                                            );
-                                                                    },
-                                                                    onpointerdown: move |evt: Event<PointerData>| {
-                                                                        // 鼠标右键交给 oncontextmenu；仅左键（或触摸/触控笔）进入长按/拖拽。
-                                                                        if matches!(
-                                                                            evt.data().trigger_button(),
-                                                                            Some(MouseButton::Secondary | MouseButton::Auxiliary)
-                                                                        ) {
-                                                                            return;
-                                                                        }
-                                                                        let step_height = element_height(&capture_id)
-                                                                            .unwrap_or(IMAGE_ROW_HEIGHT);
-                                                                        entry_pointer_down(
-                                                                            press_state,
-                                                                            press_token,
-                                                                            EntryKind::Image,
-                                                                            index,
-                                                                            image_index,
-                                                                            evt.client_coordinates().y,
-                                                                            step_height,
-                                                                            &capture_id,
-                                                                            evt.data().pointer_id(),
-                                                                            evt.data().pointer_type() == "touch",
-                                                                        );
-                                                                    },
-                                                                    onpointermove: move |evt: Event<PointerData>| {
-                                                                        entry_pointer_move(
-                                                                            press_state,
-                                                                            state,
-                                                                            on_undo_push,
-                                                                            &scope_id.read(),
-                                                                            EntryKind::Image,
-                                                                            index,
-                                                                            evt.client_coordinates().y,
-                                                                        );
-                                                                    },
-                                                                    onpointerup: move |evt: Event<PointerData>| {
-                                                                        entry_pointer_up(
-                                                                            press_state,
-                                                                            entry_menu,
-                                                                            selected,
-                                                                            EntryKind::Image,
-                                                                            index,
-                                                                            evt.client_coordinates().x,
-                                                                            evt.client_coordinates().y,
-                                                                        );
-                                                                    },
-                                                                    onpointercancel: move |_| entry_pointer_cancel(press_state, EntryKind::Image, index),
-                                                                    ondoubleclick: move |_| {
-                                                                        if let Some(path) = reveal.clone() {
-                                                                            on_reveal_item.call((path, false));
-                                                                        }
-                                                                    },
-                                                                    if let Some(data) = data {
-                                                                        img {
-                                                                            class: "decision-image-preview",
-                                                                            src: "{data.url}",
-                                                                            alt: "{image}",
-                                                                            draggable: "false",
-                                                                            decoding: "async",
-                                                                            style: if data.width > 0 && data.height > 0 { format!("aspect-ratio: {} / {};", data.width, data.height) } else { String::new() },
-                                                                        }
-                                                                    } else {
-                                                                        div {
-                                                                            class: "decision-image-placeholder",
-                                                                            style: sidebar_sizes
-                                                                                .get(&stem)
-                                                                                .filter(|(width, height)| *width > 0 && *height > 0)
-                                                                                .map(|(width, height)| format!("aspect-ratio: {width} / {height};"))
-                                                                                .unwrap_or_default(),
-                                                                            "🖼"
-                                                                        }
-                                                                    }
-                                                                    span { class: "decision-image-name", "{image}" }
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        // ===== 组标题（点击选中并展开/收起事件下拉）=====
-                                        div {
-                                            class: "decision-group-head",
-                                            role: "button",
-                                            onclick: move |_| {
-                                                selected.set(index);
-                                                toggle_group_expanded(expanded_groups, index);
-                                            },
-                                            oncontextmenu: move |evt: Event<MouseData>| {
-                                                evt.prevent_default();
-                                                let client = evt.client_coordinates();
-                                                selected.set(index);
-                                                group_menu.set(Some((index, client.x, client.y)));
-                                            },
-                                            span { class: "decision-group-id",
-                                                if group.id.trim().is_empty() {
-                                                    "（未命名）"
-                                                } else {
-                                                    "{group.id}"
-                                                }
-                                            }
-                                            if group_draft_snapshot
-                                                .as_ref()
-                                                .is_some_and(|draft| draft.index == index)
-                                            {
-                                                input {
-                                                    id: "{dom_scope}-group-name-edit-{index}",
-                                                    class: "decision-input decision-group-name-input",
-                                                    value: "{group.name}",
-                                                    placeholder: "决议组名称（如 政治决策）",
-                                                    spellcheck: "false",
-                                                    autocomplete: "off",
-                                                    "data-native-undo": "true",
-                                                    onclick: move |evt: Event<MouseData>| evt.stop_propagation(),
-                                                    oninput: {
-                                                        let scope_id = scope_id;
-                                                        move |evt: FormEvent| {
-                                                            let value = evt.value();
-                                                            apply_group_edit(
-                                                                state,
-                                                                on_undo_push,
-                                                                &scope_id.read(),
-                                                                move |groups| {
-                                                                    if let Some(entry) = groups.get_mut(index) {
-                                                                        entry.name = value.clone();
-                                                                    }
-                                                                },
-                                                            );
-                                                        }
-                                                    },
-                                                    onblur: move |_| {
-                                                        finalize_group_draft(
-                                                            state,
-                                                            on_undo_push,
-                                                            group_draft,
-                                                            &scope_id.read(),
-                                                            selected,
-                                                            expanded_groups,
-                                                            group_row_heights,
-                                                            entry_draft,
-                                                        );
-                                                    },
-                                                    onkeydown: move |evt: Event<KeyboardData>| {
-                                                        if evt.data().key().to_string() == "Enter" {
-                                                            evt.prevent_default();
-                                                            finalize_group_draft(
-                                                                state,
-                                                                on_undo_push,
-                                                                group_draft,
-                                                                &scope_id.read(),
-                                                                selected,
-                                                                expanded_groups,
-                                                                group_row_heights,
-                                                                entry_draft,
-                                                            );
-                                                        }
-                                                    },
-                                                }
-                                            } else {
-                                                span { class: "decision-group-name",
-                                                    if group.name.trim().is_empty() {
-                                                        "未命名决议组"
-                                                    } else {
-                                                        "{group.name}"
-                                                    }
-                                                }
-                                            }
-                                            if is_selected {
-                                                button {
-                                                    class: "decision-group-image-add",
-                                                    r#type: "button",
-                                                    title: "添加图片条目（填写文件名；双击可在资源管理器中定位）",
-                                                    onclick: {
-                                                        let scope_add_image = scope_add_image.clone();
-                                                        move |evt: Event<MouseData>| {
-                                                            evt.stop_propagation();
-                                                            // 先占位后聚焦：新增行进入草稿态，未输入内容失焦即自动移除。
-                                                            let new_index = state
-                                                                .peek()
-                                                                .get(index)
-                                                                .map_or(0, |group| group.images.len());
-                                                            edit_entries(
-                                                                state,
-                                                                on_undo_push,
-                                                                &scope_id.read(),
-                                                                EntryKind::Image,
-                                                                index,
-                                                                None,
-                                                            );
-                                                            entry_draft
-                                                                .set(
-                                                                    Some(EntryDraft {
-                                                                        kind: EntryKind::Image,
-                                                                        group: index,
-                                                                        index: new_index,
-                                                                        is_new: true,
-                                                                        original: None,
-                                                                    }),
-                                                                );
-                                                            selected.set(index);
-                                                            focus_element(&format!("{scope_add_image}-entry-img-{index}-{new_index}"));
-                                                        }
-                                                    },
-                                                    "🖼＋"
-                                                }
-                                            }
-                                            span { class: "decision-group-caret",
-                                                if is_expanded {
-                                                    "▾"
-                                                } else {
-                                                    "▸"
-                                                }
-                                            }
-                                        }
-                                        // ===== 事件下拉（展开显示；长按拖动排序/菜单，双击在事件编辑器中打开）=====
-                                        if is_expanded {
-                                            div { class: "decision-group-events",
-                                                if group.events.is_empty() {
-                                                    div { class: "decision-entry-empty", "暂无决议事件" }
-                                                }
-                                                for (event_index , event) in group.events.iter().enumerate() {
-                                                    if event.trim().is_empty()
-                                                        || entry_draft_snapshot
-                                                            .as_ref()
-                                                            .is_some_and(|draft| {
-                                                                draft.kind == EntryKind::Event && draft.group == index
-                                                                    && draft.index == event_index
-                                                            })
-                                                    {
-                                                        input {
-                                                            key: "event-input-{index}-{event_index}",
-                                                            id: "{dom_scope}-entry-evt-{index}-{event_index}",
-                                                            class: "decision-input decision-entry-input",
-                                                            list: "{dom_scope}-event-candidates",
-                                                            placeholder: "事件脚本名（如 决议：战前征兵）",
-                                                            value: "{event}",
-                                                            "data-native-undo": "true",
-                                                            onfocus: move |_| {
-                                                                if !entry_draft
-                                                                    .peek()
-                                                                    .as_ref()
-                                                                    .is_some_and(|draft| {
-                                                                        draft.kind == EntryKind::Event && draft.group == index
-                                                                            && draft.index == event_index
-                                                                    })
-                                                                {
-                                                                    entry_draft
-                                                                        .set(
-                                                                            Some(EntryDraft {
-                                                                                kind: EntryKind::Event,
-                                                                                group: index,
-                                                                                index: event_index,
-                                                                                is_new: false,
-                                                                                original: None,
-                                                                            }),
-                                                                        );
-                                                                }
-                                                            },
-                                                            oninput: {
-                                                                let scope_id = scope_id;
-                                                                move |evt: FormEvent| {
-                                                                    let value = evt.value();
-                                                                    apply_group_edit(
-                                                                        state,
-                                                                        on_undo_push,
-                                                                        &scope_id.read(),
-                                                                        move |groups| {
-                                                                            if let Some(entry) = groups.get_mut(index) {
-                                                                                if let Some(slot) = entry.events.get_mut(event_index) {
-                                                                                    *slot = value.clone();
-                                                                                }
-                                                                            }
-                                                                        },
-                                                                    );
-                                                                }
-                                                            },
-                                                            onblur: move |_| {
-                                                                finalize_entry_draft(state, on_undo_push, entry_draft, &scope_id.read());
-                                                            },
-                                                            onkeydown: move |evt: Event<KeyboardData>| {
-                                                                if evt.data().key().to_string() == "Enter" {
-                                                                    evt.prevent_default();
-                                                                    finalize_entry_draft(state, on_undo_push, entry_draft, &scope_id.read());
-                                                                }
-                                                            },
-                                                        }
-                                                    } else {
-                                                        {
-                                                            let dragging = press_state
-                                                                .read()
-                                                                .is_some_and(|press| {
-                                                                    press.started && press.kind == EntryKind::Event && press.group == index
-                                                                        && press.index == event_index
-                                                                });
-                                                            let capture_id = format!("{dom_scope}-entry-evt-{index}-{event_index}");
-                                                            let script_name = event.clone();
-                                                            rsx! {
-                                                                div {
-                                                                    key: "event-{index}-{event}",
-                                                                    id: "{capture_id}",
-                                                                    class: if dragging { "decision-entry dragging" } else { "decision-entry" },
-                                                                    role: "button",
-                                                                    title: "长按拖动排序；右键或长按弹出菜单；双击在事件编辑器中打开",
-                                                                    oncontextmenu: move |evt: Event<MouseData>| {
-                                                                        evt.prevent_default();
-                                                                        let client = evt.client_coordinates();
-                                                                        entry_menu
-                                                                            .set(
-                                                                                Some((EntryKind::Event, index, event_index, client.x, client.y)),
-                                                                            );
-                                                                    },
-                                                                    onpointerdown: move |evt: Event<PointerData>| {
-                                                                        // 鼠标右键交给 oncontextmenu；仅左键（或触摸/触控笔）进入长按/拖拽。
-                                                                        if matches!(
-                                                                            evt.data().trigger_button(),
-                                                                            Some(MouseButton::Secondary | MouseButton::Auxiliary)
-                                                                        ) {
-                                                                            return;
-                                                                        }
-                                                                        let step_height = element_height(&capture_id)
-                                                                            .unwrap_or(EVENT_ROW_HEIGHT);
-                                                                        entry_pointer_down(
-                                                                            press_state,
-                                                                            press_token,
-                                                                            EntryKind::Event,
-                                                                            index,
-                                                                            event_index,
-                                                                            evt.client_coordinates().y,
-                                                                            step_height,
-                                                                            &capture_id,
-                                                                            evt.data().pointer_id(),
-                                                                            evt.data().pointer_type() == "touch",
-                                                                        );
-                                                                    },
-                                                                    onpointermove: move |evt: Event<PointerData>| {
-                                                                        entry_pointer_move(
-                                                                            press_state,
-                                                                            state,
-                                                                            on_undo_push,
-                                                                            &scope_id.read(),
-                                                                            EntryKind::Event,
-                                                                            index,
-                                                                            evt.client_coordinates().y,
-                                                                        );
-                                                                    },
-                                                                    onpointerup: move |evt: Event<PointerData>| {
-                                                                        entry_pointer_up(
-                                                                            press_state,
-                                                                            entry_menu,
-                                                                            selected,
-                                                                            EntryKind::Event,
-                                                                            index,
-                                                                            evt.client_coordinates().x,
-                                                                            evt.client_coordinates().y,
-                                                                        );
-                                                                    },
-                                                                    onpointercancel: move |_| entry_pointer_cancel(press_state, EntryKind::Event, index),
-                                                                    ondoubleclick: {
-                                                                        let mod_prefix = mod_prefix.clone();
-                                                                        let mod_dir = mod_dir.clone();
-                                                                        let work_directory = work_directory.clone();
-                                                                        move |_| {
-                                                                            let name = script_name.clone();
-                                                                            let mod_prefix = mod_prefix.clone();
-                                                                            let mod_dir = mod_dir.clone();
-                                                                            let work_directory = work_directory.clone();
-                                                                            let candidates = event_candidates;
-                                                                            spawn(async move {
-                                                                                open_or_create_script(
-                                                                                        &name,
-                                                                                        &candidates.peek(),
-                                                                                        &mod_prefix,
-                                                                                        &mod_dir,
-                                                                                        work_directory,
-                                                                                        message,
-                                                                                        on_open_script,
-                                                                                        on_open_missing_script,
-                                                                                    )
-                                                                                    .await;
-                                                                            });
-                                                                        }
-                                                                    },
-                                                                    span { class: "decision-entry-index", "{event_index}" }
-                                                                    span { class: "decision-entry-name", "{event}" }
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                button {
-                                                    class: "decision-entry-add",
-                                                    r#type: "button",
-                                                    title: "添加决议事件脚本名（长按条目也可添加/删除）",
-                                                    onclick: {
-                                                        let scope_add_event = scope_add_event.clone();
-                                                        move |_| {
-                                                            // 先占位后聚焦：新增行进入草稿态，未输入内容失焦即自动移除。
-                                                            let new_index = state
-                                                                .peek()
-                                                                .get(index)
-                                                                .map_or(0, |group| group.events.len());
-                                                            edit_entries(
-                                                                state,
-                                                                on_undo_push,
-                                                                &scope_id.read(),
-                                                                EntryKind::Event,
-                                                                index,
-                                                                None,
-                                                            );
-                                                            entry_draft
-                                                                .set(
-                                                                    Some(EntryDraft {
-                                                                        kind: EntryKind::Event,
-                                                                        group: index,
-                                                                        index: new_index,
-                                                                        is_new: true,
-                                                                        original: None,
-                                                                    }),
-                                                                );
-                                                            selected.set(index);
-                                                            focus_element(&format!("{scope_add_event}-entry-evt-{index}-{new_index}"));
-                                                        }
-                                                    },
-                                                    "＋ 添加事件"
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        if render_end < list_len {
-                            div {
-                                class: "decision-group-spacer",
-                                style: "height: {bottom_spacer:.1}px;",
-                                aria_hidden: "true",
-                            }
-                        }
-                    }
-                    button {
-                        class: "decision-add-group",
-                        onclick: {
-                            let scope_add_group = scope_add_group.clone();
-                            move |_| {
-                                // 新组追加到末尾：先清筛选/行高缓存保证可见，随后滚动到底并聚焦命名输入；
-                                // 未输入有效名称就失焦 → 自动移除（见 `finalize_group_draft`）。
-                                group_filter.set(String::new());
-                                group_row_heights.set(HashMap::new());
-                                let new_index = state.peek().len();
-                                apply_group_edit(
-                                    state,
-                                    on_undo_push,
-                                    &scope_id.read(),
-                                    move |groups| {
-                                        groups.push(DecisionGroup::new_empty());
-                                    },
-                                );
-                                selected.set(new_index);
-                                group_draft
-                                    .set(
-                                        Some(GroupDraft {
-                                            index: new_index,
-                                            is_new: true,
-                                            original: None,
-                                        }),
-                                    );
-                                let list_id = format!("{scope_add_group}-groups-list");
-                                let edit_id = format!("{scope_add_group}-group-name-edit-{new_index}");
-                                let mut group_list_scroll = group_list_scroll;
-                                spawn(async move {
-                                    sleep_ms(50).await;
-                                    let script = format!(
-                                        "(function(){{ const el = document.getElementById('{list_id}'); if (!el) return 0; el.scrollTop = el.scrollHeight; return el.scrollTop; }})();",
-                                    );
-                                    if let Ok(value) = dioxus::document::eval(&script).join::<f64>().await {
-                                        group_list_scroll.set(value);
-                                    }
-                                    let _ = dioxus::document::eval(
-                                            &format!(
-                                                "(function(){{ const el = document.getElementById('{edit_id}'); if (el) {{ el.focus(); if (el.select) el.select(); }} }})();",
-                                            ),
-                                        )
-                                        .await;
-                                });
-                            }
-                        },
-                        "＋ 新建决议组"
-                    }
-                }
-                div {
-                    class: "decision-resize-handle",
-                    role: "separator",
-                    aria_orientation: "vertical",
-                    aria_label: "拖动调整决议组区域宽度",
-                    id: "{dom_scope}-resize-handle",
-                    onpointerdown: move |evt: Event<PointerData>| {
-                        let width = *groups_width.peek();
-                        resize_for_down.set(Some((evt.client_coordinates().x, width, width)));
-                        set_pane_resizing(&scope_handle_down, true);
-                        let pointer_id = evt.data().pointer_id();
-                        let handle_id = format!("{scope_handle_down}-resize-handle");
-                        spawn(async move {
-                            let _ = dioxus::document::eval(
-                                    &format!(
-                                        "document.getElementById('{handle_id}')?.setPointerCapture({pointer_id})",
-                                    ),
-                                )
-                                .await;
-                        });
-                    },
-                    onpointermove: move |evt: Event<PointerData>| {
-                        let Some((start_x, base_width, _)) = resize_for_move.get() else {
-                            return;
-                        };
-                        // 始终以「按下时的起始宽度」为基准计算位移（勿用最新宽度做基准：
-                        // 那样每帧位移会累加，分割栏跑得比指针快）。
-                        let next = (base_width + evt.client_coordinates().x - start_x)
-                            .clamp(150.0, 640.0);
-                        resize_for_move.set(Some((start_x, base_width, next)));
-                        set_pane_width(&scope_handle_move, next);
-                    },
-                    onpointerup: move |_| end_pane_resize(&scope_handle_up, &resize_for_up, groups_width),
-                    onpointercancel: move |_| end_pane_resize(&scope_handle_cancel, &resize_for_cancel, groups_width),
-                }
-                section { class: "decision-detail",
-                    if warnings.is_empty() {
-                        div { class: "decision-warnings ok", "未发现明显问题" }
-                    } else if warnings.len() <= 3 {
-                        div { class: "decision-warnings",
-                            for (warning_index , warning) in warnings.iter().enumerate() {
-                                div {
-                                    key: "{warning_index}",
-                                    class: "decision-warning",
-                                    "⚠ {warning}"
-                                }
-                            }
-                        }
-                    } else {
-                        // 大型模组（近百组）告警可达十余条，默认折叠避免占满编辑区。
-                        details { class: "decision-warnings decision-warnings-collapsed",
-                            summary { "⚠ {warnings.len()} 条告警（点击展开）" }
-                            for (warning_index , warning) in warnings.iter().enumerate() {
-                                div {
-                                    key: "{warning_index}",
-                                    class: "decision-warning",
-                                    "⚠ {warning}"
-                                }
-                            }
-                        }
-                    }
-                    if groups.is_empty() {
-                        div { class: "decision-empty",
-                            "还没有决议组。点击左下角「新建决议组」开始编辑。"
-                        }
-                    }
-                    // 借用选中组渲染（skip/take 只取一行；`index` 供下方编辑闭包捕获）。
-                    for (index , group) in groups.iter().enumerate().skip(*selected.read()).take(1) {
-                        // ===== 基本信息 =====
-                        div { class: "decision-section",
-                            div { class: "decision-section-title", "基本信息" }
-                            label { class: "decision-field",
-                                span { class: "decision-field-label",
-                                    "组 ID（add_decision 解锁、复合键前半段）"
-                                }
-                                input {
-                                    class: "decision-input",
-                                    value: "{group.id}",
-                                    "data-native-undo": "true",
-                                    oninput: {
-                                        let scope_id = scope_id;
-                                        move |evt: FormEvent| {
-                                            let value = evt.value();
-                                            apply_group_edit(
-                                                state,
-                                                on_undo_push,
-                                                &scope_id.read(),
-                                                move |groups| {
-                                                    if let Some(group) = groups.get_mut(index) {
-                                                        group.id = value.clone();
-                                                    }
-                                                },
-                                            );
-                                        }
-                                    },
-                                }
-                            }
-                            label { class: "decision-field",
-                                span { class: "decision-field-label", "显示名称" }
-                                input {
-                                    class: "decision-input",
-                                    value: "{group.name}",
-                                    "data-native-undo": "true",
-                                    oninput: {
-                                        let scope_id = scope_id;
-                                        move |evt: FormEvent| {
-                                            let value = evt.value();
-                                            apply_group_edit(
-                                                state,
-                                                on_undo_push,
-                                                &scope_id.read(),
-                                                move |groups| {
-                                                    if let Some(group) = groups.get_mut(index) {
-                                                        group.name = value.clone();
-                                                    }
-                                                },
-                                            );
-                                        }
-                                    },
-                                }
-                            }
-                        }
-                        // ===== 描述（可多条，decision_desc 切换显示）=====
-                        div { class: "decision-section",
-                            div { class: "decision-section-title",
-                                "描述（第 1 条为初始；decision_desc 按序号切换）"
-                            }
-                            for (desc_index , text) in group.desc.iter().enumerate() {
-                                div {
-                                    key: "desc-{desc_index}",
-                                    class: "decision-desc-row",
-                                    span { class: "decision-index", "{desc_index}" }
-                                    textarea {
-                                        class: "decision-desc-input",
-                                        rows: "3",
-                                        value: "{text}",
-                                        "data-native-undo": "true",
-                                        oninput: {
-                                            let scope_id = scope_id;
-                                            move |evt: FormEvent| {
-                                                let value = evt.value();
-                                                apply_group_edit(
-                                                    state,
-                                                    on_undo_push,
-                                                    &scope_id.read(),
-                                                    move |groups| {
-                                                        if let Some(group) = groups.get_mut(index) {
-                                                            if let Some(text) = group.desc.get_mut(desc_index) {
-                                                                *text = value.clone();
-                                                            }
-                                                        }
-                                                    },
-                                                );
-                                            }
-                                        },
-                                    }
-                                    div { class: "decision-row-actions",
-                                        button {
-                                            onclick: {
-                                                let scope_id = scope_id;
-                                                move |_| apply_group_edit(
-                                                    state,
-                                                    on_undo_push,
-                                                    &scope_id.read(),
-                                                    move |groups| {
-                                                        if let Some(group) = groups.get_mut(index) {
-                                                            list_move_up(&mut group.desc, desc_index);
-                                                        }
-                                                    },
-                                                )
-                                            },
-                                            title: "上移",
-                                            "↑"
-                                        }
-                                        button {
-                                            onclick: {
-                                                let scope_id = scope_id;
-                                                move |_| apply_group_edit(
-                                                    state,
-                                                    on_undo_push,
-                                                    &scope_id.read(),
-                                                    move |groups| {
-                                                        if let Some(group) = groups.get_mut(index) {
-                                                            list_move_down(&mut group.desc, desc_index);
-                                                        }
-                                                    },
-                                                )
-                                            },
-                                            title: "下移",
-                                            "↓"
-                                        }
-                                        button {
-                                            onclick: {
-                                                let scope_id = scope_id;
-                                                move |_| apply_group_edit(
-                                                    state,
-                                                    on_undo_push,
-                                                    &scope_id.read(),
-                                                    move |groups| {
-                                                        if let Some(group) = groups.get_mut(index) {
-                                                            if desc_index < group.desc.len() {
-                                                                group.desc.remove(desc_index);
-                                                            }
-                                                        }
-                                                    },
-                                                )
-                                            },
-                                            title: "删除",
-                                            "✕"
-                                        }
-                                    }
-                                }
-                            }
-                            button {
-                                class: "decision-add-row",
-                                onclick: {
-                                    let scope_id = scope_id;
-                                    move |_| apply_group_edit(
-                                        state,
-                                        on_undo_push,
-                                        &scope_id.read(),
-                                        move |groups| {
-                                            if let Some(group) = groups.get_mut(index) {
-                                                group.desc.push(String::new());
-                                            }
-                                        },
-                                    )
-                                },
-                                "＋ 添加描述"
-                            }
-                        }
-                    }
-                }
-            }
-            // 决议组菜单（右键弹出：重命名 / 删除）。
-            if let Some((menu_group_index, menu_x, menu_y)) = *group_menu.read() {
-                div {
-                    class: "menu-dismiss",
-                    style: "z-index: 57;",
-                    aria_hidden: "true",
-                    onclick: move |_| group_menu.set(None),
-                }
-                div {
-                    class: "context-menu",
-                    role: "menu",
-                    style: "position: fixed; z-index: 58; left: max(8px, min({menu_x}px, calc(100vw - 176px))); top: max(8px, min({menu_y}px, calc(100vh - 104px))); width: min(168px, calc(100vw - 16px));",
-                    button {
-                        r#type: "button",
-                        onclick: {
-                            let scope_group_menu = scope_group_menu.clone();
-                            move |_| {
-                                group_menu.set(None);
-                                let original = state
-                                    .peek()
-                                    .get(menu_group_index)
-                                    .map(|group| group.name.clone());
-                                group_draft
-                                    .set(
-                                        Some(GroupDraft {
-                                            index: menu_group_index,
-                                            is_new: false,
-                                            original,
-                                        }),
-                                    );
-                                selected.set(menu_group_index);
-                                focus_element(
-                                    &format!("{scope_group_menu}-group-name-edit-{menu_group_index}"),
-                                );
-                            }
-                        },
-                        "重命名"
-                    }
-                    button {
-                        r#type: "button",
-                        onclick: move |_| {
-                            group_menu.set(None);
-                            remove_group(
-                                state,
-                                on_undo_push,
-                                &scope_id.read(),
-                                menu_group_index,
-                                selected,
-                                expanded_groups,
-                                group_row_heights,
-                                group_draft,
-                                entry_draft,
-                            );
-                        },
-                        "删除"
-                    }
-                }
-            }
-            // 条目菜单（鼠标右键 / 长按松手弹出；固定定位在触发点；点空白处关闭）。
-            // 样式复用资源管理器 / 画布的 `.context-menu`（见 files.rs::ExplorerContextMenu）。
-            if let Some((menu_kind, menu_group, menu_index, menu_x, menu_y)) = *entry_menu.read() {
-                div {
-                    class: "menu-dismiss",
-                    style: "z-index: 55;",
-                    aria_hidden: "true",
-                    onclick: move |_| entry_menu.set(None),
-                }
-                div {
-                    class: "context-menu",
-                    role: "menu",
-                    style: "position: fixed; z-index: 56; left: max(8px, min({menu_x}px, calc(100vw - 176px))); top: max(8px, min({menu_y}px, calc(100vh - 132px))); width: min(168px, calc(100vw - 16px));",
-                    button {
-                        r#type: "button",
-                        onclick: {
-                            let scope_entry_menu = scope_entry_menu.clone();
-                            move |_| {
-                                // 重命名：改为行内输入框并聚焦；清空失焦时还原原名称。
-                                entry_menu.set(None);
-                                let value = state
-                                    .peek()
-                                    .get(menu_group)
-                                    .and_then(|group| match menu_kind {
-                                        EntryKind::Image => group.images.get(menu_index),
-                                        EntryKind::Event => group.events.get(menu_index),
-                                    })
-                                    .cloned()
-                                    .unwrap_or_default();
-                                entry_draft
-                                    .set(
-                                        Some(EntryDraft {
-                                            kind: menu_kind,
-                                            group: menu_group,
-                                            index: menu_index,
-                                            is_new: false,
-                                            original: Some(value),
-                                        }),
-                                    );
-                                let kind_tag = entry_dom_tag(menu_kind);
-                                focus_element(
-                                    &format!("{scope_entry_menu}-entry-{kind_tag}-{menu_group}-{menu_index}"),
-                                );
-                            }
-                        },
-                        "重命名"
-                    }
-                    button {
-                        r#type: "button",
-                        onclick: move |_| {
-                            edit_entries(
-                                state,
-                                on_undo_push,
-                                &scope_id.read(),
-                                menu_kind,
-                                menu_group,
-                                Some(menu_index),
-                            );
-                            entry_menu.set(None);
-                        },
-                        "删除"
-                    }
-                    button {
-                        r#type: "button",
-                        onclick: {
-                            let scope_entry_menu = scope_entry_menu.clone();
-                            move |_| {
-                                // 菜单添加与「＋」按钮一致：先占位后聚焦，未输入失焦即自动移除。
-                                entry_menu.set(None);
-                                let new_index = state
-                                    .peek()
-                                    .get(menu_group)
-                                    .map_or(
-                                        0,
-                                        |group| match menu_kind {
-                                            EntryKind::Image => group.images.len(),
-                                            EntryKind::Event => group.events.len(),
-                                        },
-                                    );
-                                edit_entries(
-                                    state,
-                                    on_undo_push,
-                                    &scope_id.read(),
-                                    menu_kind,
-                                    menu_group,
-                                    None,
-                                );
-                                entry_draft
-                                    .set(
-                                        Some(EntryDraft {
-                                            kind: menu_kind,
-                                            group: menu_group,
-                                            index: new_index,
-                                            is_new: true,
-                                            original: None,
-                                        }),
-                                    );
-                                selected.set(menu_group);
-                                if menu_kind == EntryKind::Event
-                                    && !expanded_groups.peek().contains(&menu_group)
-                                {
-                                    toggle_group_expanded(expanded_groups, menu_group);
-                                }
-                                let kind_tag = entry_dom_tag(menu_kind);
-                                focus_element(
-                                    &format!("{scope_entry_menu}-entry-{kind_tag}-{menu_group}-{new_index}"),
-                                );
-                            }
-                        },
-                        "添加"
-                    }
-                }
-            }
-        }
-    }
+		div {
+			class: "decision-stage",
+			style: if is_active { "display: flex;" } else { "display: none;" },
+			// 候选列表（图片名 / 事件脚本名），供占位条目行内输入与「添加」补全。
+			datalist { id: "{dom_scope}-image-candidates",
+				for name in image_candidates.read().iter() {
+					option { key: "img-{name}", value: "{name}" }
+				}
+			}
+			datalist { id: "{dom_scope}-event-candidates",
+				for (name , _path) in event_candidates.read().iter().take(1000) {
+					option { key: "evt-{name}-{_path}", value: "{name}" }
+				}
+			}
+			div { class: "decision-layout",
+				aside {
+					class: "decision-groups",
+					id: "{dom_scope}-groups-pane",
+					style: "width: {groups_width}px;",
+					div { class: "decision-groups-head",
+						span {
+							if is_filtering {
+								"决议组（{visible_indices.len()} / {groups.len()}）"
+							} else {
+								"决议组（{groups.len()}）"
+							}
+						}
+						if let Some((completed, total)) = image_progress {
+							div {
+								class: "decision-groups-progress",
+								role: "progressbar",
+								aria_valuemin: "0",
+								aria_valuemax: "{total}",
+								aria_valuenow: "{completed}",
+								div { class: "decision-groups-progress-label",
+									"图片加载中 {completed} / {total}"
+								}
+								div { class: "decision-groups-progress-track",
+									div {
+										class: "decision-groups-progress-fill",
+										style: "width: {image_progress_percent:.1}%;",
+									}
+								}
+							}
+						}
+					}
+					div { class: "decision-groups-filter",
+						input {
+							r#type: "text",
+							class: "decision-input",
+							value: "{group_filter}",
+							placeholder: "筛选组（ID / 名称 / 事件）...",
+							spellcheck: "false",
+							autocomplete: "off",
+							"data-native-undo": "true",
+							oninput: move |evt: FormEvent| {
+							    group_filter.set(evt.value());
+							    group_row_heights.set(HashMap::new());
+							    group_list_scroll.set(0.0);
+							    reset_group_list_scroll(&format!("{scope_filter}-groups-list"));
+							},
+						}
+						if is_filtering {
+							button {
+								class: "decision-filter-clear",
+								r#type: "button",
+								aria_label: "清除筛选",
+								onclick: move |_| {
+								    group_filter.set(String::new());
+								    group_row_heights.set(HashMap::new());
+								    group_list_scroll.set(0.0);
+								    reset_group_list_scroll(&format!("{scope_filter_clear}-groups-list"));
+								},
+								"✕"
+							}
+						}
+					}
+					if !message.read().is_empty() {
+						div {
+							class: "decision-warnings decision-side-message",
+							role: "status",
+							title: "点击关闭",
+							onclick: move |_| message.set(String::new()),
+							"⚠ {message}"
+						}
+					}
+					div {
+						class: "decision-groups-list",
+						id: "{dom_scope}-groups-list",
+						onscroll: move |evt: Event<ScrollData>| {
+						    let top = evt.scroll_top();
+						    // 记录滚动活跃时间：行高实测在滚动停止后再补测（见测量 effect）。
+						    scroll_activity.set(performance_now());
+						    if (top - *group_list_scroll.peek()).abs() >= GROUP_SCROLL_STEP {
+						        group_list_scroll.set(top);
+						    }
+						},
+						// 条目外松手 / 触摸手势被浏览器接管（如开始滚动）时兑底清理按下状态。
+						onpointerup: move |_| entry_press_cleanup(press_state),
+						onpointercancel: move |_| entry_press_cleanup(press_state),
+						if is_filtering && visible_indices.is_empty() {
+							div { class: "decision-empty", "无匹配的决议组" }
+						}
+						if window_start > 0 {
+							div {
+								class: "decision-group-spacer",
+								style: "height: {top_spacer:.1}px;",
+								aria_hidden: "true",
+							}
+						}
+						for position in window_start..render_end {
+							{
+							    let index = visible_indices[position];
+							    let group = &groups[index];
+							    let is_selected = index == *selected.read();
+							    let is_expanded = expanded_snapshot.contains(&index);
+							    rsx! {
+								div {
+									key: "group-{index}",
+									id: "{dom_scope}-group-row-{position}",
+									class: if is_selected { "decision-group-block active" } else { "decision-group-block" },
+									// ===== 图片预览（无图片不显示；长按拖动排序/菜单，双击定位）=====
+									if !group.images.is_empty() {
+										div { class: "decision-group-images",
+											for (image_index , image) in group.images.iter().enumerate() {
+												if image.trim().is_empty()
+												    || entry_draft_snapshot
+												        .as_ref()
+												        .is_some_and(|draft| {
+												            draft.kind == EntryKind::Image && draft.group == index
+												                && draft.index == image_index
+												        })
+												{
+													input {
+														key: "image-input-{index}-{image_index}",
+														id: "{dom_scope}-entry-img-{index}-{image_index}",
+														class: "decision-input decision-entry-input",
+														list: "{dom_scope}-image-candidates",
+														placeholder: "图片文件名（如 none.png）",
+														value: "{image}",
+														"data-native-undo": "true",
+														onfocus: move |_| {
+														    if !entry_draft
+														        .peek()
+														        .as_ref()
+														        .is_some_and(|draft| {
+														            draft.kind == EntryKind::Image && draft.group == index
+														                && draft.index == image_index
+														        })
+														    {
+														        entry_draft
+														            .set(
+														                Some(EntryDraft {
+														                    kind: EntryKind::Image,
+														                    group: index,
+														                    index: image_index,
+														                    is_new: false,
+														                    original: None,
+														                }),
+														            );
+														    }
+														},
+														oninput: {
+														    let scope_id = scope_id;
+														    move |evt: FormEvent| {
+														        let value = evt.value();
+														        apply_group_edit(
+														            state,
+														            on_undo_push,
+														            &scope_id.read(),
+														            move |groups| {
+														                if let Some(entry) = groups.get_mut(index) {
+														                    if let Some(slot) = entry.images.get_mut(image_index) {
+														                        *slot = value.clone();
+														                    }
+														                }
+														            },
+														        );
+														    }
+														},
+														onblur: move |_| {
+														    finalize_entry_draft(state, on_undo_push, entry_draft, &scope_id.read());
+														},
+														onkeydown: move |evt: Event<KeyboardData>| {
+														    if evt.data().key().to_string() == "Enter" {
+														        evt.prevent_default();
+														        finalize_entry_draft(state, on_undo_push, entry_draft, &scope_id.read());
+														    }
+														},
+													}
+												} else {
+													{
+													    let stem = image_stem(image);
+													    let data = sidebar_images.get(&stem);
+													    let dragging = press_state
+													        .read()
+													        .is_some_and(|press| {
+													            press.started && press.kind == EntryKind::Image && press.group == index
+													                && press.index == image_index
+													        });
+													    let capture_id = format!("{dom_scope}-entry-img-{index}-{image_index}");
+													    let reveal = image_dir
+													        .as_ref()
+													        .map(|dir| format!("{dir}/{image}"));
+													    rsx! {
+														div {
+															key: "image-{index}-{image}",
+															id: "{capture_id}", // ===== 组标题（点击选中并展开/收起事件下拉）=====
+															class: if dragging { "decision-image-entry dragging" } else { "decision-image-entry" },
+															role: "button",
+															title: "长按拖动排序；右键或长按弹出菜单；双击在内置资源管理器中定位",
+															oncontextmenu: move |evt: Event<MouseData>| {
+															    evt.prevent_default(); // 鼠标右键交给 oncontextmenu；仅左键（或触摸/触控笔）进入长按/拖拽。
+															    let client = evt.client_coordinates();
+															    entry_menu
+															        .set(
+															            Some((EntryKind::Image, index, image_index, client.x, client.y)),
+															        );
+															},
+															onpointerdown: move |evt: Event<PointerData>| {
+															    // 鼠标右键交给 oncontextmenu；仅左键（或触摸/触控笔）进入长按/拖拽。
+															    if matches!(
+															        evt.data().trigger_button(),
+															        Some(MouseButton::Secondary | MouseButton::Auxiliary)
+															    ) {
+															        return;
+															    }
+															    let step_height = element_height(&capture_id)
+															        .unwrap_or(IMAGE_ROW_HEIGHT);
+															    entry_pointer_down(
+															        press_state,
+															        press_token,
+															        EntryKind::Image,
+															        index,
+															        image_index,
+															        evt.client_coordinates().y,
+															        step_height,
+															        &capture_id,
+															        evt.data().pointer_id(),
+															        evt.data().pointer_type() == "touch",
+															    );
+															},
+															onpointermove: move |evt: Event<PointerData>| {
+															    entry_pointer_move(
+															        press_state,
+															        state,
+															        on_undo_push,
+															        &scope_id.read(),
+															        EntryKind::Image,
+															        index,
+															        evt.client_coordinates().y,
+															    );
+															},
+															onpointerup: move |evt: Event<PointerData>| {
+															    entry_pointer_up(
+															        press_state,
+															        entry_menu, // 先占位后聚焦：新增行进入草稿态，未输入内容失焦即自动移除。
+															        selected,
+															        EntryKind::Image,
+															        index,
+															        evt.client_coordinates().x,
+															        evt.client_coordinates().y,
+															    );
+															},
+															onpointercancel: move |_| entry_pointer_cancel(press_state, EntryKind::Image, index),
+															ondoubleclick: move |_| {
+															    if let Some(path) = reveal.clone() {
+															        on_reveal_item.call((path, false));
+															    }
+															},
+															if let Some(data) = data {
+																img {
+																	class: "decision-image-preview",
+																	src: "{data.url}",
+																	alt: "{image}",
+																	draggable: "false", // ===== 事件下拉（展开显示；长按拖动排序/菜单，双击在事件编辑器中打开）=====
+																	decoding: "async",
+																	style: if data.width > 0 && data.height > 0 { format!("aspect-ratio: {} / {};", data.width, data.height) } else { String::new() },
+																}
+															} else {
+																div {
+																	class: "decision-image-placeholder",
+																	style: sidebar_sizes
+																	    .get(&stem)
+																	    .filter(|(width, height)| *width > 0 && *height > 0)
+																	    .map(|(width, height)| format!("aspect-ratio: {width} / {height};"))
+																	    .unwrap_or_default(),
+																	"🖼"
+																}
+															}
+															span { class: "decision-image-name", "{image}" }
+														}
+													}
+													}
+												}
+											}
+										}
+									}
+									// ===== 组标题（点击选中并展开/收起事件下拉）=====
+									div {
+										class: "decision-group-head",
+										role: "button",
+										onclick: move |_| {
+										    selected.set(index);
+										    toggle_group_expanded(expanded_groups, index);
+										},
+										oncontextmenu: move |evt: Event<MouseData>| {
+										    evt.prevent_default();
+										    let client = evt.client_coordinates();
+										    selected.set(index);
+										    group_menu.set(Some((index, client.x, client.y)));
+										},
+										span { class: "decision-group-id",
+											if group.id.trim().is_empty() {
+												"（未命名）"
+											} else {
+												"{group.id}"
+											}
+										}
+										if group_draft_snapshot.as_ref().is_some_and(|draft| draft.index == index) {
+											input {
+												id: "{dom_scope}-group-name-edit-{index}",
+												class: "decision-input decision-group-name-input",
+												value: "{group.name}",
+												placeholder: "决议组名称（如 政治决策）",
+												spellcheck: "false", // 鼠标右键交给 oncontextmenu；仅左键（或触摸/触控笔）进入长按/拖拽。
+												autocomplete: "off",
+												"data-native-undo": "true",
+												onclick: move |evt: Event<MouseData>| evt.stop_propagation(),
+												oninput: {
+												    let scope_id = scope_id;
+												    move |evt: FormEvent| {
+												        let value = evt.value();
+												        apply_group_edit(
+												            state,
+												            on_undo_push,
+												            &scope_id.read(),
+												            move |groups| {
+												                if let Some(entry) = groups.get_mut(index) {
+												                    entry.name = value.clone();
+												                }
+												            },
+												        );
+												    }
+												},
+												onblur: move |_| {
+												    finalize_group_draft(
+												        state,
+												        on_undo_push,
+												        group_draft,
+												        &scope_id.read(),
+												        selected,
+												        expanded_groups,
+												        group_row_heights,
+												        entry_draft,
+												    );
+												},
+												onkeydown: move |evt: Event<KeyboardData>| {
+												    if evt.data().key().to_string() == "Enter" {
+												        evt.prevent_default();
+												        finalize_group_draft(
+												            state,
+												            on_undo_push,
+												            group_draft,
+												            &scope_id.read(),
+												            selected,
+												            expanded_groups,
+												            group_row_heights, // 先占位后聚焦：新增行进入草稿态，未输入内容失焦即自动移除。
+												            entry_draft,
+												        );
+												    }
+												},
+											}
+										} else {
+											span { class: "decision-group-name",
+												if group.name.trim().is_empty() {
+													"未命名决议组"
+												} else {
+													"{group.name}"
+												}
+											}
+										}
+										if is_selected {
+											button {
+												class: "decision-group-image-add",
+												r#type: "button",
+												title: "添加图片条目（填写文件名；双击可在资源管理器中定位）",
+												onclick: {
+												    let scope_add_image = scope_add_image.clone();
+												    move |evt: Event<MouseData>| {
+												        evt.stop_propagation();
+												        // 先占位后聚焦：新增行进入草稿态，未输入内容失焦即自动移除。
+												        let new_index = state
+												            .peek()
+												            .get(index)
+												            .map_or(0, |group| group.images.len());
+												        edit_entries(
+												            state,
+												            on_undo_push,
+												            &scope_id.read(),
+												            EntryKind::Image,
+												            index,
+												            None,
+												        );
+												        entry_draft
+												            .set(
+												                Some(EntryDraft {
+												                    kind: EntryKind::Image,
+												                    group: index,
+												                    index: new_index,
+												                    is_new: true,
+												                    original: None,
+												                }),
+												            );
+												        selected.set(index);
+												        focus_element(&format!("{scope_add_image}-entry-img-{index}-{new_index}"));
+												    }
+												},
+												"🖼＋"
+											}
+										}
+										span { class: "decision-group-caret",
+											if is_expanded {
+												"▾"
+											} else {
+												"▸"
+											}
+										}
+									}
+									// ===== 事件下拉（展开显示；长按拖动排序/菜单，双击在事件编辑器中打开）=====
+									if is_expanded {
+										div { class: "decision-group-events",
+											if group.events.is_empty() {
+												div { class: "decision-entry-empty", "暂无决议事件" }
+											}
+											for (event_index , event) in group.events.iter().enumerate() {
+												if event.trim().is_empty()
+												    || entry_draft_snapshot
+												        .as_ref()
+												        .is_some_and(|draft| {
+												            draft.kind == EntryKind::Event && draft.group == index
+												                && draft.index == event_index
+												        })
+												{
+													input {
+														key: "event-input-{index}-{event_index}",
+														id: "{dom_scope}-entry-evt-{index}-{event_index}",
+														class: "decision-input decision-entry-input",
+														list: "{dom_scope}-event-candidates",
+														placeholder: "事件脚本名（如 决议：战前征兵）",
+														value: "{event}",
+														"data-native-undo": "true",
+														onfocus: move |_| {
+														    if !entry_draft
+														        .peek()
+														        .as_ref()
+														        .is_some_and(|draft| {
+														            draft.kind == EntryKind::Event && draft.group == index
+														                && draft.index == event_index
+														        })
+														    {
+														        entry_draft
+														            .set(
+														                Some(EntryDraft {
+														                    kind: EntryKind::Event,
+														                    group: index,
+														                    index: event_index,
+														                    is_new: false,
+														                    original: None,
+														                }),
+														            );
+														    }
+														},
+														oninput: {
+														    let scope_id = scope_id;
+														    move |evt: FormEvent| {
+														        let value = evt.value();
+														        apply_group_edit(
+														            state,
+														            on_undo_push,
+														            &scope_id.read(),
+														            move |groups| {
+														                if let Some(entry) = groups.get_mut(index) {
+														                    if let Some(slot) = entry.events.get_mut(event_index) {
+														                        *slot = value.clone();
+														                    }
+														                }
+														            },
+														        );
+														    }
+														},
+														onblur: move |_| {
+														    finalize_entry_draft(state, on_undo_push, entry_draft, &scope_id.read());
+														},
+														onkeydown: move |evt: Event<KeyboardData>| {
+														    if evt.data().key().to_string() == "Enter" {
+														        evt.prevent_default();
+														        finalize_entry_draft(state, on_undo_push, entry_draft, &scope_id.read());
+														    }
+														},
+													}
+												} else {
+													{
+													    let dragging = press_state
+													        .read()
+													        .is_some_and(|press| {
+													            press.started && press.kind == EntryKind::Event && press.group == index
+													                && press.index == event_index
+													        });
+													    let capture_id = format!("{dom_scope}-entry-evt-{index}-{event_index}");
+													    let script_name = event.clone();
+													    rsx! {
+														div {
+															key: "event-{index}-{event}",
+															id: "{capture_id}",
+															class: if dragging { "decision-entry dragging" } else { "decision-entry" },
+															role: "button",
+															title: "长按拖动排序；右键或长按弹出菜单；双击在事件编辑器中打开",
+															oncontextmenu: move |evt: Event<MouseData>| {
+															    evt.prevent_default(); // 鼠标右键交给 oncontextmenu；仅左键（或触摸/触控笔）进入长按/拖拽。
+															    let client = evt.client_coordinates();
+															    entry_menu
+															        .set(
+															            Some((EntryKind::Event, index, event_index, client.x, client.y)),
+															        );
+															},
+															onpointerdown: move |evt: Event<PointerData>| {
+															    // 鼠标右键交给 oncontextmenu；仅左键（或触摸/触控笔）进入长按/拖拽。
+															    if matches!(
+															        evt.data().trigger_button(),
+															        Some(MouseButton::Secondary | MouseButton::Auxiliary)
+															    ) {
+															        return;
+															    }
+															    let step_height = element_height(&capture_id)
+															        .unwrap_or(EVENT_ROW_HEIGHT);
+															    entry_pointer_down(
+															        press_state,
+															        press_token,
+															        EntryKind::Event,
+															        index,
+															        event_index,
+															        evt.client_coordinates().y,
+															        step_height,
+															        &capture_id,
+															        evt.data().pointer_id(),
+															        evt.data().pointer_type() == "touch",
+															    );
+															},
+															onpointermove: move |evt: Event<PointerData>| {
+															    entry_pointer_move(
+															        press_state,
+															        state,
+															        on_undo_push,
+															        &scope_id.read(),
+															        EntryKind::Event,
+															        index,
+															        evt.client_coordinates().y,
+															    );
+															},
+															onpointerup: move |evt: Event<PointerData>| {
+															    entry_pointer_up(
+															        press_state,
+															        entry_menu,
+															        selected,
+															        EntryKind::Event,
+															        index,
+															        evt.client_coordinates().x,
+															        evt.client_coordinates().y,
+															    );
+															},
+															onpointercancel: move |_| entry_pointer_cancel(press_state, EntryKind::Event, index),
+															ondoubleclick: {
+															    let mod_prefix = mod_prefix.clone();
+															    let mod_dir = mod_dir.clone();
+															    let work_directory = work_directory.clone();
+															    move |_| {
+															        let name = script_name.clone();
+															        let mod_prefix = mod_prefix.clone();
+															        let mod_dir = mod_dir.clone();
+															        let work_directory = work_directory.clone();
+															        let candidates = event_candidates;
+															        spawn(async move {
+															            open_or_create_script(
+															                    &name,
+															                    &candidates.peek(),
+															                    &mod_prefix,
+															                    &mod_dir,
+															                    work_directory,
+															                    message,
+															                    on_open_script,
+															                    on_open_missing_script,
+															                )
+															                .await;
+															        });
+															    }
+															},
+															span { class: "decision-entry-index", "{event_index}" }
+															span { class: "decision-entry-name", "{event}" }
+														}
+													}
+													}
+												}
+											}
+											button {
+												class: "decision-entry-add",
+												r#type: "button",
+												title: "添加决议事件脚本名（长按条目也可添加/删除）",
+												onclick: {
+												    let scope_add_event = scope_add_event.clone();
+												    move |_| {
+												        // 先占位后聚焦：新增行进入草稿态，未输入内容失焦即自动移除。
+												        let new_index = state
+												            .peek()
+												            .get(index)
+												            .map_or(0, |group| group.events.len());
+												        edit_entries(
+												            state,
+												            on_undo_push,
+												            &scope_id.read(),
+												            EntryKind::Event,
+												            index,
+												            None,
+												        );
+												        entry_draft
+												            .set(
+												                Some(EntryDraft {
+												                    kind: EntryKind::Event,
+												                    group: index,
+												                    index: new_index,
+												                    is_new: true,
+												                    original: None,
+												                }),
+												            );
+												        selected.set(index);
+												        focus_element(&format!("{scope_add_event}-entry-evt-{index}-{new_index}"));
+												    }
+												},
+												"＋ 添加事件"
+											}
+										}
+									}
+								}
+							}
+							}
+						}
+						if render_end < list_len {
+							div {
+								class: "decision-group-spacer",
+								style: "height: {bottom_spacer:.1}px;",
+								aria_hidden: "true",
+							}
+						}
+					}
+					button {
+						class: "decision-add-group",
+						onclick: {
+							let scope_add_group = scope_add_group.clone();
+							move |_| {
+								// 新组追加到末尾：先清筛选/行高缓存保证可见，随后滚动到底并聚焦命名输入；
+								// 未输入有效名称就失焦 → 自动移除（见 `finalize_group_draft`）。
+								group_filter.set(String::new());
+								group_row_heights.set(HashMap::new());
+								// 重复点击（上一次建出的草稿组还没输入名称、输入框也还没来得及
+								// 获得焦点触发失焦结算）时直接复用该组：否则旧组会以「（未命名）」
+								// 留在列表里，连点几次就累积几个空组。
+								let pending_empty =
+									pending_new_group(&state.peek(), group_draft.peek().as_ref());
+								let new_index = match pending_empty {
+									Some(index) => index,
+									None => {
+										let index = state.peek().len();
+										apply_group_edit(
+											state,
+											on_undo_push,
+											&scope_id.read(),
+											move |groups| {
+												groups.push(DecisionGroup::new_empty());
+											},
+										);
+										group_draft
+											.set(
+												Some(GroupDraft {
+													index,
+													is_new: true,
+													original: None,
+												}),
+											);
+										index
+									}
+								};
+								selected.set(new_index);
+								let list_id = format!("{scope_add_group}-groups-list");
+								let edit_id = format!("{scope_add_group}-group-name-edit-{new_index}");
+								let mut group_list_scroll = group_list_scroll;
+								spawn(async move {
+									sleep_ms(50).await;
+									let script = format!(
+										"(function(){{ const el = document.getElementById('{list_id}'); if (!el) return 0; el.scrollTop = el.scrollHeight; return el.scrollTop; }})();",
+									);
+									if let Ok(value) = dioxus::document::eval(&script).join::<f64>().await {
+										group_list_scroll.set(value);
+									}
+									let _ = dioxus::document::eval(
+											&format!(
+												"(function(){{ const el = document.getElementById('{edit_id}'); if (el) {{ el.focus(); if (el.select) el.select(); }} }})();",
+											),
+										)
+										.await;
+								});
+							}
+						},
+						"＋ 新建决议组"
+					}
+				}
+				div {
+					class: "decision-resize-handle",
+					role: "separator",
+					aria_orientation: "vertical",
+					aria_label: "拖动调整决议组区域宽度",
+					id: "{dom_scope}-resize-handle",
+					onpointerdown: move |evt: Event<PointerData>| {
+					    let width = *groups_width.peek();
+					    resize_for_down.set(Some((evt.client_coordinates().x, width, width)));
+					    set_pane_resizing(&scope_handle_down, true);
+					    let pointer_id = evt.data().pointer_id();
+					    let handle_id = format!("{scope_handle_down}-resize-handle");
+					    spawn(async move {
+					        let _ = dioxus::document::eval(
+					                &format!(
+					                    "document.getElementById('{handle_id}')?.setPointerCapture({pointer_id})",
+					                ),
+					            )
+					            .await;
+					    });
+					},
+					onpointermove: move |evt: Event<PointerData>| {
+					    let Some((start_x, base_width, _)) = resize_for_move.get() else {
+					        return;
+					    };
+					    // 始终以「按下时的起始宽度」为基准计算位移（勿用最新宽度做基准：
+					    // 那样每帧位移会累加，分割栏跑得比指针快）。
+					    let next = (base_width + evt.client_coordinates().x - start_x)
+					        .clamp(150.0, 640.0);
+					    resize_for_move.set(Some((start_x, base_width, next)));
+					    set_pane_width(&scope_handle_move, next);
+					},
+					onpointerup: move |_| end_pane_resize(&scope_handle_up, &resize_for_up, groups_width),
+					onpointercancel: move |_| end_pane_resize(&scope_handle_cancel, &resize_for_cancel, groups_width),
+				}
+				section { class: "decision-detail",
+					if warnings.is_empty() {
+						div { class: "decision-warnings ok", "未发现明显问题" }
+					} else if warnings.len() <= 3 {
+						div { class: "decision-warnings",
+							for (warning_index , warning) in warnings.iter().enumerate() {
+								div {
+									key: "{warning_index}",
+									class: "decision-warning",
+									"⚠ {warning}"
+								}
+							}
+						}
+					} else {
+						// 大型模组（近百组）告警可达十余条，默认折叠避免占满编辑区。
+						details { class: "decision-warnings decision-warnings-collapsed",
+							summary { "⚠ {warnings.len()} 条告警（点击展开）" }
+							for (warning_index , warning) in warnings.iter().enumerate() {
+								div {
+									key: "{warning_index}",
+									class: "decision-warning",
+									"⚠ {warning}"
+								}
+							}
+						}
+					}
+					if groups.is_empty() {
+						div { class: "decision-empty",
+							"还没有决议组。点击左下角「新建决议组」开始编辑。"
+						}
+					}
+					// 借用选中组渲染（skip/take 只取一行；`index` 供下方编辑闭包捕获）。
+					for (index , group) in groups.iter().enumerate().skip(*selected.read()).take(1) {
+						// ===== 基本信息 =====
+						div { class: "decision-section",
+							div { class: "decision-section-title", "基本信息" }
+							label { class: "decision-field",
+								span { class: "decision-field-label",
+									"组 ID（add_decision 解锁、复合键前半段）"
+								}
+								input {
+									class: "decision-input",
+									value: "{group.id}",
+									"data-native-undo": "true",
+									oninput: {
+									    let scope_id = scope_id;
+									    move |evt: FormEvent| {
+									        let value = evt.value();
+									        apply_group_edit(
+									            state,
+									            on_undo_push,
+									            &scope_id.read(),
+									            move |groups| {
+									                if let Some(group) = groups.get_mut(index) {
+									                    group.id = value.clone();
+									                }
+									            },
+									        );
+									    }
+									},
+								}
+							}
+							label { class: "decision-field",
+								span { class: "decision-field-label", "显示名称" }
+								input {
+									class: "decision-input",
+									value: "{group.name}",
+									"data-native-undo": "true",
+									oninput: {
+									    let scope_id = scope_id;
+									    move |evt: FormEvent| {
+									        let value = evt.value();
+									        apply_group_edit(
+									            state,
+									            on_undo_push,
+									            &scope_id.read(),
+									            move |groups| {
+									                if let Some(group) = groups.get_mut(index) {
+									                    group.name = value.clone();
+									                }
+									            },
+									        );
+									    }
+									},
+								}
+							}
+						}
+						// ===== 描述（可多条，decision_desc 切换显示）=====
+						div { class: "decision-section",
+							div { class: "decision-section-title",
+								"描述（第 1 条为初始；decision_desc 按序号切换）"
+							}
+							for (desc_index , text) in group.desc.iter().enumerate() {
+								div {
+									key: "desc-{desc_index}",
+									class: "decision-desc-row",
+									span { class: "decision-index", "{desc_index}" }
+									textarea {
+										class: "decision-desc-input",
+										rows: "3",
+										value: "{text}",
+										"data-native-undo": "true",
+										oninput: {
+										    let scope_id = scope_id;
+										    move |evt: FormEvent| {
+										        let value = evt.value();
+										        apply_group_edit(
+										            state,
+										            on_undo_push,
+										            &scope_id.read(),
+										            move |groups| {
+										                if let Some(group) = groups.get_mut(index) {
+										                    if let Some(text) = group.desc.get_mut(desc_index) {
+										                        *text = value.clone();
+										                    }
+										                }
+										            },
+										        );
+										    }
+										},
+									}
+									div { class: "decision-row-actions",
+										button {
+											onclick: {
+											    let scope_id = scope_id;
+											    move |_| apply_group_edit(
+											        state,
+											        on_undo_push,
+											        &scope_id.read(),
+											        move |groups| {
+											            if let Some(group) = groups.get_mut(index) {
+											                list_move_up(&mut group.desc, desc_index);
+											            }
+											        },
+											    )
+											},
+											title: "上移",
+											"↑"
+										}
+										button {
+											onclick: {
+											    let scope_id = scope_id;
+											    move |_| apply_group_edit(
+											        state,
+											        on_undo_push,
+											        &scope_id.read(),
+											        move |groups| {
+											            if let Some(group) = groups.get_mut(index) {
+											                list_move_down(&mut group.desc, desc_index);
+											            }
+											        },
+											    )
+											},
+											title: "下移",
+											"↓"
+										}
+										button {
+											onclick: {
+											    let scope_id = scope_id;
+											    move |_| apply_group_edit(
+											        state,
+											        on_undo_push,
+											        &scope_id.read(),
+											        move |groups| {
+											            if let Some(group) = groups.get_mut(index) {
+											                if desc_index < group.desc.len() {
+											                    group.desc.remove(desc_index);
+											                }
+											            }
+											        },
+											    )
+											},
+											title: "删除",
+											"✕"
+										}
+									}
+								}
+							}
+							button {
+								class: "decision-add-row",
+								onclick: {
+								    let scope_id = scope_id;
+								    move |_| apply_group_edit(
+								        state,
+								        on_undo_push,
+								        &scope_id.read(),
+								        move |groups| {
+								            if let Some(group) = groups.get_mut(index) {
+								                group.desc.push(String::new());
+								            }
+								        },
+								    )
+								},
+								"＋ 添加描述"
+							}
+						}
+					}
+				}
+			}
+			// 决议组菜单（右键弹出：重命名 / 删除）。
+			if let Some((menu_group_index, menu_x, menu_y)) = *group_menu.read() {
+				div {
+					class: "menu-dismiss",
+					style: "z-index: 57;",
+					aria_hidden: "true",
+					onclick: move |_| group_menu.set(None),
+				}
+				div {
+					class: "context-menu",
+					role: "menu",
+					style: "position: fixed; z-index: 58; left: max(8px, min({menu_x}px, calc(100vw - 176px))); top: max(8px, min({menu_y}px, calc(100vh - 104px))); width: min(168px, calc(100vw - 16px));",
+					button {
+						r#type: "button",
+						onclick: {
+						    let scope_group_menu = scope_group_menu.clone();
+						    move |_| {
+						        group_menu.set(None);
+						        let original = state
+						            .peek()
+						            .get(menu_group_index)
+						            .map(|group| group.name.clone());
+						        group_draft
+						            .set(
+						                Some(GroupDraft {
+						                    index: menu_group_index,
+						                    is_new: false,
+						                    original,
+						                }),
+						            );
+						        selected.set(menu_group_index);
+						        focus_element(
+						            &format!("{scope_group_menu}-group-name-edit-{menu_group_index}"),
+						        );
+						    }
+						},
+						"重命名"
+					}
+					button {
+						r#type: "button",
+						onclick: move |_| {
+						    group_menu.set(None);
+						    remove_group(
+						        state,
+						        on_undo_push,
+						        &scope_id.read(),
+						        menu_group_index,
+						        selected,
+						        expanded_groups,
+						        group_row_heights,
+						        group_draft,
+						        entry_draft,
+						    );
+						},
+						"删除"
+					}
+				}
+			}
+			// 条目菜单（鼠标右键 / 长按松手弹出；固定定位在触发点；点空白处关闭）。
+			// 样式复用资源管理器 / 画布的 `.context-menu`（见 files.rs::ExplorerContextMenu）。
+			if let Some((menu_kind, menu_group, menu_index, menu_x, menu_y)) = *entry_menu.read() {
+				div {
+					class: "menu-dismiss",
+					style: "z-index: 55;",
+					aria_hidden: "true",
+					onclick: move |_| entry_menu.set(None),
+				}
+				div {
+					class: "context-menu",
+					role: "menu",
+					style: "position: fixed; z-index: 56; left: max(8px, min({menu_x}px, calc(100vw - 176px))); top: max(8px, min({menu_y}px, calc(100vh - 132px))); width: min(168px, calc(100vw - 16px));",
+					button {
+						r#type: "button",
+						onclick: {
+						    let scope_entry_menu = scope_entry_menu.clone();
+						    move |_| {
+						        // 重命名：改为行内输入框并聚焦；清空失焦时还原原名称。
+						        entry_menu.set(None);
+						        let value = state
+						            .peek()
+						            .get(menu_group)
+						            .and_then(|group| match menu_kind {
+						                EntryKind::Image => group.images.get(menu_index),
+						                EntryKind::Event => group.events.get(menu_index),
+						            })
+						            .cloned()
+						            .unwrap_or_default();
+						        entry_draft
+						            .set(
+						                Some(EntryDraft {
+						                    kind: menu_kind,
+						                    group: menu_group,
+						                    index: menu_index,
+						                    is_new: false,
+						                    original: Some(value),
+						                }),
+						            );
+						        let kind_tag = entry_dom_tag(menu_kind);
+						        focus_element(
+						            &format!("{scope_entry_menu}-entry-{kind_tag}-{menu_group}-{menu_index}"),
+						        );
+						    }
+						},
+						"重命名"
+					}
+					button {
+						r#type: "button",
+						onclick: move |_| {
+						    edit_entries(
+						        state,
+						        on_undo_push,
+						        &scope_id.read(),
+						        menu_kind,
+						        menu_group,
+						        Some(menu_index),
+						    );
+						    entry_menu.set(None);
+						},
+						"删除"
+					}
+					button {
+						r#type: "button",
+						onclick: {
+						    let scope_entry_menu = scope_entry_menu.clone();
+						    move |_| {
+						        // 菜单添加与「＋」按钮一致：先占位后聚焦，未输入失焦即自动移除。
+						        entry_menu.set(None);
+						        let new_index = state
+						            .peek()
+						            .get(menu_group)
+						            .map_or(
+						                0,
+						                |group| match menu_kind {
+						                    EntryKind::Image => group.images.len(),
+						                    EntryKind::Event => group.events.len(),
+						                },
+						            );
+						        edit_entries(
+						            state,
+						            on_undo_push,
+						            &scope_id.read(),
+						            menu_kind,
+						            menu_group,
+						            None,
+						        );
+						        entry_draft
+						            .set(
+						                Some(EntryDraft {
+						                    kind: menu_kind,
+						                    group: menu_group,
+						                    index: new_index,
+						                    is_new: true,
+						                    original: None,
+						                }),
+						            );
+						        selected.set(menu_group);
+						        if menu_kind == EntryKind::Event
+						            && !expanded_groups.peek().contains(&menu_group)
+						        {
+						            toggle_group_expanded(expanded_groups, menu_group);
+						        }
+						        let kind_tag = entry_dom_tag(menu_kind);
+						        focus_element(
+						            &format!("{scope_entry_menu}-entry-{kind_tag}-{menu_group}-{new_index}"),
+						        );
+						    }
+						},
+						"添加"
+					}
+				}
+			}
+		}
+	}
 }
 
 #[cfg(test)]
@@ -2826,6 +2848,38 @@ mod tests {
 			"decision_assets_rainfall_rfEvent_decision_json"
 		);
 		assert_eq!(dom_scope_id("a-b_c1"), "a-b_c1");
+	}
+
+	/// 重复点击「新建决议组」：空名的新建草稿组被复用（不再累积「（未命名）」空组）；
+	/// 重命名草稿 / 已填名称 / 越界下标都不复用。
+	#[test]
+	fn pending_new_group_reuses_only_empty_new_draft() {
+		let mut groups = vec![DecisionGroup::new_empty()];
+		let new_draft = GroupDraft {
+			index: 0,
+			is_new: true,
+			original: None,
+		};
+		assert_eq!(pending_new_group(&groups, Some(&new_draft)), Some(0));
+		// 草稿组已有名称：下一次点击应新建新的组。
+		groups[0].name = "政治决策".to_string();
+		assert_eq!(pending_new_group(&groups, Some(&new_draft)), None);
+		// 重命名草稿（is_new = false）不参与复用。
+		groups[0].name.clear();
+		let rename_draft = GroupDraft {
+			index: 0,
+			is_new: false,
+			original: Some("旧名称".to_string()),
+		};
+		assert_eq!(pending_new_group(&groups, Some(&rename_draft)), None);
+		// 无草稿 / 草稿下标越界（组已被移除）都不复用。
+		assert_eq!(pending_new_group(&groups, None), None);
+		let stale_draft = GroupDraft {
+			index: 5,
+			is_new: true,
+			original: None,
+		};
+		assert_eq!(pending_new_group(&groups, Some(&stale_draft)), None);
 	}
 
 	#[test]
